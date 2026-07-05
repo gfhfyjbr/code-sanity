@@ -1,0 +1,974 @@
+use crate::config::{Config, Layout, normalize_rel_path, normalize_safe_rel_path};
+use crate::db;
+use crate::index::{index_single_file, init_workspace};
+use crate::journal::{JournalEntry, JournalStatus, new_journal_id, write_journal};
+use crate::map::{SpanMap, common_changed_range, load_span_map, sha256_hex};
+use crate::sanitize::sanitize_content;
+use crate::search::{ensure_existing_path_inside, normalize_sanitized_rel_path};
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
+use regex::Regex;
+use std::fs::{self, OpenOptions};
+use std::path::{Component, Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct ApplyReport {
+    pub files: Vec<String>,
+    pub journal_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOptions {
+    pub session_id: Option<String>,
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UnifiedPatch {
+    files: Vec<FilePatch>,
+}
+
+#[derive(Debug, Clone)]
+struct FilePatch {
+    old_path: String,
+    new_path: String,
+    hunks: Vec<Hunk>,
+}
+
+#[derive(Debug, Clone)]
+struct Hunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    lines: Vec<HunkLine>,
+}
+
+#[derive(Debug, Clone)]
+enum HunkLine {
+    Context(String),
+    Add(String),
+    Remove(String),
+}
+
+pub fn apply_patch_text(root: &Path, patch_text: &str) -> Result<ApplyReport> {
+    apply_patch_text_with_options(root, patch_text, ApplyOptions::default())
+}
+
+pub fn apply_patch_text_with_options(
+    root: &Path,
+    patch_text: &str,
+    options: ApplyOptions,
+) -> Result<ApplyReport> {
+    apply_patch_text_with_options_inner(root, patch_text, options, None)
+}
+
+#[cfg(test)]
+fn apply_patch_text_with_failure_after_writes(
+    root: &Path,
+    patch_text: &str,
+    fail_after_writes: usize,
+) -> Result<ApplyReport> {
+    apply_patch_text_with_options_inner(
+        root,
+        patch_text,
+        ApplyOptions::default(),
+        Some(fail_after_writes),
+    )
+}
+
+fn apply_patch_text_with_options_inner(
+    root: &Path,
+    patch_text: &str,
+    options: ApplyOptions,
+    fail_after_writes_for_test: Option<usize>,
+) -> Result<ApplyReport> {
+    let layout = init_workspace(root)?;
+    let config = Config::load_or_default(&layout)?;
+    let conn = db::connect(&layout)?;
+    db::init_schema(&conn)?;
+    let _lock = ApplyLock::acquire(layout.tmp_dir.join("apply.lock"))?;
+
+    let parsed = parse_unified_patch(patch_text)?;
+    if parsed.files.is_empty() {
+        bail!("patch contains no file changes");
+    }
+
+    let mut planned = Vec::<PlannedFileApply>::new();
+    let mut original_patch = String::new();
+    let mut files = Vec::new();
+
+    for file_patch in parsed.files {
+        let rel = normalize_patch_file_path(&file_patch.new_path, root, &layout)
+            .or_else(|_| normalize_patch_file_path(&file_patch.old_path, root, &layout))
+            .with_context(|| {
+                format!(
+                    "patch paths are not inside sanitized mirror or repo: {} -> {}",
+                    file_patch.old_path, file_patch.new_path
+                )
+            })?;
+        let rel_string = normalize_rel_path(&rel);
+        let real_path = root.join(&rel);
+        let mirror_path = layout.mirror_dir.join(&rel);
+        let map_path = layout.map_path(&rel);
+
+        let span_map = load_span_map(&map_path)
+            .with_context(|| format!("load span map {}; run index first", map_path.display()))?;
+        let (db_original_hash, db_sanitized_hash) = db::file_hashes(&conn, &rel_string)?
+            .ok_or_else(|| anyhow!("{rel_string}: file is not tracked; run index first"))?;
+        let real_content = fs::read_to_string(&real_path)
+            .with_context(|| format!("read real file {}", real_path.display()))?;
+        let mirror_content = fs::read_to_string(&mirror_path)
+            .with_context(|| format!("read mirror file {}", mirror_path.display()))?;
+
+        let real_hash = sha256_hex(real_content.as_bytes());
+        let mirror_hash = sha256_hex(mirror_content.as_bytes());
+        if real_hash != db_original_hash {
+            return write_conflict_and_bail(
+                &layout,
+                &conn,
+                &options,
+                patch_text,
+                &original_patch,
+                &files,
+                format!("{rel_string}: real file drifted since last index; run `code-sanity sync`"),
+            );
+        }
+        if mirror_hash != db_sanitized_hash || mirror_hash != span_map.sanitized_hash {
+            return write_conflict_and_bail(
+                &layout,
+                &conn,
+                &options,
+                patch_text,
+                &original_patch,
+                &files,
+                format!(
+                    "{rel_string}: sanitized mirror drifted since last index; run `code-sanity sync`"
+                ),
+            );
+        }
+
+        for (start, end) in changed_ranges(&mirror_content, &file_patch)? {
+            if span_map.conflicts_with_sanitized_edit(start, end) {
+                return write_conflict_and_bail(
+                    &layout,
+                    &conn,
+                    &options,
+                    patch_text,
+                    &original_patch,
+                    &files,
+                    format!(
+                        "{rel_string}: patch edits sanitized replacement span at bytes {start}..{end}; automatic apply refused"
+                    ),
+                );
+            }
+        }
+
+        let patched_sanitized = apply_file_patch_to_content(&mirror_content, &file_patch)
+            .with_context(|| format!("apply sanitized patch to {rel_string}"))?;
+        let original_file_patch = translate_file_patch(&file_patch, &span_map, &mirror_content)?;
+        let patched_original = apply_file_patch_to_content(&real_content, &original_file_patch)
+            .with_context(|| format!("apply translated patch to {rel_string}"))?;
+        let rendered_after = sanitize_content(&rel, &patched_original, &config)
+            .with_context(|| format!("resanitize patched {rel_string}"))?;
+        if rendered_after.sanitized != patched_sanitized {
+            return write_conflict_and_bail(
+                &layout,
+                &conn,
+                &options,
+                patch_text,
+                &render_file_patch(&original_file_patch),
+                &files,
+                format!(
+                    "{rel_string}: translated patch does not preserve sanitize(real) == patched mirror invariant"
+                ),
+            );
+        }
+
+        original_patch.push_str(&render_file_patch(&original_file_patch));
+        files.push(rel_string.clone());
+        planned.push(PlannedFileApply {
+            rel,
+            real_path,
+            next_content: patched_original,
+        });
+    }
+
+    let backups = planned
+        .iter()
+        .map(|planned_file| {
+            fs::read_to_string(&planned_file.real_path)
+                .with_context(|| format!("backup {}", planned_file.real_path.display()))
+                .map(|content| FileBackup {
+                    rel: planned_file.rel.clone(),
+                    real_path: planned_file.real_path.clone(),
+                    content,
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let journal_path = commit_planned_apply(
+        root,
+        &layout,
+        &conn,
+        &options,
+        patch_text,
+        &original_patch,
+        &files,
+        &planned,
+        &backups,
+        fail_after_writes_for_test,
+    )?;
+
+    Ok(ApplyReport {
+        files,
+        journal_path,
+    })
+}
+
+pub fn write_sanitized_content(
+    root: &Path,
+    rel_path: &Path,
+    sanitized_content: &str,
+) -> Result<ApplyReport> {
+    let rel_path = normalize_sanitized_rel_path(rel_path)?;
+    let layout = Layout::new(root);
+    let mirror_path = layout.mirror_dir.join(&rel_path);
+    ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, &rel_path)?;
+    let current = fs::read_to_string(&mirror_path).with_context(|| {
+        format!(
+            "read current sanitized file {}; run `code-sanity index` first",
+            rel_path.display()
+        )
+    })?;
+    if current == sanitized_content {
+        let layout = init_workspace(root)?;
+        let entry = JournalEntry {
+            id: new_journal_id(),
+            status: JournalStatus::Success,
+            session_id: None,
+            agent: None,
+            files: vec![normalize_rel_path(&rel_path)],
+            sanitized_patch: String::new(),
+            original_patch: String::new(),
+            error: None,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let journal_path = write_journal(&layout, &entry)?;
+        return Ok(ApplyReport {
+            files: entry.files,
+            journal_path,
+        });
+    }
+    let patch = whole_file_patch(&rel_path, &current, sanitized_content);
+    apply_patch_text(root, &patch)
+}
+
+struct PlannedFileApply {
+    rel: PathBuf,
+    real_path: PathBuf,
+    next_content: String,
+}
+
+struct FileBackup {
+    rel: PathBuf,
+    real_path: PathBuf,
+    content: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_planned_apply(
+    root: &Path,
+    layout: &Layout,
+    conn: &rusqlite::Connection,
+    options: &ApplyOptions,
+    sanitized_patch: &str,
+    original_patch: &str,
+    files: &[String],
+    planned: &[PlannedFileApply],
+    backups: &[FileBackup],
+    fail_after_writes_for_test: Option<usize>,
+) -> Result<PathBuf> {
+    let mut written = Vec::<PathBuf>::new();
+    let commit_result = (|| -> Result<PathBuf> {
+        for (idx, planned_file) in planned.iter().enumerate() {
+            atomic_write(&planned_file.real_path, &planned_file.next_content)
+                .with_context(|| format!("write {}", planned_file.real_path.display()))?;
+            written.push(planned_file.real_path.clone());
+            if fail_after_writes_for_test == Some(idx + 1) {
+                bail!("simulated apply failure after {} write(s)", idx + 1);
+            }
+        }
+        for planned_file in planned {
+            index_single_file(root, &planned_file.rel)
+                .with_context(|| format!("reindex {}", planned_file.rel.display()))?;
+        }
+
+        let entry = JournalEntry {
+            id: new_journal_id(),
+            status: JournalStatus::Success,
+            session_id: options.session_id.clone(),
+            agent: options.agent.clone(),
+            files: files.to_vec(),
+            sanitized_patch: sanitized_patch.to_string(),
+            original_patch: original_patch.to_string(),
+            error: None,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let journal_path = write_journal(layout, &entry)?;
+        if let Err(err) = db::insert_journal_row(
+            conn,
+            options.session_id.as_deref(),
+            options.agent.as_deref(),
+            sanitized_patch,
+            original_patch,
+            "success",
+            &entry.created_at,
+        ) {
+            let _ = fs::remove_file(&journal_path);
+            return Err(err);
+        }
+        Ok(journal_path)
+    })();
+
+    match commit_result {
+        Ok(journal_path) => Ok(journal_path),
+        Err(err) => {
+            rollback_real_files(root, backups, &written)
+                .with_context(|| format!("apply failed ({err}); rollback failed"))?;
+            Err(err.context("apply failed after writes; rolled back real files"))
+        }
+    }
+}
+
+fn rollback_real_files(root: &Path, backups: &[FileBackup], written: &[PathBuf]) -> Result<()> {
+    for backup in backups {
+        if written.iter().any(|path| path == &backup.real_path) {
+            atomic_write(&backup.real_path, &backup.content)
+                .with_context(|| format!("restore {}", backup.real_path.display()))?;
+        }
+    }
+    for backup in backups {
+        index_single_file(root, &backup.rel)
+            .with_context(|| format!("reindex restored {}", backup.rel.display()))?;
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let nonce = Utc::now().timestamp_nanos_opt().map_or_else(
+        || Utc::now().timestamp_micros().to_string(),
+        |value| value.to_string(),
+    );
+    let tmp_path = parent.join(format!(
+        ".{file_name}.code-sanity-tmp-{}-{nonce}",
+        std::process::id()
+    ));
+    let write_result = fs::write(&tmp_path, content)
+        .and_then(|()| fs::rename(&tmp_path, path))
+        .with_context(|| format!("atomic write {}", path.display()));
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+struct ApplyLock {
+    path: PathBuf,
+}
+
+impl ApplyLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "acquire apply lock {}; another code-sanity apply may be running",
+                    path.display()
+                )
+            })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ApplyLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn write_conflict_and_bail<T>(
+    layout: &Layout,
+    conn: &rusqlite::Connection,
+    options: &ApplyOptions,
+    sanitized_patch: &str,
+    original_patch: &str,
+    files: &[String],
+    error: String,
+) -> Result<T> {
+    let entry = JournalEntry {
+        id: new_journal_id(),
+        status: JournalStatus::Conflict,
+        session_id: options.session_id.clone(),
+        agent: options.agent.clone(),
+        files: files.to_vec(),
+        sanitized_patch: sanitized_patch.to_string(),
+        original_patch: original_patch.to_string(),
+        error: Some(error.clone()),
+        created_at: Utc::now().to_rfc3339(),
+    };
+    let journal_path = write_journal(layout, &entry)?;
+    db::insert_journal_row(
+        conn,
+        options.session_id.as_deref(),
+        options.agent.as_deref(),
+        sanitized_patch,
+        original_patch,
+        "conflict",
+        &entry.created_at,
+    )?;
+    bail!(
+        "{error}; conflict journal written to {}",
+        journal_path.display()
+    )
+}
+
+fn parse_unified_patch(input: &str) -> Result<UnifiedPatch> {
+    let mut lines = input.lines().peekable();
+    let mut files = Vec::new();
+    let hunk_re = Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").unwrap();
+
+    while let Some(line) = lines.next() {
+        if !line.starts_with("--- ") {
+            continue;
+        }
+        let old_path = parse_patch_path(line, "--- ")?;
+        let Some(next) = lines.next() else {
+            bail!("patch header for {old_path} is missing +++ line");
+        };
+        if !next.starts_with("+++ ") {
+            bail!("patch header for {old_path} has invalid +++ line: {next}");
+        }
+        let new_path = parse_patch_path(next, "+++ ")?;
+        let mut hunks = Vec::new();
+
+        while let Some(peek) = lines.peek().copied() {
+            if peek.starts_with("--- ") {
+                break;
+            }
+            if !peek.starts_with("@@ ") {
+                lines.next();
+                continue;
+            }
+            let header = lines.next().unwrap();
+            let Some(captures) = hunk_re.captures(header) else {
+                bail!("invalid hunk header: {header}");
+            };
+            let old_start = captures[1].parse::<usize>()?;
+            let old_count = captures
+                .get(2)
+                .map(|m| m.as_str().parse::<usize>())
+                .transpose()?
+                .unwrap_or(1);
+            let new_start = captures[3].parse::<usize>()?;
+            let new_count = captures
+                .get(4)
+                .map(|m| m.as_str().parse::<usize>())
+                .transpose()?
+                .unwrap_or(1);
+            let mut hunk_lines = Vec::new();
+            while let Some(peek) = lines.peek().copied() {
+                if peek.starts_with("@@ ") || peek.starts_with("--- ") {
+                    break;
+                }
+                let hunk_line = lines.next().unwrap();
+                if hunk_line.starts_with('\\') {
+                    continue;
+                }
+                let Some(prefix) = hunk_line.as_bytes().first().copied() else {
+                    bail!("empty hunk line");
+                };
+                let content = hunk_line[1..].to_string();
+                match prefix {
+                    b' ' => hunk_lines.push(HunkLine::Context(content)),
+                    b'+' => hunk_lines.push(HunkLine::Add(content)),
+                    b'-' => hunk_lines.push(HunkLine::Remove(content)),
+                    other => bail!("invalid hunk line prefix {}", other as char),
+                }
+            }
+            hunks.push(Hunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                lines: hunk_lines,
+            });
+        }
+
+        files.push(FilePatch {
+            old_path,
+            new_path,
+            hunks,
+        });
+    }
+
+    Ok(UnifiedPatch { files })
+}
+
+fn parse_patch_path(line: &str, prefix: &str) -> Result<String> {
+    let path = line
+        .strip_prefix(prefix)
+        .unwrap_or(line)
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("empty patch path line: {line}"))?;
+    Ok(path.to_string())
+}
+
+fn normalize_patch_file_path(path: &str, root: &Path, layout: &Layout) -> Result<PathBuf> {
+    if path == "/dev/null" {
+        bail!("create/delete patches are not supported in MVP");
+    }
+    let mut candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        if let Ok(stripped) = candidate.strip_prefix(&layout.mirror_dir) {
+            candidate = stripped.to_path_buf();
+        } else if let Ok(stripped) = candidate.strip_prefix(root) {
+            candidate = stripped.to_path_buf();
+        } else {
+            bail!("absolute patch path is outside repo: {path}");
+        }
+    }
+    let mut components = candidate.components();
+    if let Some(Component::Normal(first)) = components.next()
+        && (first == "a" || first == "b")
+    {
+        candidate = components.as_path().to_path_buf();
+    }
+    let mirror_prefix = Path::new(".code-sanity").join("mirror");
+    if let Ok(stripped) = candidate.strip_prefix(&mirror_prefix) {
+        candidate = stripped.to_path_buf();
+    }
+    if candidate.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        bail!("patch path escapes repo: {path}");
+    }
+    normalize_safe_rel_path(&candidate, "repo")
+}
+
+fn changed_ranges(content: &str, file_patch: &FilePatch) -> Result<Vec<(usize, usize)>> {
+    let line_starts = line_starts(content);
+    let mut ranges = Vec::new();
+    for hunk in &file_patch.hunks {
+        let start = byte_for_line(&line_starts, content.len(), hunk.old_start);
+        let end = byte_after_lines(&line_starts, content.len(), hunk.old_start, hunk.old_count);
+        let old_region = &content[start..end];
+        let new_region = hunk_new_region(hunk);
+        let (local_start, local_end) = common_changed_range(old_region, &new_region);
+        ranges.push((start + local_start, start + local_end));
+    }
+    Ok(ranges)
+}
+
+fn apply_file_patch_to_content(content: &str, file_patch: &FilePatch) -> Result<String> {
+    let lines = split_lines(content);
+    let mut out = Vec::<String>::new();
+    let mut cursor = 0usize;
+
+    for hunk in &file_patch.hunks {
+        let start_idx = if hunk.old_start == 0 {
+            0
+        } else {
+            hunk.old_start - 1
+        };
+        if start_idx < cursor {
+            bail!("overlapping hunks at line {}", hunk.old_start);
+        }
+        if start_idx > lines.len() {
+            bail!("hunk starts past end of file at line {}", hunk.old_start);
+        }
+        out.extend(lines[cursor..start_idx].iter().cloned());
+        cursor = start_idx;
+
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(expected) => {
+                    let actual = lines
+                        .get(cursor)
+                        .ok_or_else(|| anyhow!("missing context line {}", cursor + 1))?;
+                    if line_body(actual) != expected {
+                        bail!(
+                            "context mismatch at line {}: expected {:?}, got {:?}",
+                            cursor + 1,
+                            expected,
+                            line_body(actual)
+                        );
+                    }
+                    out.push(actual.clone());
+                    cursor += 1;
+                }
+                HunkLine::Remove(expected) => {
+                    let actual = lines
+                        .get(cursor)
+                        .ok_or_else(|| anyhow!("missing remove line {}", cursor + 1))?;
+                    if line_body(actual) != expected {
+                        bail!(
+                            "remove mismatch at line {}: expected {:?}, got {:?}",
+                            cursor + 1,
+                            expected,
+                            line_body(actual)
+                        );
+                    }
+                    cursor += 1;
+                }
+                HunkLine::Add(content) => out.push(format!("{content}\n")),
+            }
+        }
+    }
+
+    out.extend(lines[cursor..].iter().cloned());
+    Ok(out.concat())
+}
+
+#[derive(Debug, Clone)]
+struct AliasRange {
+    start: usize,
+    end: usize,
+    sanitized_text: String,
+    original_text: String,
+}
+
+fn translate_file_patch(
+    file_patch: &FilePatch,
+    span_map: &SpanMap,
+    sanitized_content: &str,
+) -> Result<FilePatch> {
+    let starts = line_starts(sanitized_content);
+    let hunks = file_patch
+        .hunks
+        .iter()
+        .map(|hunk| translate_hunk(hunk, span_map, sanitized_content, &starts))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(FilePatch {
+        old_path: file_patch.old_path.clone(),
+        new_path: file_patch.new_path.clone(),
+        hunks,
+    })
+}
+
+fn translate_hunk(
+    hunk: &Hunk,
+    span_map: &SpanMap,
+    sanitized_content: &str,
+    line_starts: &[usize],
+) -> Result<Hunk> {
+    let old_region_start = byte_for_line(line_starts, sanitized_content.len(), hunk.old_start);
+    let old_region_end = byte_after_lines(
+        line_starts,
+        sanitized_content.len(),
+        hunk.old_start,
+        hunk.old_count,
+    );
+    let old_region = &sanitized_content[old_region_start..old_region_end];
+    let new_region = hunk_new_region(hunk);
+    let old_alias_ranges = alias_ranges_for_region(span_map, old_region_start, old_region_end);
+    let new_alias_ranges =
+        project_alias_ranges_to_new_region(&old_alias_ranges, old_region, &new_region)?;
+
+    let mut old_cursor = 0usize;
+    let mut new_cursor = 0usize;
+    let mut lines = Vec::with_capacity(hunk.lines.len());
+    for line in &hunk.lines {
+        match line {
+            HunkLine::Context(text) => {
+                let translated = translate_known_alias_ranges(text, old_cursor, &old_alias_ranges)?;
+                old_cursor += text.len() + 1;
+                new_cursor += text.len() + 1;
+                lines.push(HunkLine::Context(translated));
+            }
+            HunkLine::Remove(text) => {
+                let translated = translate_known_alias_ranges(text, old_cursor, &old_alias_ranges)?;
+                old_cursor += text.len() + 1;
+                lines.push(HunkLine::Remove(translated));
+            }
+            HunkLine::Add(text) => {
+                let translated = translate_known_alias_ranges(text, new_cursor, &new_alias_ranges)?;
+                new_cursor += text.len() + 1;
+                lines.push(HunkLine::Add(translated));
+            }
+        }
+    }
+
+    Ok(Hunk {
+        old_start: hunk.old_start,
+        old_count: hunk.old_count,
+        new_start: hunk.new_start,
+        new_count: hunk.new_count,
+        lines,
+    })
+}
+
+fn alias_ranges_for_region(span_map: &SpanMap, start: usize, end: usize) -> Vec<AliasRange> {
+    span_map
+        .replacements
+        .iter()
+        .filter(|replacement| {
+            replacement.sanitized_start >= start && replacement.sanitized_end <= end
+        })
+        .map(|replacement| AliasRange {
+            start: replacement.sanitized_start - start,
+            end: replacement.sanitized_end - start,
+            sanitized_text: replacement.sanitized_text.clone(),
+            original_text: replacement.original_text.clone(),
+        })
+        .collect()
+}
+
+fn project_alias_ranges_to_new_region(
+    old_ranges: &[AliasRange],
+    old_region: &str,
+    new_region: &str,
+) -> Result<Vec<AliasRange>> {
+    let (changed_start, changed_old_end) = common_changed_range(old_region, new_region);
+    let mut projected = Vec::with_capacity(old_ranges.len());
+    for range in old_ranges {
+        let (start, end) = if range.end <= changed_start {
+            (range.start, range.end)
+        } else if range.start >= changed_old_end {
+            (
+                new_region.len() - (old_region.len() - range.start),
+                new_region.len() - (old_region.len() - range.end),
+            )
+        } else {
+            bail!("patch changes sanitized replacement span");
+        };
+        if start > end || end > new_region.len() {
+            bail!("projected alias range is outside patched hunk");
+        }
+        projected.push(AliasRange {
+            start,
+            end,
+            sanitized_text: range.sanitized_text.clone(),
+            original_text: range.original_text.clone(),
+        });
+    }
+    Ok(projected)
+}
+
+fn translate_known_alias_ranges(
+    text: &str,
+    line_start_in_region: usize,
+    ranges: &[AliasRange],
+) -> Result<String> {
+    let line_end = line_start_in_region + text.len();
+    let mut cursor = 0usize;
+    let mut out = String::with_capacity(text.len());
+    for range in ranges
+        .iter()
+        .filter(|range| range.start >= line_start_in_region && range.end <= line_end)
+    {
+        let local_start = range.start - line_start_in_region;
+        let local_end = range.end - line_start_in_region;
+        if !text.is_char_boundary(local_start) || !text.is_char_boundary(local_end) {
+            bail!("replacement span is not on UTF-8 boundaries");
+        }
+        let actual = &text[local_start..local_end];
+        if actual != range.sanitized_text {
+            bail!(
+                "replacement span mismatch: expected {:?}, got {:?}",
+                range.sanitized_text,
+                actual
+            );
+        }
+        out.push_str(&text[cursor..local_start]);
+        out.push_str(&range.original_text);
+        cursor = local_end;
+    }
+    out.push_str(&text[cursor..]);
+    Ok(out)
+}
+
+fn render_file_patch(file_patch: &FilePatch) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("--- {}\n", file_patch.old_path));
+    out.push_str(&format!("+++ {}\n", file_patch.new_path));
+    for hunk in &file_patch.hunks {
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+        ));
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(text) => out.push_str(&format!(" {text}\n")),
+                HunkLine::Add(text) => out.push_str(&format!("+{text}\n")),
+                HunkLine::Remove(text) => out.push_str(&format!("-{text}\n")),
+            }
+        }
+    }
+    out
+}
+
+fn whole_file_patch(rel_path: &Path, old: &str, new: &str) -> String {
+    let old_lines = old.lines().count();
+    let new_lines = new.lines().count();
+    let old_start = if old_lines == 0 { 0 } else { 1 };
+    let new_start = if new_lines == 0 { 0 } else { 1 };
+    let rel = normalize_rel_path(rel_path);
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{rel}\n"));
+    out.push_str(&format!("+++ b/{rel}\n"));
+    out.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        old_start, old_lines, new_start, new_lines
+    ));
+    for line in old.lines() {
+        out.push_str(&format!("-{line}\n"));
+    }
+    for line in new.lines() {
+        out.push_str(&format!("+{line}\n"));
+    }
+    out
+}
+
+fn split_lines(content: &str) -> Vec<String> {
+    content
+        .split_inclusive('\n')
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn line_body(line: &str) -> &str {
+    let without_lf = line.strip_suffix('\n').unwrap_or(line);
+    without_lf.strip_suffix('\r').unwrap_or(without_lf)
+}
+
+fn line_starts(content: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (idx, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(idx + 1);
+        }
+    }
+    starts
+}
+
+fn byte_for_line(starts: &[usize], len: usize, one_based_line: usize) -> usize {
+    if one_based_line == 0 {
+        return 0;
+    }
+    starts.get(one_based_line - 1).copied().unwrap_or(len)
+}
+
+fn byte_after_lines(starts: &[usize], len: usize, one_based_line: usize, count: usize) -> usize {
+    if count == 0 {
+        return byte_for_line(starts, len, one_based_line);
+    }
+    let start_idx = one_based_line.saturating_sub(1);
+    starts.get(start_idx + count).copied().unwrap_or(len)
+}
+
+fn hunk_new_region(hunk: &Hunk) -> String {
+    let mut out = String::new();
+    for line in &hunk.lines {
+        match line {
+            HunkLine::Context(text) | HunkLine::Add(text) => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            HunkLine::Remove(_) => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_applies_patch() {
+        let patch = parse_unified_patch(
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n fn neutral_parser() {\n-    1\n+    2\n }\n",
+        )
+        .unwrap();
+        assert_eq!(patch.files.len(), 1);
+        let next =
+            apply_file_patch_to_content("fn neutral_parser() {\n    1\n}\n", &patch.files[0])
+                .unwrap();
+        assert_eq!(next, "fn neutral_parser() {\n    2\n}\n");
+    }
+
+    #[test]
+    fn changed_range_allows_adjacent_insert() {
+        let patch = parse_unified_patch(
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-fn neutral_parser() {}\n+fn neutral_parser(input: &str) {}\n",
+        )
+        .unwrap();
+        let ranges = changed_ranges("fn neutral_parser() {}\n", &patch.files[0]).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].0 >= "fn neutral_parser(".len());
+    }
+
+    #[test]
+    fn rollback_restores_real_files_after_late_multi_file_failure() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/a.rs"),
+            "fn safe_a() -> usize {\n    1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("src/b.rs"),
+            "fn safe_b() -> usize {\n    1\n}\n",
+        )
+        .unwrap();
+        crate::index::index_workspace(repo.path()).unwrap();
+        let before_a = std::fs::read_to_string(repo.path().join("src/a.rs")).unwrap();
+        let before_b = std::fs::read_to_string(repo.path().join("src/b.rs")).unwrap();
+
+        let patch = "\
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,3 +1,3 @@
+ fn safe_a() -> usize {
+-    1
++    2
+ }
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1,3 +1,3 @@
+ fn safe_b() -> usize {
+-    1
++    2
+ }
+";
+        let err = apply_patch_text_with_failure_after_writes(repo.path(), patch, 1).unwrap_err();
+        assert!(err.to_string().contains("rolled back real files"));
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("src/a.rs")).unwrap(),
+            before_a
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("src/b.rs")).unwrap(),
+            before_b
+        );
+        assert!(crate::verify::verify_workspace(repo.path()).is_ok());
+    }
+}
