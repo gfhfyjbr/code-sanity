@@ -796,7 +796,10 @@ fn opencode_bridge_conflicts_on_replacement_span_edit() {
         code_sanity::patch::ApplyOptions::default(),
     )
     .unwrap_err();
-    assert!(err.to_string().contains("replacement span"));
+    let chain = format!("{err:#}");
+    assert!(chain.contains("replacement span"), "{chain}");
+    // The displaced edit is kept as a durable stash and referenced in the error.
+    assert!(chain.contains("the edit is kept at"), "{chain}");
     assert_eq!(
         fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
         real_before

@@ -254,8 +254,8 @@ pub fn index_single_file(root: &Path, rel: &Path) -> Result<SpanMap> {
     let layout = init_workspace(root)?;
     let _lock = WorkspaceLock::acquire(&layout)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
-    let (_, span_map, _) = index_single_file_locked(root, &layout, rel, true)?;
-    Ok(span_map)
+    let indexed = index_single_file_locked(root, &layout, rel, true)?;
+    Ok(indexed.span_map)
 }
 
 /// Sync one path (used by agent hooks): pending mirror edits are preserved.
@@ -275,10 +275,10 @@ pub fn sync_single_file(root: &Path, rel: &Path) -> Result<IndexReport> {
         report.removed += 1;
         return Ok(report);
     }
-    match index_single_file_locked(root, &layout, rel, false)? {
-        (FileOutcome::Updated, _, _) => report.indexed += 1,
-        (FileOutcome::Unchanged, _, _) => report.unchanged += 1,
-        (FileOutcome::PendingSkipped, _, _) => report.pending += 1,
+    match index_single_file_locked(root, &layout, rel, false)?.outcome {
+        FileOutcome::Updated => report.indexed += 1,
+        FileOutcome::Unchanged => report.unchanged += 1,
+        FileOutcome::PendingSkipped => report.pending += 1,
     }
     Ok(report)
 }
@@ -289,26 +289,31 @@ pub(crate) enum FileOutcome {
     PendingSkipped,
 }
 
-/// Index one file; the caller must already hold the workspace lock. Returns
-/// the outcome, the (fresh or previous) span map, and whether this file's
-/// protected identifier set changed — in which case other files' logic
-/// fingerprints are stale and a full pass is needed to reconverge.
+/// Result of indexing one file under the caller's lock.
+pub(crate) struct SingleFileIndex {
+    pub(crate) outcome: FileOutcome,
+    pub(crate) span_map: SpanMap,
+    /// The file's protected identifier set changed: other files' renderings
+    /// are stale and the caller owes a reconverge pass.
+    pub(crate) protected_changed: bool,
+    /// Durable copy of a pending mirror edit that a force reset displaced.
+    pub(crate) stashed: Option<PathBuf>,
+}
+
+/// Index one file; the caller must already hold the workspace lock.
 pub(crate) fn index_single_file_locked(
     root: &Path,
     layout: &Layout,
     rel: &Path,
     force_mirror: bool,
-) -> Result<(FileOutcome, SpanMap, bool)> {
+) -> Result<SingleFileIndex> {
     let config = Config::load_or_default(layout)?;
     let mut conn = db::connect(layout)?;
     db::init_schema(&conn)?;
 
     let rel_string = normalize_rel_path(rel);
     let source_path = root.join(rel);
-    let content = fs::read_to_string(&source_path)
-        .with_context(|| format!("read source {}", source_path.display()))?;
-    let metadata = fs::metadata(&source_path)
-        .with_context(|| format!("metadata {}", source_path.display()))?;
+    let (content, metadata) = read_with_stat(&source_path)?;
     let sha = sha256_hex(content.as_bytes());
     let fresh_protected = collect_protected_identifiers(&content);
 
@@ -336,7 +341,7 @@ pub(crate) fn index_single_file_locked(
         logic_fingerprint: logic,
         protected_json: db::protected_to_json(&fresh_protected),
     };
-    let (outcome, span_map, _stashed) = render_and_store(
+    let (outcome, span_map, stashed) = render_and_store(
         root,
         layout,
         &config,
@@ -347,7 +352,40 @@ pub(crate) fn index_single_file_locked(
         &union,
         force_mirror,
     )?;
-    Ok((outcome, span_map, protected_changed))
+    Ok(SingleFileIndex {
+        outcome,
+        span_map,
+        protected_changed,
+        stashed,
+    })
+}
+
+/// Read a file as a consistent (content, metadata) snapshot: stat, read,
+/// re-stat, retrying when the file changed mid-read. Recording a stat NEWER
+/// than the content would wedge the incremental index on a stale render (the
+/// mtime/size pre-check would keep matching).
+fn read_with_stat(path: &Path) -> Result<(String, fs::Metadata)> {
+    for _ in 0..3 {
+        let before = fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
+        let content =
+            fs::read_to_string(path).with_context(|| format!("read source {}", path.display()))?;
+        let after = fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
+        if mtime_ns(&before) == mtime_ns(&after) && before.len() == after.len() {
+            return Ok((content, after));
+        }
+    }
+    anyhow::bail!(
+        "{} keeps changing while being read; retry later",
+        path.display()
+    )
+}
+
+/// Re-render everything whose rendering became stale after a policy or
+/// protected-set change; the caller must hold the exclusive lock. Currently a
+/// full incremental pass — the single swap point for a narrower dirty-set
+/// reconvergence later.
+pub(crate) fn reconverge_workspace(root: &Path, layout: &Layout) -> Result<IndexReport> {
+    index_workspace_locked(root, layout)
 }
 
 /// The repo-wide protected identifier union as last indexed.
@@ -447,8 +485,8 @@ fn render_and_store(
             .join(rel);
         crate::fsutil::atomic_write_sync(&stash_path, old)
             .with_context(|| format!("stash pending mirror edit for {}", rel.display()))?;
-        log::warn!(
-            "discarding a pending mirror edit for {}; copy kept at {}",
+        log::info!(
+            "resetting a pending mirror edit for {}; copy kept at {}",
             rel.display(),
             stash_path.display()
         );

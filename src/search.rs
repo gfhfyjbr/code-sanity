@@ -1,4 +1,5 @@
 use crate::config::{Layout, normalize_rel_path, normalize_safe_rel_path};
+use crate::lock::WorkspaceLock;
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use std::fs;
@@ -14,6 +15,8 @@ pub struct SearchMatch {
 
 pub fn read_sanitized_file(root: &Path, rel_path: &Path) -> Result<String> {
     let layout = Layout::new(root);
+    // Shared lock: never hand a torn mid-write mirror file to an agent.
+    let _lock = WorkspaceLock::acquire_shared(&layout)?;
     let rel_path = normalize_safe_rel_path(rel_path, "sanitized mirror")?;
     let path = layout.mirror_dir.join(&rel_path);
     ensure_existing_path_inside(&path, &layout.mirror_dir, &rel_path)?;
@@ -49,6 +52,7 @@ pub fn search_mirror_limited(
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, HARD_MAX_RESULTS);
     let layout = Layout::new(root);
+    let _lock = WorkspaceLock::acquire_shared(&layout)?;
     let mut matches = Vec::new();
     if !layout.mirror_dir.exists() {
         bail!("sanitized mirror is missing; run `code-sanity index` first");
@@ -95,6 +99,7 @@ pub fn search_mirror_limited(
 
 pub fn list_mirror_files(root: &Path, glob: Option<&str>) -> Result<Vec<String>> {
     let layout = Layout::new(root);
+    let _lock = WorkspaceLock::acquire_shared(&layout)?;
     if !layout.mirror_dir.exists() {
         bail!("sanitized mirror is missing; run `code-sanity index` first");
     }

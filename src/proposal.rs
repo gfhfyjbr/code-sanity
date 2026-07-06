@@ -10,7 +10,7 @@
 
 use crate::config::{Config, Layout, ProviderConfig};
 use crate::db;
-use crate::index::index_single_file_locked;
+use crate::index::reconverge_workspace;
 use crate::lock::WorkspaceLock;
 use crate::map::load_span_map;
 use crate::sanitize::{collect_protected_identifiers, derive_alias};
@@ -416,8 +416,11 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
             item.proposal.sanitized_text.clone(),
         );
         config.save(&layout)?;
-        index_single_file_locked(root, &layout, Path::new(&item.file), true)
-            .with_context(|| format!("reindex {} after approval", item.file))?;
+        // A registry change alters the rendering policy for the whole repo,
+        // not just the proposal's file: reconverge everything before agents
+        // (MCP readers) can observe a half-registered term.
+        reconverge_workspace(root, &layout)
+            .with_context(|| format!("reindex after approving {}", item.id))?;
         item.status = ReviewStatus::Approved;
     } else {
         item.status = ReviewStatus::Rejected;

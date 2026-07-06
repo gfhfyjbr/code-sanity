@@ -66,12 +66,20 @@ pub fn run(root: &Path, command: &[String], in_worktree: bool) -> Result<i32> {
     if command.is_empty() {
         bail!("no command given; usage: code-sanity sh -- <cmd> [args...]");
     }
-    let pairs = build_reverse_pairs(root)?;
-    let sanitizer = std::sync::Arc::new(OutputSanitizer::new(&pairs)?);
-    let worktree = if in_worktree {
-        Some(materialize_worktree(root)?)
-    } else {
-        None
+    // Snapshot (reverse pairs + worktree copy) under a shared lock so a
+    // concurrent index/apply cannot produce a torn view; released before the
+    // child runs so long commands do not starve writers.
+    let (sanitizer, worktree) = {
+        let layout = crate::config::Layout::new(root);
+        let _lock = crate::lock::WorkspaceLock::acquire_shared(&layout)?;
+        let pairs = build_reverse_pairs(root)?;
+        let sanitizer = std::sync::Arc::new(OutputSanitizer::new(&pairs)?);
+        let worktree = if in_worktree {
+            Some(materialize_worktree(root)?)
+        } else {
+            None
+        };
+        (sanitizer, worktree)
     };
     let cwd = worktree
         .as_ref()

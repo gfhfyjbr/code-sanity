@@ -1,7 +1,7 @@
 use crate::config::{Config, Layout, normalize_rel_path, normalize_safe_rel_path};
 use crate::db;
 use crate::index::{
-    index_single_file, index_single_file_locked, index_workspace_locked, init_workspace,
+    index_single_file_locked, init_workspace, reconverge_workspace,
     stored_protected_union_with_override,
 };
 use crate::journal::{
@@ -570,23 +570,29 @@ pub fn project_mirror_edit(
     options: ApplyOptions,
 ) -> Result<ApplyReport> {
     let rel = normalize_sanitized_rel_path(rel_path)?;
-    let layout = Layout::new(root);
+    let layout = init_workspace(root)?;
+    // One exclusive lock across the whole read-refresh-diff-apply sequence: a
+    // concurrent sync or edit can neither clobber the captured mirror edit nor
+    // interleave with the baseline refresh.
+    let _lock = WorkspaceLock::acquire(&layout)?;
+    crate::journal::ensure_no_interrupted_apply(&layout)?;
+
     let mirror_path = layout.mirror_dir.join(&rel);
     ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, &rel)?;
     let new_mirror = fs::read_to_string(&mirror_path)
         .with_context(|| format!("read edited mirror {}", rel.display()))?;
+    let rel_string = normalize_rel_path(&rel);
 
     let real_path = root.join(&rel);
     if !real_path.exists() {
         // The agent created a new mirror file; route through a create patch so
         // the standard "must already be neutral" create checks apply.
-        let rel_string = normalize_rel_path(&rel);
         let line_count = new_mirror.lines().count().max(1);
         let mut patch = format!("--- /dev/null\n+++ b/{rel_string}\n@@ -0,0 +1,{line_count} @@\n");
         for line in new_mirror.lines() {
             patch.push_str(&format!("+{line}\n"));
         }
-        return apply_patch_text_with_options(root, &patch, options);
+        return apply_patch_text_locked(root, &layout, &patch, options, None);
     }
 
     // A mirror edit is only projectable against the baseline it was made on.
@@ -594,10 +600,8 @@ pub fn project_mirror_edit(
     // view: blindly diffing against a refreshed baseline would silently revert
     // the external change. Record the edit in a conflict journal entry (the
     // durable copy), reset the mirror to sanitize(real), and refuse.
-    let layout = init_workspace(root)?;
     let conn = db::connect(&layout)?;
     db::init_schema(&conn)?;
-    let rel_string = normalize_rel_path(&rel);
     let real_content = fs::read_to_string(&real_path)
         .with_context(|| format!("read real file {}", real_path.display()))?;
     let drifted = match db::file_hashes(&conn, &rel_string)? {
@@ -605,7 +609,7 @@ pub fn project_mirror_edit(
         None => false,
     };
     if drifted {
-        index_single_file(root, &rel)?;
+        index_single_file_locked(root, &layout, &rel, true)?;
         let baseline = fs::read_to_string(&mirror_path)
             .with_context(|| format!("read refreshed mirror {}", rel.display()))?;
         let recorded_edit = whole_file_patch(&rel, &baseline, &new_mirror);
@@ -625,16 +629,41 @@ pub fn project_mirror_edit(
     }
 
     // Refresh the baseline: reindex real so the mirror on disk and the db both
-    // hold sanitize(real) again. `new_mirror` was captured first, so the agent's
-    // edit is preserved.
-    index_single_file(root, &rel)?;
+    // hold sanitize(real) again. `new_mirror` was captured first, and the
+    // force reset keeps a durable stash copy of it under journal/discarded/.
+    let refreshed = index_single_file_locked(root, &layout, &rel, true)?;
     let baseline = fs::read_to_string(&mirror_path)
         .with_context(|| format!("read refreshed mirror {}", rel.display()))?;
     if baseline == new_mirror {
-        return write_sanitized_content(root, &rel, &new_mirror);
+        // No-op edit: record a Success journal entry for the audit trail.
+        let entry = JournalEntry {
+            id: new_journal_id(),
+            status: JournalStatus::Success,
+            session_id: options.session_id.clone(),
+            agent: options.agent.clone(),
+            files: vec![rel_string],
+            sanitized_patch: String::new(),
+            original_patch: String::new(),
+            error: None,
+            created_at: Utc::now().to_rfc3339(),
+            pending: None,
+        };
+        let journal_path = write_journal(&layout, &entry)?;
+        return Ok(ApplyReport {
+            files: entry.files,
+            journal_path,
+        });
     }
     let patch = whole_file_patch(&rel, &baseline, &new_mirror);
-    apply_patch_text_with_options(root, &patch, options)
+    apply_patch_text_locked(root, &layout, &patch, options, None).map_err(|err| {
+        match refreshed.stashed.as_ref() {
+            Some(stash) => err.context(format!(
+                "the mirror was reset to sanitize(real); the edit is kept at {}",
+                stash.display()
+            )),
+            None => err,
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -873,7 +902,7 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
         );
     }
     if protected_drift {
-        index_workspace_locked(root, &layout)
+        reconverge_workspace(root, &layout)
             .context("reindex after recovered protected symbol change")?;
     }
     Ok(report)
@@ -1012,7 +1041,7 @@ fn commit_planned_apply(
             if protected_drift {
                 // The repo-wide protected symbol set changed, so other files'
                 // renderings are stale; reconverge before releasing the lock.
-                index_workspace_locked(root, layout)
+                reconverge_workspace(root, layout)
                     .context("reindex after protected symbol change")?;
             }
             Ok(journal_path)
@@ -1030,7 +1059,7 @@ fn commit_planned_apply(
                     )?;
                 }
                 if protected_drift {
-                    index_workspace_locked(root, layout)
+                    reconverge_workspace(root, layout)
                         .context("reindex after rolled-back protected symbol change")?;
                 }
                 Ok(())
@@ -1071,9 +1100,9 @@ fn set_file_state(
         Some(content) => {
             crate::fsutil::atomic_write_sync(&real_path, content)
                 .with_context(|| format!("write {}", real_path.display()))?;
-            let (_, _, protected_changed) = index_single_file_locked(root, layout, rel, true)
+            let indexed = index_single_file_locked(root, layout, rel, true)
                 .with_context(|| format!("reindex {}", rel.display()))?;
-            Ok(protected_changed)
+            Ok(indexed.protected_changed)
         }
         None => {
             let rel_string = normalize_rel_path(rel);
