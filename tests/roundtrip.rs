@@ -313,6 +313,15 @@ fn verify_fails_on_planted_dictionary_term_in_mirror() {
         .assert()
         .code(3)
         .stderr(predicate::str::contains("leak of term"));
+
+    // Plain sync preserves the (possibly agent-owned) mirror bytes; the
+    // recovery path is sync --force, which resets the mirror to sanitize(real).
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", repo.path().to_str().unwrap(), "sync", "--force"])
+        .assert()
+        .success();
+    assert!(verify_workspace(repo.path()).is_ok());
 }
 
 #[test]

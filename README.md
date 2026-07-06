@@ -101,7 +101,9 @@ file re-renders exactly one file.
 
 Mirror files holding a **pending agent edit** (mirror on disk differs from the
 last indexed sanitized hash) are never clobbered by `sync`/`index`; only the
-patch bridge resets them after projecting the edit.
+patch bridge resets them after projecting the edit. `sync --force` is the
+recovery path: it re-renders everything and resets pending (or tampered)
+mirror files back to `sanitize(real)`.
 
 ## Model-based sanitizer
 
@@ -182,7 +184,7 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `review-sanitize [--path <path>]`
 - `sh -- <cmd> [args...]`
 - `strict-run -- <cmd> [args...]`
-- `sync [--path <rel>]`
+- `sync [--path <rel>] [--force]`
 - `verify`
 - `doctor [--agent codex|claude|opencode]`
 - `install-hooks --agent codex|claude|opencode [--force]`

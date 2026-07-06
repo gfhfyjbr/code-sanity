@@ -117,6 +117,9 @@ enum Command {
         /// Sync only this repo-relative path (used by agent hooks).
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Reset mirror files with pending (or tampered) edits to sanitize(real).
+        #[arg(long)]
+        force: bool,
     },
     Verify,
     Doctor {
@@ -358,10 +361,18 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             let code = crate::strict::run(&root, &command, true)?;
             std::process::exit(code);
         }
-        Command::Sync { path } => {
-            let report = match path {
-                Some(path) => crate::index::sync_single_file(&root, &path)?,
-                None => index_workspace(&root)?,
+        Command::Sync { path, force } => {
+            let report = match (path, force) {
+                (Some(path), false) => crate::index::sync_single_file(&root, &path)?,
+                (Some(path), true) => {
+                    crate::index::index_single_file(&root, &path)?;
+                    crate::index::IndexReport {
+                        indexed: 1,
+                        ..Default::default()
+                    }
+                }
+                (None, false) => index_workspace(&root)?,
+                (None, true) => crate::index::index_workspace_force(&root)?,
             };
             println!(
                 "synced indexed={} unchanged={} skipped={} removed={} pending={}",

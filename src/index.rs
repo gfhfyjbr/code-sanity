@@ -50,8 +50,25 @@ pub fn index_workspace(root: &Path) -> Result<IndexReport> {
     index_workspace_locked(root, &layout)
 }
 
+/// Full index pass that also resets mirror files holding pending (or planted)
+/// edits back to sanitize(real). The recovery path when a mirror was tampered
+/// with or an agent edit must be discarded.
+pub fn index_workspace_force(root: &Path) -> Result<IndexReport> {
+    let layout = init_workspace(root)?;
+    let _lock = WorkspaceLock::acquire(&layout)?;
+    index_workspace_locked_inner(root, &layout, true)
+}
+
 /// Full index pass; the caller must hold the workspace lock.
 pub(crate) fn index_workspace_locked(root: &Path, layout: &Layout) -> Result<IndexReport> {
+    index_workspace_locked_inner(root, layout, false)
+}
+
+fn index_workspace_locked_inner(
+    root: &Path,
+    layout: &Layout,
+    force_mirror: bool,
+) -> Result<IndexReport> {
     let config = Config::load_or_default(layout)?;
     let mut conn = db::connect(layout)?;
     db::init_schema(&conn)?;
@@ -138,7 +155,8 @@ pub(crate) fn index_workspace_locked(root: &Path, layout: &Layout) -> Result<Ind
         seen.insert(candidate.rel_string.clone());
         let state = states.get(&candidate.rel_string);
 
-        if candidate.fast
+        if !force_mirror
+            && candidate.fast
             && let Some(state) = state
             && state.logic_fingerprint == logic
             && layout.mirror_dir.join(&candidate.rel).exists()
@@ -165,7 +183,8 @@ pub(crate) fn index_workspace_locked(root: &Path, layout: &Layout) -> Result<Ind
 
         // Content proved unchanged by hash and logic matches: refresh the
         // mtime/size pre-check columns without re-rendering.
-        if let Some(state) = state
+        if !force_mirror
+            && let Some(state) = state
             && state.input_sha256 == sha
             && state.logic_fingerprint == logic
             && layout.mirror_dir.join(&candidate.rel).exists()
@@ -198,7 +217,7 @@ pub(crate) fn index_workspace_locked(root: &Path, layout: &Layout) -> Result<Ind
             &content,
             state_row,
             &union,
-            false,
+            force_mirror,
         )? {
             (FileOutcome::Updated, _) => report.indexed += 1,
             (FileOutcome::Unchanged, _) => report.unchanged += 1,
