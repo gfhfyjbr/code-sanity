@@ -120,6 +120,14 @@ enum Command {
     InstallHooks {
         #[arg(long)]
         agent: Agent,
+        /// Replace files even when the existing config cannot be merged.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove code-sanity hooks, preserving foreign configuration.
+    UninstallHooks {
+        #[arg(long)]
+        agent: Agent,
     },
     Serve {
         #[arg(long)]
@@ -345,8 +353,11 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         Command::Doctor { agent } => {
             doctor(&root, agent)?;
         }
-        Command::InstallHooks { agent } => {
-            install_hooks(&root, agent)?;
+        Command::InstallHooks { agent, force } => {
+            install_hooks(&root, agent, force)?;
+        }
+        Command::UninstallHooks { agent } => {
+            uninstall_hooks(&root, agent)?;
         }
         Command::Serve { once } => {
             if once {
@@ -482,46 +493,195 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>) -> Result<()> {
     Ok(())
 }
 
-fn install_hooks(root: &std::path::Path, agent: Agent) -> Result<()> {
+/// Write `content` to `path`, keeping a `.bak` copy of any existing different
+/// content so a user customization is never silently destroyed.
+fn write_with_backup(path: &std::path::Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == content {
+            return Ok(());
+        }
+        let backup = path.with_extension(format!(
+            "{}bak",
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| format!("{ext}."))
+                .unwrap_or_default()
+        ));
+        fs::write(&backup, existing).with_context(|| format!("write {}", backup.display()))?;
+    }
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))
+}
+
+/// Merge our hook entries into an existing hooks JSON config, preserving every
+/// foreign key and hook. Returns the merged document.
+fn merge_hooks_json(
+    path: &std::path::Path,
+    ours_raw: &str,
+    force: bool,
+) -> Result<serde_json::Value> {
+    let ours: serde_json::Value = serde_json::from_str(ours_raw).context("parse builtin hooks")?;
+    let mut existing = match fs::read_to_string(path) {
+        Err(_) => serde_json::json!({}),
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => value,
+            Err(err) if force => {
+                eprintln!(
+                    "warning: {} is not valid JSON ({err}); replacing (backup kept)",
+                    path.display()
+                );
+                serde_json::json!({})
+            }
+            Err(err) => anyhow::bail!(
+                "{} is not valid JSON ({err}); fix it or rerun with --force",
+                path.display()
+            ),
+        },
+    };
+
+    if !existing.is_object() {
+        anyhow::bail!("{} does not contain a JSON object", path.display());
+    }
+    let root_object = existing.as_object_mut().expect("checked object");
+    let hooks_slot = root_object
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks_slot.is_object() {
+        anyhow::bail!("{}: \"hooks\" is not an object", path.display());
+    }
+    let hooks = hooks_slot.as_object_mut().expect("checked object");
+
+    for (event, our_entries) in ours["hooks"].as_object().expect("builtin hooks object") {
+        let slot = hooks.entry(event.clone()).or_insert_with(|| serde_json::json!([]));
+        let Some(entries) = slot.as_array_mut() else {
+            anyhow::bail!("{}: hooks.{event} is not an array", path.display());
+        };
+        for our_entry in our_entries.as_array().expect("builtin hook entries") {
+            if !entries.iter().any(|entry| entry == our_entry) {
+                entries.push(our_entry.clone());
+            }
+        }
+    }
+    Ok(existing)
+}
+
+/// Remove our hook entries from an existing hooks JSON config, leaving all
+/// foreign configuration in place. Returns None if the file does not exist or
+/// is not valid JSON.
+fn strip_hooks_json(path: &std::path::Path, ours_raw: &str) -> Result<Option<serde_json::Value>> {
+    let ours: serde_json::Value = serde_json::from_str(ours_raw).context("parse builtin hooks")?;
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(None);
+    };
+    let Some(hooks) = existing.get_mut("hooks").and_then(|value| value.as_object_mut()) else {
+        return Ok(Some(existing));
+    };
+    for (event, our_entries) in ours["hooks"].as_object().expect("builtin hooks object") {
+        if let Some(entries) = hooks.get_mut(event).and_then(|value| value.as_array_mut()) {
+            entries.retain(|entry| {
+                !our_entries
+                    .as_array()
+                    .expect("builtin hook entries")
+                    .iter()
+                    .any(|ours| ours == entry)
+            });
+        }
+    }
+    hooks.retain(|_, value| value.as_array().is_none_or(|entries| !entries.is_empty()));
+    Ok(Some(existing))
+}
+
+fn install_hooks(root: &std::path::Path, agent: Agent, force: bool) -> Result<()> {
     let installed = format!("{agent:?}");
     match agent {
         Agent::Codex => {
+            let config_path = root.join(".codex/hooks.json");
+            let merged = merge_hooks_json(&config_path, CODEX_HOOKS_JSON, force)?;
+            write_with_backup(
+                &config_path,
+                &format!("{}\n", serde_json::to_string_pretty(&merged)?),
+            )?;
             let dir = root.join(".codex/hooks");
-            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            fs::write(root.join(".codex/hooks.json"), CODEX_HOOKS_JSON)
-                .context("write codex hooks.json")?;
-            fs::write(dir.join("pre_tool_use.py"), CODEX_PRE_TOOL_USE_PY)
-                .context("write codex pre_tool_use.py")?;
-            fs::write(dir.join("post_tool_use.py"), CODEX_POST_TOOL_USE_PY)
-                .context("write codex post_tool_use.py")?;
+            write_with_backup(&dir.join("pre_tool_use.py"), CODEX_PRE_TOOL_USE_PY)?;
+            write_with_backup(&dir.join("post_tool_use.py"), POST_TOOL_USE_PY)?;
         }
         Agent::Claude => {
+            let config_path = root.join(".claude/settings.json");
+            let merged = merge_hooks_json(&config_path, CLAUDE_SETTINGS_JSON, force)?;
+            write_with_backup(
+                &config_path,
+                &format!("{}\n", serde_json::to_string_pretty(&merged)?),
+            )?;
             let dir = root.join(".claude/hooks");
-            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            fs::write(root.join(".claude/settings.json"), CLAUDE_SETTINGS_JSON)
-                .context("write claude settings.json")?;
-            fs::write(dir.join("pre_tool_use.py"), CLAUDE_PRE_TOOL_USE_PY)
-                .context("write claude pre_tool_use.py")?;
-            fs::write(dir.join("post_tool_use.py"), CLAUDE_POST_TOOL_USE_PY)
-                .context("write claude post_tool_use.py")?;
-            fs::write(dir.join("session_start.py"), CLAUDE_SESSION_START_PY)
-                .context("write claude session_start.py")?;
+            write_with_backup(&dir.join("pre_tool_use.py"), CLAUDE_PRE_TOOL_USE_PY)?;
+            write_with_backup(&dir.join("post_tool_use.py"), POST_TOOL_USE_PY)?;
+            write_with_backup(&dir.join("session_start.py"), CLAUDE_SESSION_START_PY)?;
         }
         Agent::Opencode => {
             let dir = root.join(".opencode/plugins");
-            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            fs::write(dir.join("code-sanity.ts"), OPENCODE_PLUGIN_TS)
-                .context("write opencode plugin")?;
-            fs::write(
-                root.join(".opencode/package.json"),
-                "{\n  \"name\": \"code-sanity-opencode-plugin\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"type\": \"module\"\n}\n",
-            )
-            .context("write opencode package.json")?;
+            write_with_backup(&dir.join("code-sanity.ts"), OPENCODE_PLUGIN_TS)?;
+            write_with_backup(
+                &root.join(".opencode/package.json"),
+                OPENCODE_PACKAGE_JSON,
+            )?;
         }
     }
     println!("installed hooks for {installed}");
     Ok(())
 }
+
+fn uninstall_hooks(root: &std::path::Path, agent: Agent) -> Result<()> {
+    let name = format!("{agent:?}");
+    let remove_if_present = |path: &std::path::Path| -> Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+        }
+    };
+    match agent {
+        Agent::Codex => {
+            let config_path = root.join(".codex/hooks.json");
+            if let Some(stripped) = strip_hooks_json(&config_path, CODEX_HOOKS_JSON)? {
+                write_with_backup(
+                    &config_path,
+                    &format!("{}\n", serde_json::to_string_pretty(&stripped)?),
+                )?;
+            }
+            remove_if_present(&root.join(".codex/hooks/pre_tool_use.py"))?;
+            remove_if_present(&root.join(".codex/hooks/post_tool_use.py"))?;
+        }
+        Agent::Claude => {
+            let config_path = root.join(".claude/settings.json");
+            if let Some(stripped) = strip_hooks_json(&config_path, CLAUDE_SETTINGS_JSON)? {
+                write_with_backup(
+                    &config_path,
+                    &format!("{}\n", serde_json::to_string_pretty(&stripped)?),
+                )?;
+            }
+            remove_if_present(&root.join(".claude/hooks/pre_tool_use.py"))?;
+            remove_if_present(&root.join(".claude/hooks/post_tool_use.py"))?;
+            remove_if_present(&root.join(".claude/hooks/session_start.py"))?;
+        }
+        Agent::Opencode => {
+            remove_if_present(&root.join(".opencode/plugins/code-sanity.ts"))?;
+            // package.json is removed only when it is exactly ours.
+            let pkg = root.join(".opencode/package.json");
+            if fs::read_to_string(&pkg).is_ok_and(|body| body == OPENCODE_PACKAGE_JSON) {
+                remove_if_present(&pkg)?;
+            }
+        }
+    }
+    println!("uninstalled hooks for {name}");
+    Ok(())
+}
+
+const OPENCODE_PACKAGE_JSON: &str = "{\n  \"name\": \"code-sanity-opencode-plugin\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"type\": \"module\"\n}\n";
 
 /// Generated opencode plugin. Redirects reads/search to the sanitized mirror,
 /// bridges mirror edits back to the real repo via `code-sanity project-edit`,
@@ -539,6 +699,7 @@ const OPENCODE_PLUGIN_TS: &str = r#"// code-sanity opencode plugin (generated by
 //
 // Requires the `code-sanity` binary on PATH, or set CODE_SANITY_BIN.
 import { join, relative, isAbsolute } from "node:path"
+import { appendFileSync, mkdirSync } from "node:fs"
 
 const BIN = process.env.CODE_SANITY_BIN || "code-sanity"
 const MIRROR_REL = ".code-sanity/mirror"
@@ -549,11 +710,26 @@ export const CodeSanityPlugin = async ({ directory, $ }: any) => {
   const root = directory
   const mirrorRoot = join(root, MIRROR_REL)
 
+  // Failures are logged, never silently swallowed.
+  const log = (message: string) => {
+    try {
+      const dir = join(root, ".code-sanity", "logs")
+      mkdirSync(dir, { recursive: true })
+      appendFileSync(
+        join(dir, "hooks.log"),
+        `${new Date().toISOString()} opencode: ${message}\n`,
+      )
+    } catch (err) {
+      console.error(`code-sanity plugin: ${message} (log failed: ${err})`)
+    }
+  }
+
   const run = async (args: string[]) => {
     try {
       const out = await $`${BIN} --root ${root} ${args}`.quiet()
       return out.stdout.toString().trim()
-    } catch (_e) {
+    } catch (e: any) {
+      log(`${args.join(" ")} failed: ${e?.stderr?.toString?.() ?? e}`)
       return ""
     }
   }
@@ -610,10 +786,14 @@ export const CodeSanityPlugin = async ({ directory, $ }: any) => {
       const args = input?.args || output?.args || {}
       const rel = toRel(args.filePath || args.path)
       if (!rel) return
+      // Mirror edits are back-projected first, then only the touched path is
+      // re-synced; a full-repo sync here would clobber concurrent work.
       await run(["project-edit", "--path", rel, "--agent", "opencode"])
+      await run(["sync", "--path", rel])
     },
-    "file.edited": async () => {
-      await run(["sync"])
+    "file.edited": async (input: any) => {
+      const rel = toRel(input?.file || input?.path)
+      if (rel) await run(["sync", "--path", rel])
     },
   }
 }
@@ -625,7 +805,7 @@ const CODEX_HOOKS_JSON: &str = r##"{
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": "edit|write|patch|apply_patch|bash|shell|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           { "type": "command", "command": "python3 .codex/hooks/pre_tool_use.py" }
         ]
@@ -633,7 +813,7 @@ const CODEX_HOOKS_JSON: &str = r##"{
     ],
     "PostToolUse": [
       {
-        "matcher": "*",
+        "matcher": "edit|write|patch|apply_patch|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           { "type": "command", "command": "python3 .codex/hooks/post_tool_use.py" }
         ]
@@ -678,10 +858,26 @@ def rewrite_read(cmd):
     return "code-sanity read " + path
 
 
+def log_line(cwd, message):
+    import datetime
+    line = "%s pre_tool_use: %s\n" % (
+        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        message,
+    )
+    try:
+        log_dir = os.path.join(cwd, ".code-sanity", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "hooks.log"), "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        sys.stderr.write("code-sanity hook: " + line)
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
-    except Exception:
+    except Exception as exc:
+        log_line(os.getcwd(), "invalid hook payload: %r" % (exc,))
         print(json.dumps({"permissionDecision": "allow"}))
         return
     cwd = payload.get("cwd") or os.getcwd()
@@ -727,27 +923,91 @@ if __name__ == "__main__":
     main()
 "##;
 
-const CODEX_POST_TOOL_USE_PY: &str = r##"#!/usr/bin/env python3
-# code-sanity Codex PostToolUse: keep the mirror in sync after edits (best-effort).
-import json, os, subprocess, sys
+/// Shared PostToolUse hook (Codex and Claude payloads are shape-compatible).
+/// Mirrors edited in place are back-projected first (`project-edit`), then the
+/// touched path is synced; only the changed path is reindexed. Failures are
+/// logged to `.code-sanity/logs/hooks.log`, never swallowed.
+const POST_TOOL_USE_PY: &str = r##"#!/usr/bin/env python3
+# code-sanity PostToolUse hook (generated by `code-sanity install-hooks`).
+# Back-projects mirror edits (project-edit), then syncs only the edited path.
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+MIRROR = ".code-sanity/mirror"
+
+
+def log_line(cwd, message):
+    line = "%s post_tool_use: %s\n" % (
+        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        message,
+    )
+    try:
+        log_dir = os.path.join(cwd, ".code-sanity", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "hooks.log"), "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        sys.stderr.write("code-sanity hook: " + line)
+
+
+def rel_paths(payload, cwd):
+    tool_input = payload.get("tool_input") or payload.get("input") or {}
+    raw = tool_input.get("file_path") or tool_input.get("path") or ""
+    raw = str(raw).replace("\\", "/")
+    if not raw:
+        return []
+    if os.path.isabs(raw):
+        try:
+            raw = os.path.relpath(raw, cwd).replace("\\", "/")
+        except ValueError:
+            return []
+    if raw.startswith(".."):
+        return []
+    return [raw]
 
 
 def main():
+    cwd = os.getcwd()
     try:
         payload = json.load(sys.stdin)
-    except Exception:
-        payload = {}
+    except Exception as exc:  # log, never silently drop
+        log_line(cwd, "invalid hook payload: %r" % (exc,))
+        return
+    cwd = payload.get("cwd") or cwd
     binary = os.environ.get("CODE_SANITY_BIN", "code-sanity")
-    try:
-        subprocess.run(
-            [binary, "sync"],
-            cwd=payload.get("cwd") or os.getcwd(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-        )
-    except Exception:
-        pass
+
+    for path in rel_paths(payload, cwd):
+        commands = []
+        if path.startswith(MIRROR + "/"):
+            rel = path[len(MIRROR) + 1 :]
+            # Mirror was edited in place: project the edit to the real repo
+            # FIRST, then refresh the mirror for that path.
+            commands.append(["project-edit", "--path", rel])
+            commands.append(["sync", "--path", rel])
+        elif path.startswith(".code-sanity/"):
+            continue
+        else:
+            commands.append(["sync", "--path", path])
+        for args in commands:
+            try:
+                proc = subprocess.run(
+                    [binary, *args],
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if proc.returncode != 0:
+                    log_line(
+                        cwd,
+                        "%s failed (%d): %s"
+                        % (" ".join(args), proc.returncode, proc.stderr.strip()),
+                    )
+            except Exception as exc:
+                log_line(cwd, "%s error: %r" % (" ".join(args), exc))
 
 
 if __name__ == "__main__":
@@ -818,12 +1078,29 @@ def deny(reason):
     }
 
 
+def log_line(cwd, message):
+    import datetime
+    line = "%s pre_tool_use: %s\n" % (
+        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        message,
+    )
+    try:
+        log_dir = os.path.join(cwd, ".code-sanity", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "hooks.log"), "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        sys.stderr.write("code-sanity hook: " + line)
+
+
 def main():
+    cwd = os.getcwd()
     try:
         payload = json.load(sys.stdin)
-    except Exception:
+    except Exception as exc:
+        log_line(cwd, "invalid hook payload: %r" % (exc,))
         return
-    cwd = payload.get("cwd") or os.getcwd()
+    cwd = payload.get("cwd") or cwd
     mode = read_mode(cwd)
     tool = payload.get("tool_name") or ""
     tinput = payload.get("tool_input") or {}
@@ -855,32 +1132,6 @@ if __name__ == "__main__":
     main()
 "##;
 
-const CLAUDE_POST_TOOL_USE_PY: &str = r##"#!/usr/bin/env python3
-# code-sanity Claude Code PostToolUse: keep the mirror in sync after edits (best-effort).
-import json, os, subprocess, sys
-
-
-def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        payload = {}
-    binary = os.environ.get("CODE_SANITY_BIN", "code-sanity")
-    try:
-        subprocess.run(
-            [binary, "sync"],
-            cwd=payload.get("cwd") or os.getcwd(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-        )
-    except Exception:
-        pass
-
-
-if __name__ == "__main__":
-    main()
-"##;
 
 const CLAUDE_SESSION_START_PY: &str = r##"#!/usr/bin/env python3
 # code-sanity Claude Code SessionStart: inject guidance to use the code-sanity tools.

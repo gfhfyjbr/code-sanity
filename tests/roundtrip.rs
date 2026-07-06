@@ -860,6 +860,138 @@ fn codex_and_claude_hooks_generate_and_verify() {
 }
 
 #[test]
+fn install_hooks_merges_and_uninstall_preserves_foreign_settings() {
+    use serde_json::Value;
+    let repo = copy_fixture("basic-rust");
+    let root = repo.path().to_str().unwrap();
+
+    // Pre-existing settings.json with foreign keys and a foreign hook.
+    let settings_path = repo.path().join(".claude/settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    let foreign = serde_json::json!({
+        "permissions": { "allow": ["Bash(cargo:*)"] },
+        "env": { "FOO": "bar" },
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "Bash", "hooks": [ { "type": "command", "command": "echo foreign" } ] }
+            ]
+        }
+    });
+    fs::write(&settings_path, serde_json::to_string_pretty(&foreign).unwrap()).unwrap();
+
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", root, "install-hooks", "--agent", "claude"])
+        .assert()
+        .success();
+
+    let merged: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    // Foreign keys and hooks survive the merge.
+    assert_eq!(merged["permissions"]["allow"][0], "Bash(cargo:*)");
+    assert_eq!(merged["env"]["FOO"], "bar");
+    let pre = merged["hooks"]["PreToolUse"].as_array().unwrap();
+    assert!(pre.iter().any(|entry| entry["hooks"][0]["command"] == "echo foreign"));
+    assert!(
+        pre.iter()
+            .any(|entry| entry["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("pre_tool_use.py"))
+    );
+    // A backup of the pre-merge file exists.
+    assert!(repo.path().join(".claude/settings.json.bak").exists());
+    // Idempotent: reinstalling does not duplicate entries.
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", root, "install-hooks", "--agent", "claude"])
+        .assert()
+        .success();
+    let again: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        again["hooks"]["PreToolUse"].as_array().unwrap().len(),
+        pre.len()
+    );
+
+    // Uninstall removes our entries and scripts but keeps foreign config.
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", root, "uninstall-hooks", "--agent", "claude"])
+        .assert()
+        .success();
+    let stripped: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(stripped["permissions"]["allow"][0], "Bash(cargo:*)");
+    let pre_after = stripped["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(pre_after.len(), 1);
+    assert_eq!(pre_after[0]["hooks"][0]["command"], "echo foreign");
+    assert!(!repo.path().join(".claude/hooks/pre_tool_use.py").exists());
+    assert!(!repo.path().join(".claude/hooks/post_tool_use.py").exists());
+}
+
+#[test]
+fn post_hook_projects_mirror_edit_then_syncs_only_that_path() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: python3 not available");
+        return;
+    };
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let root = repo.path().to_str().unwrap();
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", root, "install-hooks", "--agent", "claude"])
+        .assert()
+        .success();
+
+    // The agent edits the mirror file in place (outside a replacement span).
+    let mirror_path = repo.path().join(".code-sanity/mirror/src/lib.rs");
+    let mirror = fs::read_to_string(&mirror_path).unwrap();
+    fs::write(&mirror_path, mirror.replace("    1\n", "    8\n")).unwrap();
+
+    // The PostToolUse hook receives the edited mirror path and must run
+    // project-edit first so the real file gets the change.
+    let bin = assert_cmd::cargo::cargo_bin("code-sanity");
+    let hook = repo.path().join(".claude/hooks/post_tool_use.py");
+    let payload = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": { "file_path": ".code-sanity/mirror/src/lib.rs" },
+        "cwd": root,
+    });
+    use std::io::Write as _;
+    use std::process::{Command as StdCommand, Stdio};
+    let mut child = StdCommand::new(py)
+        .arg(&hook)
+        .current_dir(repo.path())
+        .env("CODE_SANITY_BIN", &bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(real.contains("    8"), "real: {real}");
+    assert!(real.contains("fn dangerous_parser()"));
+    assert!(verify_workspace(repo.path()).is_ok());
+    // No swallowed failures: the log stays empty on the happy path.
+    let log = repo.path().join(".code-sanity/logs/hooks.log");
+    if log.exists() {
+        let body = fs::read_to_string(&log).unwrap();
+        assert!(body.is_empty(), "unexpected hook errors: {body}");
+    }
+}
+
+#[test]
 fn codex_and_claude_hooks_enforce_strict_mode() {
     let Some(py) = python3_bin() else {
         eprintln!("skipping: python3 not available");
