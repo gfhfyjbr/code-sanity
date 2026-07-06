@@ -816,6 +816,128 @@ fn codex_and_claude_hooks_enforce_strict_mode() {
 }
 
 #[test]
+fn external_model_proposals_validated_queued_and_applied_on_approval() {
+    use code_sanity::config::{Config, Layout, ProviderConfig};
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: python3 not available");
+        return;
+    };
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+
+    // A fake offline "model": reads the file payload, emits a fixed proposal set
+    // covering one valid, one invalid-identifier, and one not-in-file case.
+    let script_dir = tempfile::tempdir().unwrap();
+    let script = script_dir.path().join("fake_model.py");
+    fs::write(
+        &script,
+        "import json,sys\njson.load(sys.stdin)\nprint(json.dumps({\"proposals\":[\n {\"category\":\"identifier\",\"original_text\":\"safe_helper\",\"sanitized_text\":\"assist_helper\",\"confidence\":0.95},\n {\"category\":\"identifier\",\"original_text\":\"safe_helper\",\"sanitized_text\":\"9invalid\",\"confidence\":0.95},\n {\"category\":\"identifier\",\"original_text\":\"ghost_term\",\"sanitized_text\":\"foo\",\"confidence\":0.95}\n]}))\n",
+    )
+    .unwrap();
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::External {
+        command: vec![py.to_string(), script.to_str().unwrap().to_string()],
+    };
+    config.save(&layout).unwrap();
+
+    let report =
+        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs"))).unwrap();
+    assert_eq!(report.proposed, 3);
+    assert_eq!(report.queued, 1);
+    assert_eq!(report.rejected.len(), 2);
+
+    // The model never wrote the mirror.
+    let mirror_before = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    assert!(mirror_before.contains("safe_helper"));
+    assert!(!mirror_before.contains("assist_helper"));
+
+    // Approve the surviving proposal -> registry updated -> engine applies it.
+    let items = code_sanity::proposal::list_review(repo.path(), false).unwrap();
+    assert_eq!(items.len(), 1);
+    code_sanity::proposal::resolve_review(repo.path(), &items[0].id, true).unwrap();
+
+    let mirror_after = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    assert!(mirror_after.contains("fn assist_helper()"));
+    assert!(!mirror_after.contains("fn safe_helper"));
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(real.contains("fn safe_helper")); // real symbol untouched
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn alias_registry_is_applied_deterministically_across_files() {
+    use code_sanity::config::{Config, Layout};
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("src/a.rs"),
+        "fn widgetname() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("src/b.rs"),
+        "fn use_it() -> usize {\n    widgetname()\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config
+        .sanitizer
+        .alias_registry
+        .insert("widgetname".to_string(), "gadget".to_string());
+    config.save(&layout).unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let a = read_sanitized_file(repo.path(), Path::new("src/a.rs")).unwrap();
+    let b = read_sanitized_file(repo.path(), Path::new("src/b.rs")).unwrap();
+    assert!(a.contains("fn gadget()"));
+    assert!(b.contains("gadget()"));
+    assert!(!a.contains("widgetname"));
+    assert!(!b.contains("widgetname"));
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn heuristic_provider_queues_denylist_terms() {
+    use code_sanity::config::{Config, Layout};
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.denylist = vec!["safe_helper".to_string()];
+    config.save(&layout).unwrap();
+
+    let report =
+        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs"))).unwrap();
+    assert_eq!(report.queued, 1);
+    let items = code_sanity::proposal::list_review(repo.path(), false).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].proposal.original_text, "safe_helper");
+    assert!(items[0].flag.contains("confidence"));
+}
+
+#[test]
+fn review_sanitize_reports_applied_replacements() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "review-sanitize",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dangerous -> neutral"))
+        .stdout(predicate::str::contains("static-dictionary"));
+}
+
+#[test]
 fn cli_index_read_search_verify_smoke() {
     let repo = copy_fixture("basic-rust");
     Command::cargo_bin("code-sanity")

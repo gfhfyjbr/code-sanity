@@ -78,6 +78,25 @@ enum Command {
     },
     /// Print the configured enforcement mode (soft|guided|strict).
     Mode,
+    /// Run the configured proposal provider and queue proposals for review.
+    ProposeSanitize {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// List or resolve queued sanitization proposals.
+    Review {
+        #[arg(long)]
+        approve: Option<String>,
+        #[arg(long)]
+        reject: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Audit every applied replacement (from the span maps).
+    ReviewSanitize {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     Sync,
     Verify,
     Doctor {
@@ -210,6 +229,67 @@ pub fn run() -> Result<()> {
                 crate::config::Mode::Strict => "strict",
             };
             println!("{mode}");
+        }
+        Command::ProposeSanitize { path } => {
+            let report = crate::proposal::propose_sanitize(&root, path.as_deref())?;
+            println!(
+                "proposed={} queued={} rejected={}",
+                report.proposed,
+                report.queued,
+                report.rejected.len()
+            );
+            for rejected in &report.rejected {
+                println!("rejected: {rejected}");
+            }
+        }
+        Command::Review {
+            approve,
+            reject,
+            all,
+        } => {
+            if let Some(id) = approve {
+                let item = crate::proposal::resolve_review(&root, &id, true)?;
+                println!(
+                    "approved {} {} -> {} (file {})",
+                    item.id, item.proposal.original_text, item.proposal.sanitized_text, item.file
+                );
+            } else if let Some(id) = reject {
+                let item = crate::proposal::resolve_review(&root, &id, false)?;
+                println!("rejected {}", item.id);
+            } else {
+                let items = crate::proposal::list_review(&root, all)?;
+                if items.is_empty() {
+                    println!("review queue is empty");
+                }
+                for item in items {
+                    println!(
+                        "{}\t{:?}\t{}\t{} -> {}\t[{}]\t{}",
+                        item.id,
+                        item.status,
+                        item.file,
+                        item.proposal.original_text,
+                        item.proposal.sanitized_text,
+                        item.flag,
+                        item.proposal.category
+                    );
+                }
+            }
+        }
+        Command::ReviewSanitize { path } => {
+            let rows = crate::proposal::audit_replacements(&root, path.as_deref())?;
+            println!("replacements={}", rows.len());
+            for row in rows {
+                println!(
+                    "{}:{}\t{}\t{} -> {}\t[{}]\tconf={:.2}",
+                    row.file,
+                    row.original_line,
+                    row.category,
+                    row.original_text,
+                    row.sanitized_text,
+                    row.policy_source,
+                    row.confidence
+                );
+            }
         }
         Command::Sync => {
             let report = index_workspace(&root)?;

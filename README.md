@@ -72,6 +72,17 @@ The default provider is deterministic and local:
 
 Every tracked file gets a JSON span map with original and sanitized byte offsets, line starts, hashes, replacement spans, and rendered sizes.
 
+## Model-based sanitizer
+
+The model never writes the mirror. It runs only in an offline *propose* step and its output is validated, queued, and applied deterministically:
+
+1. `code-sanity propose-sanitize [--path <path>]` runs the configured proposal provider. The default is a deterministic `HeuristicProposalProvider` (proposes neutral aliases for denylisted terms). Set `provider.kind = "external"` with a `command` to plug in a local model; it receives `{rel, content}` JSON on stdin and returns a `ProposalBatch`.
+2. Each proposal is validated: the original must appear in the file, allowlisted terms are refused, identifier aliases must be valid identifiers, aliases may not introduce newlines or contain a denylisted term. Survivors are queued under `.code-sanity/review/`; anything touching a public API name or below `confidence_threshold` is flagged for review.
+3. `code-sanity review [--all]` lists the queue. `review --approve <id>` records the alias in the deterministic registry (`sanitizer.alias_registry` in `config.toml`) and reindexes the file; `review --reject <id>` drops it. Approval re-validates so a stale queue can't apply an unsafe alias.
+4. `index`/`verify` use only the deterministic engine (dictionary + alias registry), so they stay reproducible and the model stays out of the write path.
+
+`code-sanity review-sanitize [--path <path>]` prints an audit of every applied replacement (category, original → sanitized, policy source, confidence, line) read from the span maps.
+
 ## Patch Bridge
 
 `apply-patch` accepts unified diffs against sanitized paths such as `a/src/lib.rs`, `b/src/lib.rs`, or `.code-sanity/mirror/src/lib.rs`. Modify, create (`--- /dev/null`), and delete (`+++ /dev/null`) patches are all supported.
@@ -111,6 +122,9 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `project-edit --path <path> [--agent <name>] [--session-id <id>]`
 - `recover [--rollback]`
 - `mode`
+- `propose-sanitize [--path <path>]`
+- `review [--approve <id>] [--reject <id>] [--all]`
+- `review-sanitize [--path <path>]`
 - `sync`
 - `verify`
 - `doctor [--agent codex|claude|opencode]`
@@ -167,7 +181,7 @@ Hooks are not a complete enforcement boundary. Strict protection requires runnin
 - `.gitignore` support is delegated to the `ignore` crate (full gitignore language, `require_git(false)`); the walker does not follow parent-directory or global gitignores, for determinism.
 - The opencode plugin, MCP server, and Codex/Claude hooks are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
 - Codex/Claude hooks require `python3` on the host.
-- The LLM sanitizer provider remains a scaffold for a later phase.
+- The model-based sanitizer is proposal-only: an external provider must be supplied as a `command`; there is no bundled LLM. The deterministic engine (dictionary + alias registry) always does the actual sanitization.
 
 ## Tests
 

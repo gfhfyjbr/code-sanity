@@ -44,11 +44,29 @@ impl SanitizerProvider for StubSanitizerProvider {
                 config,
                 &mut candidates,
             );
+            collect_registry_replacements(
+                rel_path,
+                content,
+                range.start,
+                range.end,
+                "comment",
+                config,
+                &mut candidates,
+            );
         }
 
         for range in &string_ranges {
             if is_fixture_or_test(rel_path) || is_in_test_context(content, range.start) {
                 collect_dictionary_replacements(
+                    rel_path,
+                    content,
+                    range.start,
+                    range.end,
+                    "string_literal",
+                    config,
+                    &mut candidates,
+                );
+                collect_registry_replacements(
                     rel_path,
                     content,
                     range.start,
@@ -102,7 +120,11 @@ pub fn sanitize_content(
     config: &Config,
 ) -> Result<RenderedSanitization> {
     match &config.sanitizer.provider {
-        crate::config::ProviderConfig::Stub => {
+        // The deterministic engine (dictionary + alias registry) always does the
+        // actual sanitization at index/verify time. The External model provider
+        // only produces proposals via `propose-sanitize`; approved proposals land
+        // in the alias registry, so the model never writes the mirror directly.
+        crate::config::ProviderConfig::Stub | crate::config::ProviderConfig::External { .. } => {
             StubSanitizerProvider.sanitize(rel_path, content, config)
         }
         crate::config::ProviderConfig::LlmStub { .. } => {
@@ -169,6 +191,51 @@ fn collect_dictionary_replacements(
     }
 }
 
+/// Apply deterministic alias-registry entries (exact, case-sensitive whole-word
+/// matches) within a range. Registry entries are human-approved model proposals;
+/// applying them here keeps the model out of the write path while making the
+/// substitution deterministic at index time.
+fn collect_registry_replacements(
+    rel_path: &Path,
+    content: &str,
+    start: usize,
+    end: usize,
+    category: &str,
+    config: &Config,
+    out: &mut Vec<PendingReplacement>,
+) {
+    let slice = &content[start..end];
+    for (term, alias) in &config.sanitizer.alias_registry {
+        if term.is_empty()
+            || config
+                .sanitizer
+                .allowlist
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(term))
+        {
+            continue;
+        }
+        let mut search_at = 0usize;
+        while let Some(found) = slice[search_at..].find(term.as_str()) {
+            let local_start = search_at + found;
+            let local_end = local_start + term.len();
+            if is_start_boundary(slice, local_start) && is_end_boundary(slice, local_end) {
+                out.push(PendingReplacement {
+                    category: category.to_string(),
+                    original_text: term.clone(),
+                    sanitized_text: alias.clone(),
+                    stable_key: stable_key(rel_path, term, category, start + local_start),
+                    confidence: 1.0,
+                    policy_source: "alias-registry".to_string(),
+                    original_start: start + local_start,
+                    original_end: start + local_end,
+                });
+            }
+            search_at = local_end;
+        }
+    }
+}
+
 fn collect_identifier_replacements(
     rel_path: &Path,
     content: &str,
@@ -210,6 +277,28 @@ fn collect_identifier_replacements(
             continue;
         }
         if !should_sanitize_identifier(content, start, ident) {
+            continue;
+        }
+
+        // A model-approved alias registered for the whole identifier wins over
+        // dictionary substring matching and is applied verbatim.
+        if let Some(alias) = config.sanitizer.alias_registry.get(ident)
+            && !config
+                .sanitizer
+                .allowlist
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(ident))
+        {
+            out.push(PendingReplacement {
+                category: "identifier".to_string(),
+                original_text: ident.to_string(),
+                sanitized_text: alias.clone(),
+                stable_key: stable_key(rel_path, ident, "identifier", start),
+                confidence: 1.0,
+                policy_source: "alias-registry".to_string(),
+                original_start: start,
+                original_end: end,
+            });
             continue;
         }
 
@@ -293,7 +382,7 @@ fn should_sanitize_identifier(content: &str, start: usize, ident: &str) -> bool 
     true
 }
 
-fn public_declaration_identifiers(content: &str) -> HashSet<String> {
+pub(crate) fn public_declaration_identifiers(content: &str) -> HashSet<String> {
     let bytes = content.as_bytes();
     let mut protected = HashSet::new();
     let mut cursor = 0usize;

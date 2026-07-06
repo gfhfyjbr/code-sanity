@@ -6,6 +6,7 @@ pub mod journal;
 pub mod map;
 pub mod mcp;
 pub mod patch;
+pub mod proposal;
 pub mod sanitize;
 pub mod search;
 pub mod verify;

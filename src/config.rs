@@ -13,6 +13,7 @@ pub struct Layout {
     pub mirror_dir: PathBuf,
     pub maps_dir: PathBuf,
     pub journal_dir: PathBuf,
+    pub review_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub tmp_dir: PathBuf,
 }
@@ -27,6 +28,7 @@ impl Layout {
             mirror_dir: state_dir.join("mirror"),
             maps_dir: state_dir.join("maps"),
             journal_dir: state_dir.join("journal"),
+            review_dir: state_dir.join("review"),
             logs_dir: state_dir.join("logs"),
             tmp_dir: state_dir.join("tmp"),
             state_dir,
@@ -40,6 +42,7 @@ impl Layout {
             &self.mirror_dir,
             &self.maps_dir,
             &self.journal_dir,
+            &self.review_dir,
             &self.logs_dir,
             &self.tmp_dir,
         ] {
@@ -82,12 +85,34 @@ pub struct SanitizerConfig {
     pub preserve_line_count: bool,
     pub dictionary: BTreeMap<String, String>,
     pub allowlist: Vec<String>,
+    /// Terms that must never survive into the mirror. A proposal whose output
+    /// still contains a denylisted term is rejected.
+    #[serde(default)]
+    pub denylist: Vec<String>,
+    /// Proposals below this confidence are routed to the review queue instead of
+    /// being eligible for approval-free handling.
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: f64,
+    /// Deterministic alias registry: exact original term -> approved alias.
+    /// Populated by approving model proposals; consulted by the deterministic
+    /// engine during index so the model never writes the mirror directly.
+    #[serde(default)]
+    pub alias_registry: BTreeMap<String, String>,
+}
+
+fn default_confidence_threshold() -> f64 {
+    0.8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ProviderConfig {
+    /// Deterministic dictionary + alias registry engine (default).
     Stub,
+    /// Offline/local model provider: `command` is invoked with `{rel, content}`
+    /// JSON on stdin and must emit a proposal batch on stdout. Used by
+    /// `propose-sanitize` only; never during index/verify.
+    External { command: Vec<String> },
     LlmStub { endpoint: Option<String> },
 }
 
@@ -127,6 +152,9 @@ impl Default for Config {
                     "auth".to_string(),
                     "token".to_string(),
                 ],
+                denylist: Vec::new(),
+                confidence_threshold: default_confidence_threshold(),
+                alias_registry: BTreeMap::new(),
             },
             ignore: IgnoreConfig {
                 extra_dirs: vec![
@@ -171,7 +199,11 @@ impl Config {
         if layout.config_path.exists() {
             return Ok(());
         }
-        let raw = toml::to_string_pretty(self).context("serialize default config")?;
+        self.save(layout)
+    }
+
+    pub fn save(&self, layout: &Layout) -> Result<()> {
+        let raw = toml::to_string_pretty(self).context("serialize config")?;
         fs::write(&layout.config_path, raw)
             .with_context(|| format!("write {}", layout.config_path.display()))
     }
