@@ -108,14 +108,29 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `apply-patch [--patch <file>] [--agent <name>] [--session-id <id>]`
 - `write --path <path> [--sanitized-content <file>]`
 - `rename --path <path> --from <alias> --to <name> [--agent <name>] [--session-id <id>]`
+- `project-edit --path <path> [--agent <name>] [--session-id <id>]`
 - `recover [--rollback]`
+- `mode`
 - `sync`
 - `verify`
 - `doctor [--agent codex|claude|opencode]`
 - `install-hooks --agent codex|claude|opencode`
 - `serve [--once]`
 
-`serve` and generated agent hooks are scaffolds. The working MVP surface is the CLI core.
+`serve` and the Codex/Claude hooks are still scaffolds. The opencode plugin is a working adapter.
+
+## Agent Adapters
+
+### opencode
+
+`code-sanity install-hooks --agent opencode` generates a working plugin at `.opencode/plugins/code-sanity.ts` (plus `.opencode/package.json`). It:
+
+- redirects `read`/`grep`/`glob`/`list` tools to the sanitized mirror;
+- lets `edit`/`write` land on the mirror file, then back-projects the change to the real repo with `code-sanity project-edit` (span-aware, conflict-safe);
+- in `strict` mode, blocks edits that target the real repo instead of the mirror;
+- keeps the mirror synced at session start and on external `file.edited` events.
+
+The plugin resolves the CLI as `code-sanity` on `PATH` or `$CODE_SANITY_BIN`. `project-edit` is the bridge primitive: after the agent edits a mirror file in place, it refreshes the baseline from `sanitize(real)` and drives the difference through the patch bridge. Hooks are a guardrail, not a hard boundary — reads via `bash`/other tools are not intercepted; hard isolation requires strict-mode worktree isolation.
 
 ## Safety Notes
 
@@ -131,7 +146,8 @@ Hooks are not a complete enforcement boundary. Strict protection requires runnin
 - `rename` is single-file scoped; it does not chase references across files.
 - Public API detection is conservative heuristic protection, not a full language-aware symbol graph.
 - `.gitignore` support is delegated to the `ignore` crate (full gitignore language, `require_git(false)`); the walker does not follow parent-directory or global gitignores, for determinism.
-- LLM provider, MCP server, generated hooks, and production daemon remain scaffolds for later phases.
+- The opencode plugin is a working guardrail adapter, not a hard boundary; it does not intercept reads via `bash` or other non-file tools.
+- LLM provider, MCP server, and Codex/Claude hooks remain scaffolds for later phases.
 
 ## Tests
 

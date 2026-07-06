@@ -462,6 +462,51 @@ pub fn write_sanitized_content(
     apply_patch_text(root, &patch)
 }
 
+/// Back-project an in-place edit of a mirror file to the real repo. This is the
+/// primitive an editor adapter (e.g. the opencode plugin) calls after the agent
+/// edits the sanitized mirror file directly: the mirror on disk now holds the
+/// new sanitized content, so the baseline is refreshed from `sanitize(real)` and
+/// the difference is driven through the normal patch bridge (span-aware, with
+/// conflict detection). Editing a replacement span still conflicts and leaves
+/// the real file untouched.
+pub fn project_mirror_edit(
+    root: &Path,
+    rel_path: &Path,
+    options: ApplyOptions,
+) -> Result<ApplyReport> {
+    let rel = normalize_sanitized_rel_path(rel_path)?;
+    let layout = Layout::new(root);
+    let mirror_path = layout.mirror_dir.join(&rel);
+    ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, &rel)?;
+    let new_mirror = fs::read_to_string(&mirror_path)
+        .with_context(|| format!("read edited mirror {}", rel.display()))?;
+
+    let real_path = root.join(&rel);
+    if !real_path.exists() {
+        // The agent created a new mirror file; route through a create patch so
+        // the standard "must already be neutral" create checks apply.
+        let rel_string = normalize_rel_path(&rel);
+        let line_count = new_mirror.lines().count().max(1);
+        let mut patch = format!("--- /dev/null\n+++ b/{rel_string}\n@@ -0,0 +1,{line_count} @@\n");
+        for line in new_mirror.lines() {
+            patch.push_str(&format!("+{line}\n"));
+        }
+        return apply_patch_text_with_options(root, &patch, options);
+    }
+
+    // Refresh the baseline: reindex real so the mirror on disk and the db both
+    // hold sanitize(real) again. `new_mirror` was captured first, so the agent's
+    // edit is preserved.
+    index_single_file(root, &rel)?;
+    let baseline = fs::read_to_string(&mirror_path)
+        .with_context(|| format!("read refreshed mirror {}", rel.display()))?;
+    if baseline == new_mirror {
+        return write_sanitized_content(root, &rel, &new_mirror);
+    }
+    let patch = whole_file_patch(&rel, &baseline, &new_mirror);
+    apply_patch_text_with_options(root, &patch, options)
+}
+
 #[derive(Debug, Clone)]
 pub struct RenameReport {
     pub apply: ApplyReport,

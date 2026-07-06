@@ -460,6 +460,128 @@ fn gitignore_full_syntax_is_respected() {
 }
 
 #[test]
+fn opencode_install_generates_working_plugin() {
+    let repo = copy_fixture("basic-rust");
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "install-hooks",
+            "--agent",
+            "opencode",
+        ])
+        .assert()
+        .success();
+
+    let plugin = repo.path().join(".opencode/plugins/code-sanity.ts");
+    let body = fs::read_to_string(&plugin).unwrap();
+    assert!(body.contains("project-edit"));
+    assert!(body.contains(".code-sanity/mirror"));
+    assert!(body.contains("tool.execute.before"));
+    assert!(body.contains("tool.execute.after"));
+    assert!(body.contains("strict mode"));
+    assert!(repo.path().join(".opencode/package.json").exists());
+
+    // doctor reports the plugin as installed.
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "doctor",
+            "--agent",
+            "opencode",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("installed=true"));
+
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", repo.path().to_str().unwrap(), "mode"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("guided"));
+}
+
+#[test]
+fn opencode_bridge_projects_mirror_edit_to_real() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let mirror_path = repo.path().join(".code-sanity/mirror/src/lib.rs");
+
+    // The plugin redirects read+edit to the mirror, so the agent edits the
+    // sanitized mirror file directly. Simulate that in-place edit.
+    let mirror = fs::read_to_string(&mirror_path).unwrap();
+    let edited = mirror.replace("    1\n", "    3\n");
+    assert_ne!(mirror, edited);
+    fs::write(&mirror_path, &edited).unwrap();
+
+    // The after-hook back-projects the mirror edit to the real repo.
+    code_sanity::project_mirror_edit(
+        repo.path(),
+        Path::new("src/lib.rs"),
+        code_sanity::patch::ApplyOptions::default(),
+    )
+    .unwrap();
+
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(real.contains("    3"));
+    assert!(real.contains("fn dangerous_parser()")); // real name preserved
+    let mirror_after = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    assert!(mirror_after.contains("fn neutral_parser()"));
+    assert!(mirror_after.contains("    3"));
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn opencode_bridge_conflicts_on_replacement_span_edit() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let mirror_path = repo.path().join(".code-sanity/mirror/src/lib.rs");
+    let real_before = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+
+    // Edit inside a replacement span (rename the alias itself) via a raw mirror
+    // edit; the bridge must refuse and leave the real file untouched.
+    let mirror = fs::read_to_string(&mirror_path).unwrap();
+    let edited = mirror.replace("neutral_parser", "pleasant_parser");
+    fs::write(&mirror_path, &edited).unwrap();
+
+    let err = code_sanity::project_mirror_edit(
+        repo.path(),
+        Path::new("src/lib.rs"),
+        code_sanity::patch::ApplyOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("replacement span"));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+        real_before
+    );
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn opencode_bridge_creates_real_file_from_new_mirror_file() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let new_mirror_path = repo.path().join(".code-sanity/mirror/src/created.rs");
+    fs::write(&new_mirror_path, "pub fn created_ok() -> usize {\n    2\n}\n").unwrap();
+
+    code_sanity::project_mirror_edit(
+        repo.path(),
+        Path::new("src/created.rs"),
+        code_sanity::patch::ApplyOptions::default(),
+    )
+    .unwrap();
+
+    let real = fs::read_to_string(repo.path().join("src/created.rs")).unwrap();
+    assert_eq!(real, "pub fn created_ok() -> usize {\n    2\n}\n");
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
 fn cli_index_read_search_verify_smoke() {
     let repo = copy_fixture("basic-rust");
     Command::cargo_bin("code-sanity")
