@@ -9,6 +9,7 @@ pub mod patch;
 pub mod proposal;
 pub mod sanitize;
 pub mod search;
+pub mod strict;
 pub mod verify;
 
 pub use config::{Config, Layout};

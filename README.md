@@ -125,6 +125,8 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `propose-sanitize [--path <path>]`
 - `review [--approve <id>] [--reject <id>] [--all]`
 - `review-sanitize [--path <path>]`
+- `sh -- <cmd> [args...]`
+- `strict-run -- <cmd> [args...]`
 - `sync`
 - `verify`
 - `doctor [--agent codex|claude|opencode]`
@@ -165,6 +167,22 @@ The plugin resolves the CLI as `code-sanity` on `PATH` or `$CODE_SANITY_BIN`. `p
 
 `code-sanity install-hooks --agent claude` writes `.claude/settings.json` plus `.claude/hooks/{pre_tool_use,post_tool_use,session_start}.py`. The `PreToolUse` guard denies raw real-repo `Read`/`Edit`/`Write` in strict mode (guided denies edits) and steers to the code-sanity MCP server; `SessionStart` injects guidance to use the code-sanity tools; `PostToolUse` runs `code-sanity sync`. Register the MCP server as in [docs/MCP.md](docs/MCP.md). Hooks read the enforcement mode from `.code-sanity/config.toml` and are a guardrail, not a transparent read rewrite.
 
+## Strict mode
+
+Two runners hide real names from a command, including in build/test output, via a reverse map (alias → shown, so real originals are replaced with their sanitized aliases in stdout/stderr):
+
+```bash
+# Run in the real repo (so the build actually compiles/passes), sanitize output:
+code-sanity sh -- cargo test
+
+# Run inside a fresh sanitized worktree (the process reads only sanitized files):
+code-sanity strict-run -- cat src/lib.rs
+```
+
+`sh` runs the command in the real repo and reverse-maps its stdout/stderr, so a real compiler/test error shows sanitized identifiers. `strict-run` first copies the mirror into a worktree outside the repo tree and runs there, so even a raw `cat`/`grep` only sees sanitized content. Both propagate the child exit code.
+
+These are guardrails, not a hard sandbox: absolute paths, network, or escaping the worktree can still reach the real repo. True isolation needs an overlay/FUSE/container (optional; not implemented). Known bypasses are catalogued in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+
 ## Safety Notes
 
 This tool is for lexical normalization and privacy reduction, not for hiding real behavior. The sanitizer should not rewrite control flow, imports, public APIs, auth semantics, dangerous APIs, protocol strings, SQL, shell commands, or other behavior-bearing text.
@@ -182,6 +200,7 @@ Hooks are not a complete enforcement boundary. Strict protection requires runnin
 - The opencode plugin, MCP server, and Codex/Claude hooks are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
 - Codex/Claude hooks require `python3` on the host.
 - The model-based sanitizer is proposal-only: an external provider must be supplied as a `command`; there is no bundled LLM. The deterministic engine (dictionary + alias registry) always does the actual sanitization.
+- Strict mode (`sh`/`strict-run`) is a guardrail with best-effort output sanitization, not a hard sandbox; FUSE/overlay isolation is not implemented. Output sanitization is substring-based and covers terms present in the span maps/dictionary/registry.
 
 ## Tests
 

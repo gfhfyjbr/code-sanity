@@ -938,6 +938,52 @@ fn review_sanitize_reports_applied_replacements() {
 }
 
 #[test]
+#[cfg(unix)]
+fn strict_sh_sanitizes_command_output() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    // The command runs in the real repo, but its output is reverse-mapped so
+    // real identifiers never reach the caller.
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "sh",
+            "--",
+            "/bin/echo",
+            "dangerous_parser",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("neutral_parser"))
+        .stdout(predicate::str::contains("dangerous").not());
+}
+
+#[test]
+#[cfg(unix)]
+fn strict_run_reads_sanitized_worktree() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    // strict-run reads the file from a sanitized worktree, so even a raw `cat`
+    // only ever sees sanitized content.
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "strict-run",
+            "--",
+            "cat",
+            "src/lib.rs",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fn neutral_parser()"))
+        .stdout(predicate::str::contains("dangerous_parser").not());
+}
+
+#[test]
 fn cli_index_read_search_verify_smoke() {
     let repo = copy_fixture("basic-rust");
     Command::cargo_bin("code-sanity")

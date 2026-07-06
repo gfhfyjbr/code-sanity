@@ -97,6 +97,16 @@ enum Command {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// Run a command in the real repo, sanitizing its stdout/stderr.
+    Sh {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Run a command inside a sanitized worktree, sanitizing its output.
+    StrictRun {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        command: Vec<String>,
+    },
     Sync,
     Verify,
     Doctor {
@@ -290,6 +300,14 @@ pub fn run() -> Result<()> {
                     row.confidence
                 );
             }
+        }
+        Command::Sh { command } => {
+            let code = crate::strict::run(&root, &command, false)?;
+            std::process::exit(code);
+        }
+        Command::StrictRun { command } => {
+            let code = crate::strict::run(&root, &command, true)?;
+            std::process::exit(code);
         }
         Command::Sync => {
             let report = index_workspace(&root)?;
