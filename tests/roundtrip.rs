@@ -17,6 +17,48 @@ fn copy_fixture(name: &str) -> TempDir {
     temp
 }
 
+fn python3_bin() -> Option<&'static str> {
+    for candidate in ["python3", "python"] {
+        let ok = std::process::Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn set_mode(repo: &Path, mode: &str) {
+    let cfg = repo.join(".code-sanity/config.toml");
+    let body = fs::read_to_string(&cfg).unwrap();
+    let body = body.replace("mode = \"guided\"", &format!("mode = \"{mode}\""));
+    fs::write(&cfg, body).unwrap();
+}
+
+fn run_hook(py: &str, script: &Path, cwd: &Path, stdin: &str) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(py)
+        .arg(script)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 fn copy_dir(source: &Path, dest: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(source)? {
@@ -655,6 +697,122 @@ fn cli_serve_once_prints_tool_manifest() {
         .stdout(predicate::str::contains("read_file"))
         .stdout(predicate::str::contains("apply_patch"))
         .stdout(predicate::str::contains("inputSchema"));
+}
+
+#[test]
+fn codex_and_claude_hooks_generate_and_verify() {
+    use serde_json::Value;
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let root = repo.path().to_str().unwrap();
+
+    for agent in ["codex", "claude"] {
+        Command::cargo_bin("code-sanity")
+            .unwrap()
+            .args(["--root", root, "install-hooks", "--agent", agent])
+            .assert()
+            .success();
+        Command::cargo_bin("code-sanity")
+            .unwrap()
+            .args(["--root", root, "doctor", "--agent", agent])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("installed=true"));
+    }
+
+    // Generated configs are valid JSON.
+    let codex_hooks = fs::read_to_string(repo.path().join(".codex/hooks.json")).unwrap();
+    serde_json::from_str::<Value>(&codex_hooks).unwrap();
+    let claude_settings = fs::read_to_string(repo.path().join(".claude/settings.json")).unwrap();
+    serde_json::from_str::<Value>(&claude_settings).unwrap();
+    assert!(
+        repo.path()
+            .join(".claude/hooks/session_start.py")
+            .exists()
+    );
+}
+
+#[test]
+fn codex_and_claude_hooks_enforce_strict_mode() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: python3 not available");
+        return;
+    };
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let root = repo.path().to_str().unwrap();
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", root, "install-hooks", "--agent", "codex"])
+        .assert()
+        .success();
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", root, "install-hooks", "--agent", "claude"])
+        .assert()
+        .success();
+    set_mode(repo.path(), "strict");
+
+    let cwd = serde_json::Value::String(root.to_string());
+    let codex_pre = repo.path().join(".codex/hooks/pre_tool_use.py");
+    let claude_pre = repo.path().join(".claude/hooks/pre_tool_use.py");
+
+    // Codex: raw real-repo edit is denied in strict.
+    let deny = run_hook(
+        py,
+        &codex_pre,
+        repo.path(),
+        &serde_json::json!({"tool_name":"Edit","tool_input":{"file_path":"src/lib.rs"},"cwd":cwd})
+            .to_string(),
+    );
+    assert!(deny.contains("\"deny\""), "codex deny: {deny}");
+
+    // Codex: editing the mirror is allowed.
+    let allow = run_hook(
+        py,
+        &codex_pre,
+        repo.path(),
+        &serde_json::json!({"tool_name":"Edit","tool_input":{"file_path":".code-sanity/mirror/src/lib.rs"},"cwd":cwd})
+            .to_string(),
+    );
+    assert!(allow.contains("\"allow\""), "codex allow: {allow}");
+    assert!(!allow.contains("deny"), "codex mirror edit not denied: {allow}");
+
+    // Codex: obvious shell reads are redirected to the mirror.
+    let redirect = run_hook(
+        py,
+        &codex_pre,
+        repo.path(),
+        &serde_json::json!({"tool_name":"bash","tool_input":{"command":"cat src/lib.rs"},"cwd":cwd})
+            .to_string(),
+    );
+    assert!(
+        redirect.contains("code-sanity read src/lib.rs"),
+        "codex redirect: {redirect}"
+    );
+
+    // Claude: raw real-repo read is denied in strict.
+    let claude_deny = run_hook(
+        py,
+        &claude_pre,
+        repo.path(),
+        &serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"src/lib.rs"},"cwd":cwd})
+            .to_string(),
+    );
+    assert!(claude_deny.contains("deny"), "claude deny: {claude_deny}");
+
+    // Claude: reading the mirror is allowed (no deny emitted).
+    let claude_allow = run_hook(
+        py,
+        &claude_pre,
+        repo.path(),
+        &serde_json::json!({"tool_name":"Read","tool_input":{"file_path":".code-sanity/mirror/src/lib.rs"},"cwd":cwd})
+            .to_string(),
+    );
+    assert!(
+        claude_allow.trim().is_empty(),
+        "claude mirror read should be allowed: {claude_allow}"
+    );
 }
 
 #[test]

@@ -283,21 +283,50 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>) -> Result<()> {
     );
     match agent {
         Some(Agent::Codex) => {
+            let hooks = root.join(".codex/hooks.json");
+            let pre = root.join(".codex/hooks/pre_tool_use.py");
+            let post = root.join(".codex/hooks/post_tool_use.py");
+            let installed = hooks.exists()
+                && pre.exists()
+                && post.exists()
+                && fs::read_to_string(&pre)
+                    .map(|body| body.contains("permissionDecision"))
+                    .unwrap_or(false);
+            println!("codex hooks.json={} exists={}", hooks.display(), hooks.exists());
+            println!("codex pre_tool_use.py exists={}", pre.exists());
+            println!("codex post_tool_use.py exists={}", post.exists());
             println!(
-                "codex hooks scaffold target: {}",
-                root.join(".codex/hooks.json").display()
+                "codex hooks installed={} (run `code-sanity install-hooks --agent codex`)",
+                installed
             );
             println!(
-                "strict enforcement requires running agents in mirror/overlay; hooks are best-effort"
+                "codex hooks deny raw edits in strict and steer to code_sanity MCP tools; PreToolUse is a guardrail, not a full enforcement boundary"
             );
         }
         Some(Agent::Claude) => {
+            let settings = root.join(".claude/settings.json");
+            let pre = root.join(".claude/hooks/pre_tool_use.py");
+            let post = root.join(".claude/hooks/post_tool_use.py");
+            let session = root.join(".claude/hooks/session_start.py");
+            let installed = settings.exists()
+                && pre.exists()
+                && fs::read_to_string(&pre)
+                    .map(|body| body.contains("permissionDecision"))
+                    .unwrap_or(false);
             println!(
-                "claude hooks scaffold target: {}",
-                root.join(".claude/settings.json").display()
+                "claude settings.json={} exists={}",
+                settings.display(),
+                settings.exists()
+            );
+            println!("claude pre_tool_use.py exists={}", pre.exists());
+            println!("claude post_tool_use.py exists={}", post.exists());
+            println!("claude session_start.py exists={}", session.exists());
+            println!(
+                "claude hooks installed={} (run `code-sanity install-hooks --agent claude`)",
+                installed
             );
             println!(
-                "recommended path is MCP/guard config; transparent read rewrite is not assumed"
+                "claude hooks guard raw Read/Edit/Write in strict and steer to the code-sanity MCP server; hooks are a guardrail, not a hard boundary"
             );
         }
         Some(Agent::Opencode) => {
@@ -335,41 +364,24 @@ fn install_hooks(root: &std::path::Path, agent: Agent) -> Result<()> {
         Agent::Codex => {
             let dir = root.join(".codex/hooks");
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            let hooks = root.join(".codex/hooks.json");
-            fs::write(
-                &hooks,
-                r#"{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 .codex/hooks/pre_tool_use.py"
-          }
-        ]
-      }
-    ]
-  }
-}
-"#,
-            )
-            .with_context(|| format!("write {}", hooks.display()))?;
-            fs::write(
-                dir.join("pre_tool_use.py"),
-                "import json, sys\npayload = json.load(sys.stdin)\nprint(json.dumps({\"permissionDecision\":\"allow\",\"message\":\"code-sanity guided mode: prefer code-sanity read/search/apply-patch\"}))\n",
-            )
-            .context("write codex pre_tool_use.py")?;
+            fs::write(root.join(".codex/hooks.json"), CODEX_HOOKS_JSON)
+                .context("write codex hooks.json")?;
+            fs::write(dir.join("pre_tool_use.py"), CODEX_PRE_TOOL_USE_PY)
+                .context("write codex pre_tool_use.py")?;
+            fs::write(dir.join("post_tool_use.py"), CODEX_POST_TOOL_USE_PY)
+                .context("write codex post_tool_use.py")?;
         }
         Agent::Claude => {
             let dir = root.join(".claude/hooks");
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            fs::write(
-                root.join(".claude/settings.json"),
-                "{\n  \"hooks\": {}\n}\n",
-            )
-            .context("write claude settings scaffold")?;
+            fs::write(root.join(".claude/settings.json"), CLAUDE_SETTINGS_JSON)
+                .context("write claude settings.json")?;
+            fs::write(dir.join("pre_tool_use.py"), CLAUDE_PRE_TOOL_USE_PY)
+                .context("write claude pre_tool_use.py")?;
+            fs::write(dir.join("post_tool_use.py"), CLAUDE_POST_TOOL_USE_PY)
+                .context("write claude post_tool_use.py")?;
+            fs::write(dir.join("session_start.py"), CLAUDE_SESSION_START_PY)
+                .context("write claude session_start.py")?;
         }
         Agent::Opencode => {
             let dir = root.join(".opencode/plugins");
@@ -484,3 +496,293 @@ export const CodeSanityPlugin = async ({ directory, $ }: any) => {
 
 export default CodeSanityPlugin
 "#;
+
+const CODEX_HOOKS_JSON: &str = r##"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 .codex/hooks/pre_tool_use.py" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "python3 .codex/hooks/post_tool_use.py" }
+        ]
+      }
+    ]
+  }
+}
+"##;
+
+/// Codex PreToolUse guard. Denies raw real-repo edits in strict, nudges toward
+/// the code_sanity MCP tools in guided, and best-effort redirects obvious shell
+/// reads to the sanitized mirror. Guardrail only: PreToolUse does not intercept
+/// every shell path, so strict isolation still needs the mirror/overlay.
+const CODEX_PRE_TOOL_USE_PY: &str = r##"#!/usr/bin/env python3
+# code-sanity Codex PreToolUse guard (generated by `code-sanity install-hooks --agent codex`).
+# Guardrail, not a hard boundary: PreToolUse does not intercept every shell path.
+import json, os, re, sys
+
+MIRROR = ".code-sanity/mirror"
+
+
+def read_mode(cwd):
+    path = os.path.join(cwd or ".", ".code-sanity", "config.toml")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                match = re.match(r'\s*mode\s*=\s*"(\w+)"', line)
+                if match:
+                    return match.group(1)
+    except OSError:
+        pass
+    return "guided"
+
+
+def rewrite_read(cmd):
+    match = re.match(r"^\s*(cat|nl|head|tail)\s+(\S+)\s*$", cmd or "")
+    if not match:
+        return None
+    path = match.group(2)
+    if path.startswith("/") or path.startswith("-") or ".." in path or MIRROR in path:
+        return None
+    return "code-sanity read " + path
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        print(json.dumps({"permissionDecision": "allow"}))
+        return
+    cwd = payload.get("cwd") or os.getcwd()
+    mode = read_mode(cwd)
+    tool = (payload.get("tool_name") or payload.get("tool") or "")
+    tinput = payload.get("tool_input") or payload.get("input") or {}
+    lname = tool.lower()
+
+    # code_sanity MCP tools are always allowed.
+    if "code_sanity" in lname or "code-sanity" in lname or lname.startswith("mcp__code"):
+        print(json.dumps({"permissionDecision": "allow"}))
+        return
+
+    decision = {"permissionDecision": "allow"}
+    is_edit = ("apply_patch" in lname) or lname in ("edit", "write", "patch")
+    if is_edit:
+        path = str(tinput.get("file_path") or tinput.get("path") or "").replace("\\", "/")
+        edits_mirror = MIRROR in path
+        if mode == "strict" and not edits_mirror:
+            decision = {
+                "permissionDecision": "deny",
+                "message": "code-sanity strict mode: edit via the code_sanity MCP apply_patch tool "
+                "or the sanitized mirror (" + MIRROR + "); raw real-repo edits are blocked.",
+            }
+        elif mode == "guided" and not edits_mirror:
+            decision = {
+                "permissionDecision": "allow",
+                "message": "code-sanity: prefer code_sanity apply_patch so edits round-trip through the sanitized bridge.",
+            }
+    elif lname in ("bash", "shell") and mode != "soft":
+        rewritten = rewrite_read(tinput.get("command", ""))
+        if rewritten:
+            decision = {
+                "permissionDecision": "allow",
+                "updatedInput": {"command": rewritten},
+                "message": "code-sanity: redirected read to the sanitized mirror.",
+            }
+
+    print(json.dumps(decision))
+
+
+if __name__ == "__main__":
+    main()
+"##;
+
+const CODEX_POST_TOOL_USE_PY: &str = r##"#!/usr/bin/env python3
+# code-sanity Codex PostToolUse: keep the mirror in sync after edits (best-effort).
+import json, os, subprocess, sys
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    binary = os.environ.get("CODE_SANITY_BIN", "code-sanity")
+    try:
+        subprocess.run(
+            [binary, "sync"],
+            cwd=payload.get("cwd") or os.getcwd(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+"##;
+
+const CLAUDE_SETTINGS_JSON: &str = r##"{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "python3 .claude/hooks/pre_tool_use.py" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "python3 .claude/hooks/post_tool_use.py" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 .claude/hooks/session_start.py" }
+        ]
+      }
+    ]
+  }
+}
+"##;
+
+/// Claude Code PreToolUse guard. Denies raw real-repo Read/Edit/Write in strict
+/// (guided denies edits) and steers toward the code-sanity MCP server. Emits a
+/// deny decision only; allowed tools fall through to normal permission flow.
+const CLAUDE_PRE_TOOL_USE_PY: &str = r##"#!/usr/bin/env python3
+# code-sanity Claude Code PreToolUse guard (generated by `code-sanity install-hooks --agent claude`).
+# Guardrail, not a hard boundary: hooks steer tools but do not transparently
+# rewrite every read. For hard isolation run the agent inside the mirror/overlay.
+import json, os, re, sys
+
+MIRROR = ".code-sanity/mirror"
+
+
+def read_mode(cwd):
+    path = os.path.join(cwd or ".", ".code-sanity", "config.toml")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                match = re.match(r'\s*mode\s*=\s*"(\w+)"', line)
+                if match:
+                    return match.group(1)
+    except OSError:
+        pass
+    return "guided"
+
+
+def deny(reason):
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return
+    cwd = payload.get("cwd") or os.getcwd()
+    mode = read_mode(cwd)
+    tool = payload.get("tool_name") or ""
+    tinput = payload.get("tool_input") or {}
+    path = str(tinput.get("file_path") or tinput.get("path") or "").replace("\\", "/")
+    edits_mirror = MIRROR in path
+
+    reason_edit = (
+        "code-sanity strict mode: use the code-sanity MCP apply_patch tool or edit the "
+        "sanitized mirror (" + MIRROR + "); raw real-repo edits are blocked."
+    )
+    reason_read = (
+        "code-sanity strict mode: read via the code-sanity MCP read_file/search tools; "
+        "raw reads of the real repo are blocked."
+    )
+
+    decision = None
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        if not edits_mirror and mode in ("strict", "guided"):
+            decision = deny(reason_edit)
+    elif tool == "Read":
+        if not edits_mirror and mode == "strict":
+            decision = deny(reason_read)
+
+    if decision:
+        print(json.dumps(decision))
+
+
+if __name__ == "__main__":
+    main()
+"##;
+
+const CLAUDE_POST_TOOL_USE_PY: &str = r##"#!/usr/bin/env python3
+# code-sanity Claude Code PostToolUse: keep the mirror in sync after edits (best-effort).
+import json, os, subprocess, sys
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    binary = os.environ.get("CODE_SANITY_BIN", "code-sanity")
+    try:
+        subprocess.run(
+            [binary, "sync"],
+            cwd=payload.get("cwd") or os.getcwd(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+"##;
+
+const CLAUDE_SESSION_START_PY: &str = r##"#!/usr/bin/env python3
+# code-sanity Claude Code SessionStart: inject guidance to use the code-sanity tools.
+import json, sys
+
+CONTEXT = (
+    "This repository uses code-sanity: a sanitized mirror is the agent-facing view of the "
+    "real code. Prefer the code-sanity MCP tools (read_file, search, list_files, apply_patch, "
+    "verify) for reads and edits so changes round-trip through the sanitized bridge. In strict "
+    "mode, raw reads/edits of the real repo are blocked; edit the mirror or use apply_patch."
+)
+
+
+def main():
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": CONTEXT,
+                }
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
+"##;

@@ -136,6 +136,21 @@ The Codex/Claude hooks are still scaffolds. The opencode plugin and the MCP serv
 
 The plugin resolves the CLI as `code-sanity` on `PATH` or `$CODE_SANITY_BIN`. `project-edit` is the bridge primitive: after the agent edits a mirror file in place, it refreshes the baseline from `sanitize(real)` and drives the difference through the patch bridge. Hooks are a guardrail, not a hard boundary — reads via `bash`/other tools are not intercepted; hard isolation requires strict-mode worktree isolation.
 
+### Codex
+
+`code-sanity install-hooks --agent codex` writes `.codex/hooks.json` plus `.codex/hooks/{pre,post}_tool_use.py`. The `PreToolUse` guard:
+
+- denies raw real-repo edits (`apply_patch`/`edit`/`write`) in strict mode and steers to the code_sanity MCP `apply_patch` tool;
+- nudges toward `apply_patch` in guided mode;
+- best-effort redirects obvious shell reads (`cat`/`nl`/`head`/`tail <file>`) to `code-sanity read` via `updatedInput`;
+- always allows `code_sanity` MCP tools and mirror-targeted edits.
+
+`PostToolUse` runs `code-sanity sync` after edits. Pair with the [MCP server](docs/MCP.md). Codex `PreToolUse` is explicitly a guardrail, not a full enforcement boundary — it does not intercept every shell path.
+
+### Claude Code
+
+`code-sanity install-hooks --agent claude` writes `.claude/settings.json` plus `.claude/hooks/{pre_tool_use,post_tool_use,session_start}.py`. The `PreToolUse` guard denies raw real-repo `Read`/`Edit`/`Write` in strict mode (guided denies edits) and steers to the code-sanity MCP server; `SessionStart` injects guidance to use the code-sanity tools; `PostToolUse` runs `code-sanity sync`. Register the MCP server as in [docs/MCP.md](docs/MCP.md). Hooks read the enforcement mode from `.code-sanity/config.toml` and are a guardrail, not a transparent read rewrite.
+
 ## Safety Notes
 
 This tool is for lexical normalization and privacy reduction, not for hiding real behavior. The sanitizer should not rewrite control flow, imports, public APIs, auth semantics, dangerous APIs, protocol strings, SQL, shell commands, or other behavior-bearing text.
@@ -150,8 +165,9 @@ Hooks are not a complete enforcement boundary. Strict protection requires runnin
 - `rename` is single-file scoped; it does not chase references across files.
 - Public API detection is conservative heuristic protection, not a full language-aware symbol graph.
 - `.gitignore` support is delegated to the `ignore` crate (full gitignore language, `require_git(false)`); the walker does not follow parent-directory or global gitignores, for determinism.
-- The opencode plugin and MCP server are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
-- LLM provider and Codex/Claude hooks remain scaffolds for later phases.
+- The opencode plugin, MCP server, and Codex/Claude hooks are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
+- Codex/Claude hooks require `python3` on the host.
+- The LLM sanitizer provider remains a scaffold for a later phase.
 
 ## Tests
 
