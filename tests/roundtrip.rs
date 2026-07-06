@@ -610,7 +610,7 @@ fn recover_replays_interrupted_apply() {
     };
     code_sanity::journal::write_journal(&layout, &entry).unwrap();
 
-    let report = code_sanity::recover_workspace(repo.path(), false).unwrap();
+    let report = code_sanity::recover_workspace(repo.path(), false, false).unwrap();
     assert_eq!(report.recovered.len(), 1);
     assert!(!report.rolled_back);
     assert_eq!(fs::read_to_string(&real_path).unwrap(), after);
@@ -646,7 +646,7 @@ fn recover_rolls_back_interrupted_apply() {
     };
     code_sanity::journal::write_journal(&layout, &entry).unwrap();
 
-    let report = code_sanity::recover_workspace(repo.path(), true).unwrap();
+    let report = code_sanity::recover_workspace(repo.path(), true, false).unwrap();
     assert_eq!(report.recovered.len(), 1);
     assert!(report.rolled_back);
     assert_eq!(fs::read_to_string(&real_path).unwrap(), before);

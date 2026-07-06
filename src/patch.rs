@@ -133,6 +133,7 @@ pub(crate) fn apply_patch_text_locked(
     options: ApplyOptions,
     fail_after_writes_for_test: Option<usize>,
 ) -> Result<ApplyReport> {
+    crate::journal::ensure_no_interrupted_apply(layout)?;
     let config = Config::load_or_default(layout)?;
     let conn = db::connect(layout)?;
     db::init_schema(&conn)?;
@@ -666,6 +667,7 @@ pub fn rename_alias(
 
     let layout = init_workspace(root)?;
     let _lock = WorkspaceLock::acquire(&layout)?;
+    crate::journal::ensure_no_interrupted_apply(&layout)?;
     let conn = db::connect(&layout)?;
     db::init_schema(&conn)?;
 
@@ -768,13 +770,21 @@ pub fn rename_alias(
 pub struct RecoverReport {
     pub recovered: Vec<String>,
     pub rolled_back: bool,
+    /// Files whose current content matched neither the recorded snapshot nor
+    /// the target; left untouched, journal entry kept in `applying`.
+    pub conflicts: Vec<String>,
 }
 
 /// Finish or undo any apply that was interrupted after its `applying` journal
 /// entry was written but before it reached a terminal state. By default the
 /// apply is replayed to its recorded `after` state (roll-forward). With
 /// `rollback`, every touched file is restored to its `before` state instead.
-pub fn recover_workspace(root: &Path, rollback: bool) -> Result<RecoverReport> {
+///
+/// Freshness: a file is only driven to its target when its current content
+/// still matches the snapshot the journal recorded (or already equals the
+/// target). Anything else means newer work landed after the crash; the file is
+/// reported as a conflict and left alone unless `force` overrides.
+pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<RecoverReport> {
     let layout = init_workspace(root)?;
     // flock is released by the kernel when the crashed process died, so a
     // leftover lock file is harmless; recover just takes the lock normally.
@@ -794,15 +804,45 @@ pub fn recover_workspace(root: &Path, rollback: bool) -> Result<RecoverReport> {
         let Some(pending) = entry.pending.clone() else {
             continue;
         };
+        let mut entry_conflicts = Vec::new();
         for pending_file in &pending {
             let rel = PathBuf::from(&pending_file.rel);
-            let target = if rollback {
-                pending_file.before.as_deref()
+            let (target, precondition) = if rollback {
+                (
+                    pending_file.before.as_deref(),
+                    pending_file.after.as_deref(),
+                )
             } else {
-                pending_file.after.as_deref()
+                (
+                    pending_file.after.as_deref(),
+                    pending_file.before.as_deref(),
+                )
             };
+            let current = match fs::read_to_string(root.join(&rel)) {
+                Ok(content) => Some(content),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("read current {}", pending_file.rel));
+                }
+            };
+            let fresh = current.as_deref() == precondition || current.as_deref() == target;
+            if !fresh && !force {
+                entry_conflicts.push(pending_file.rel.clone());
+                continue;
+            }
             protected_drift |= set_file_state(root, &layout, &conn, &rel, target)
                 .with_context(|| format!("recover {}", pending_file.rel))?;
+        }
+        if !entry_conflicts.is_empty() {
+            // Newer work landed on these files after the crash. Leave the
+            // journal entry in `applying` so the workspace stays blocked until
+            // a human resolves it (or reruns recover with --force).
+            report.conflicts.extend(entry_conflicts.iter().map(|rel| {
+                format!(
+                    "{rel}: current content matches neither the recorded snapshot nor the                      target; resolve manually or rerun with --force"
+                )
+            }));
+            continue;
         }
         entry.status = if rollback {
             JournalStatus::RolledBack
@@ -943,6 +983,11 @@ fn commit_planned_apply(
                 set_file_state(root, layout, conn, &planned_file.rel, planned_file.after())
                     .with_context(|| format!("apply {}", planned_file.rel.display()))?;
             applied.push(idx);
+            // Crash-test hook: pause after the first write so a test harness
+            // can SIGKILL this process deterministically mid-apply.
+            if idx == 0 && std::env::var_os("CODE_SANITY_TEST_SLEEP_AFTER_FIRST_WRITE").is_some() {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
             if fail_after_writes_for_test == Some(idx + 1) {
                 bail!("simulated apply failure after {} write(s)", idx + 1);
             }

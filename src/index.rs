@@ -30,6 +30,8 @@ pub struct IndexReport {
     /// Mirror files left untouched because they hold a pending agent edit
     /// (mirror on disk differs from the last indexed sanitized hash).
     pub pending: usize,
+    /// Durable copies of pending agent edits that a force pass discarded.
+    pub stashed: Vec<String>,
 }
 
 pub fn init_workspace(root: &Path) -> Result<Layout> {
@@ -47,6 +49,7 @@ pub fn init_workspace(root: &Path) -> Result<Layout> {
 pub fn index_workspace(root: &Path) -> Result<IndexReport> {
     let layout = init_workspace(root)?;
     let _lock = WorkspaceLock::acquire(&layout)?;
+    crate::journal::ensure_no_interrupted_apply(&layout)?;
     index_workspace_locked(root, &layout)
 }
 
@@ -56,6 +59,7 @@ pub fn index_workspace(root: &Path) -> Result<IndexReport> {
 pub fn index_workspace_force(root: &Path) -> Result<IndexReport> {
     let layout = init_workspace(root)?;
     let _lock = WorkspaceLock::acquire(&layout)?;
+    crate::journal::ensure_no_interrupted_apply(&layout)?;
     index_workspace_locked_inner(root, &layout, true)
 }
 
@@ -208,7 +212,7 @@ fn index_workspace_locked_inner(
             logic_fingerprint: logic.clone(),
             protected_json: db::protected_to_json(&protected),
         };
-        match render_and_store(
+        let (outcome, _, stashed) = render_and_store(
             root,
             layout,
             &config,
@@ -218,10 +222,14 @@ fn index_workspace_locked_inner(
             state_row,
             &union,
             force_mirror,
-        )? {
-            (FileOutcome::Updated, _) => report.indexed += 1,
-            (FileOutcome::Unchanged, _) => report.unchanged += 1,
-            (FileOutcome::PendingSkipped, _) => report.pending += 1,
+        )?;
+        if let Some(stash) = stashed {
+            report.stashed.push(stash.display().to_string());
+        }
+        match outcome {
+            FileOutcome::Updated => report.indexed += 1,
+            FileOutcome::Unchanged => report.unchanged += 1,
+            FileOutcome::PendingSkipped => report.pending += 1,
         }
     }
 
@@ -245,6 +253,7 @@ fn index_workspace_locked_inner(
 pub fn index_single_file(root: &Path, rel: &Path) -> Result<SpanMap> {
     let layout = init_workspace(root)?;
     let _lock = WorkspaceLock::acquire(&layout)?;
+    crate::journal::ensure_no_interrupted_apply(&layout)?;
     let (_, span_map, _) = index_single_file_locked(root, &layout, rel, true)?;
     Ok(span_map)
 }
@@ -253,6 +262,7 @@ pub fn index_single_file(root: &Path, rel: &Path) -> Result<SpanMap> {
 pub fn sync_single_file(root: &Path, rel: &Path) -> Result<IndexReport> {
     let layout = init_workspace(root)?;
     let _lock = WorkspaceLock::acquire(&layout)?;
+    crate::journal::ensure_no_interrupted_apply(&layout)?;
     let mut report = IndexReport::default();
     if !root.join(rel).exists() {
         // The real file is gone: drop its targets.
@@ -326,7 +336,7 @@ pub(crate) fn index_single_file_locked(
         logic_fingerprint: logic,
         protected_json: db::protected_to_json(&fresh_protected),
     };
-    let (outcome, span_map) = render_and_store(
+    let (outcome, span_map, _stashed) = render_and_store(
         root,
         layout,
         &config,
@@ -392,7 +402,7 @@ fn render_and_store(
     state: IndexState,
     protected_union: &BTreeSet<String>,
     force_mirror: bool,
-) -> Result<(FileOutcome, SpanMap)> {
+) -> Result<(FileOutcome, SpanMap, Option<PathBuf>)> {
     let _ = root;
     let mut rendered = sanitize_content(rel, content, config, protected_union)
         .with_context(|| format!("sanitize {}", rel.display()))?;
@@ -400,18 +410,49 @@ fn render_and_store(
     let mirror_path = layout.mirror_dir.join(rel);
     let map_path = layout.map_path(rel);
     let old_mirror = fs::read_to_string(&mirror_path).ok();
+    let db_sanitized_hash = db::file_hashes(conn, &state.rel_path)?.map(|(_, hash)| hash);
 
     // Pending-edit protection: the agent edited this mirror file and the edit
     // has not been projected yet (mirror on disk differs from the last indexed
     // sanitized hash). Sync must not clobber it; only the patch bridge (force)
     // may reset the mirror to sanitize(real).
+    //
+    // Self-heal: a mirror that already equals the fresh render is converged
+    // content with a stale db row (a crash between the mirror write and the db
+    // commit), not a pending edit — fall through so the upsert repairs the row.
     if !force_mirror
         && let Some(old) = old_mirror.as_deref()
-        && let Some((_, db_sanitized_hash)) = db::file_hashes(conn, &state.rel_path)?
-        && sha256_hex(old.as_bytes()) != db_sanitized_hash
+        && old != rendered.sanitized
+        && let Some(hash) = db_sanitized_hash.as_deref()
+        && sha256_hex(old.as_bytes()) != hash
     {
         let previous = load_span_map(&map_path).unwrap_or(rendered.span_map);
-        return Ok((FileOutcome::PendingSkipped, previous));
+        return Ok((FileOutcome::PendingSkipped, previous, None));
+    }
+
+    // A force reset is about to discard an un-projected agent edit: keep a
+    // durable copy under journal/discarded/ before overwriting it.
+    let mut stashed = None;
+    if force_mirror
+        && let Some(old) = old_mirror.as_deref()
+        && old != rendered.sanitized
+        && db_sanitized_hash
+            .as_deref()
+            .is_none_or(|hash| sha256_hex(old.as_bytes()) != hash)
+    {
+        let stash_path = layout
+            .journal_dir
+            .join("discarded")
+            .join(crate::journal::new_journal_id())
+            .join(rel);
+        crate::fsutil::atomic_write_sync(&stash_path, old)
+            .with_context(|| format!("stash pending mirror edit for {}", rel.display()))?;
+        log::warn!(
+            "discarding a pending mirror edit for {}; copy kept at {}",
+            rel.display(),
+            stash_path.display()
+        );
+        stashed = Some(stash_path);
     }
 
     let old_map_raw = fs::read_to_string(&map_path).ok();
@@ -429,8 +470,10 @@ fn render_and_store(
     let unchanged = old_mirror.as_deref() == Some(rendered.sanitized.as_str())
         && old_map_raw.as_deref() == Some(next_map.as_str());
 
-    write_if_changed(&mirror_path, &rendered.sanitized)?;
-    write_if_changed(&map_path, &next_map)?;
+    crate::fsutil::atomic_write_if_changed(&mirror_path, &rendered.sanitized)
+        .with_context(|| format!("write mirror {}", mirror_path.display()))?;
+    crate::fsutil::atomic_write_if_changed(&map_path, &next_map)
+        .with_context(|| format!("write map {}", map_path.display()))?;
     db::upsert_indexed_file(conn, &rendered.span_map, &state)?;
 
     Ok((
@@ -440,6 +483,7 @@ fn render_and_store(
             FileOutcome::Updated
         },
         rendered.span_map,
+        stashed,
     ))
 }
 
@@ -515,16 +559,6 @@ fn is_binary(path: &Path) -> Result<bool> {
     }
 }
 
-fn write_if_changed(path: &Path, content: &str) -> Result<()> {
-    if fs::read_to_string(path).ok().as_deref() == Some(content) {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    fs::write(path, content).with_context(|| format!("write {}", path.display()))
-}
-
 fn remove_if_exists(path: PathBuf) -> Result<()> {
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -535,7 +569,13 @@ fn remove_if_exists(path: PathBuf) -> Result<()> {
 
 fn ensure_gitignore_entry(root: &Path, entry: &str) -> Result<()> {
     let path = root.join(".gitignore");
-    let current = fs::read_to_string(&path).unwrap_or_default();
+    // Only a missing file means "empty": treating a read error as empty would
+    // clobber the user's .gitignore on the rewrite below.
+    let current = match fs::read_to_string(&path) {
+        Ok(current) => current,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
     if current
         .lines()
         .any(|line| line.trim() == entry.trim_end_matches('/'))
@@ -550,7 +590,8 @@ fn ensure_gitignore_entry(root: &Path, entry: &str) -> Result<()> {
     }
     next.push_str(entry);
     next.push('\n');
-    fs::write(&path, next).with_context(|| format!("write {}", path.display()))
+    crate::fsutil::atomic_write_sync(&path, &next)
+        .with_context(|| format!("write {}", path.display()))
 }
 
 #[cfg(test)]

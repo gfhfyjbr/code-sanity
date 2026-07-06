@@ -210,9 +210,12 @@ impl Config {
         self.save(layout)
     }
 
+    /// Durable atomic save with a `.bak` copy of previous, different content —
+    /// the config holds the salt and the human-approved alias registry, which
+    /// are not derivable from anything else.
     pub fn save(&self, layout: &Layout) -> Result<()> {
         let raw = toml::to_string_pretty(self).context("serialize config")?;
-        fs::write(&layout.config_path, raw)
+        crate::fsutil::write_with_backup_sync(&layout.config_path, &raw)
             .with_context(|| format!("write {}", layout.config_path.display()))
     }
 }

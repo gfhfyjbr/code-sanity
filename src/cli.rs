@@ -82,6 +82,9 @@ enum Command {
     Recover {
         #[arg(long)]
         rollback: bool,
+        /// Overwrite files even when their content changed after the crash.
+        #[arg(long)]
+        force: bool,
     },
     /// Print the configured enforcement mode (soft|guided|strict).
     Mode,
@@ -275,13 +278,17 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                 report.journal_path.display()
             );
         }
-        Command::Recover { rollback } => {
-            let report = recover_workspace(&root, rollback)?;
+        Command::Recover { rollback, force } => {
+            let report = recover_workspace(&root, rollback, force)?;
             println!(
-                "recovered entries={} rolled_back={}",
+                "recovered entries={} rolled_back={} conflicts={}",
                 report.recovered.len(),
-                report.rolled_back
+                report.rolled_back,
+                report.conflicts.len()
             );
+            for conflict in &report.conflicts {
+                eprintln!("conflict: {conflict}");
+            }
         }
         Command::Mode => {
             let layout = crate::config::Layout::new(&root);
@@ -380,9 +387,17 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                 (None, true) => crate::index::index_workspace_force(&root)?,
             };
             println!(
-                "synced indexed={} unchanged={} skipped={} removed={} pending={}",
-                report.indexed, report.unchanged, report.skipped, report.removed, report.pending
+                "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={}",
+                report.indexed,
+                report.unchanged,
+                report.skipped,
+                report.removed,
+                report.pending,
+                report.stashed.len()
             );
+            for stash in &report.stashed {
+                eprintln!("stashed pending mirror edit: {stash}");
+            }
         }
         Command::Verify => {
             let report = verify_workspace(&root)?;

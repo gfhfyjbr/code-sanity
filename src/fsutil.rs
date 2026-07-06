@@ -1,9 +1,15 @@
 //! Durable filesystem primitives shared by every write path.
 //!
-//! All writes that must survive a crash go through `atomic_write_sync`:
-//! temp file in the same directory -> write -> fsync(file) -> rename over the
-//! target -> fsync(parent dir). A power failure therefore leaves either the
-//! old content or the new content, never a torn or zero-length file.
+//! Two tiers:
+//! - `atomic_write_sync`: temp file in the same directory -> write ->
+//!   fsync(file) -> rename over the target -> fsync(parent dir). A power
+//!   failure leaves either the old or the new content, never a torn or
+//!   zero-length file. For state that cannot be recomputed: real repo files,
+//!   journal entries, config (salt + registry), stashes.
+//! - `atomic_write` / `atomic_write_if_changed`: same temp+rename atomicity
+//!   without the fsyncs. For derived state (mirror, span maps) where a lost
+//!   rename after power loss is repaired by `sync`/`verify`, and per-file
+//!   fsyncs would dominate full-index time (macOS fsync is ~tens of ms).
 
 use anyhow::{Context, Result, anyhow};
 use std::fs;
@@ -25,9 +31,7 @@ fn temp_path_for(path: &Path, parent: &Path) -> PathBuf {
     ))
 }
 
-/// Atomically replace `path` with `content` and make the replacement durable
-/// (file fsync + parent directory fsync). Creates missing parent directories.
-pub fn atomic_write_sync(path: &Path, content: &str) -> Result<()> {
+fn atomic_write_impl(path: &Path, content: &str, durable: bool) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
@@ -38,12 +42,17 @@ pub fn atomic_write_sync(path: &Path, content: &str) -> Result<()> {
             fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(content.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
+        if durable {
+            file.sync_all()
+                .with_context(|| format!("fsync {}", tmp.display()))?;
+        }
+        drop(file);
         fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .with_context(|| format!("fsync {}", parent.display()))?;
+        if durable {
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .with_context(|| format!("fsync {}", parent.display()))?;
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -52,13 +61,25 @@ pub fn atomic_write_sync(path: &Path, content: &str) -> Result<()> {
     result
 }
 
-/// `atomic_write_sync` unless the file already holds exactly `content`.
-/// Returns whether a write happened.
+/// Atomically replace `path` with `content` and make the replacement durable
+/// (file fsync + parent directory fsync). Creates missing parent directories.
+pub fn atomic_write_sync(path: &Path, content: &str) -> Result<()> {
+    atomic_write_impl(path, content, true)
+}
+
+/// Atomically replace `path` with `content` (temp + rename, no fsync). For
+/// derived state that `sync`/`verify` can rebuild after a power loss.
+pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    atomic_write_impl(path, content, false)
+}
+
+/// `atomic_write` unless the file already holds exactly `content`. Returns
+/// whether a write happened.
 pub fn atomic_write_if_changed(path: &Path, content: &str) -> Result<bool> {
     if fs::read_to_string(path).ok().as_deref() == Some(content) {
         return Ok(false);
     }
-    atomic_write_sync(path, content)?;
+    atomic_write(path, content)?;
     Ok(true)
 }
 

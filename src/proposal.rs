@@ -10,7 +10,8 @@
 
 use crate::config::{Config, Layout, ProviderConfig};
 use crate::db;
-use crate::index::index_single_file;
+use crate::index::index_single_file_locked;
+use crate::lock::WorkspaceLock;
 use crate::map::load_span_map;
 use crate::sanitize::{collect_protected_identifiers, derive_alias};
 use anyhow::{Context, Result, anyhow, bail};
@@ -389,6 +390,11 @@ pub fn list_review(root: &Path, include_resolved: bool) -> Result<Vec<ReviewItem
 /// engine applies it; rejecting just marks the item.
 pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem> {
     let layout = crate::index::init_workspace(root)?;
+    // Approval is a read-modify-write of the config registry plus a reindex;
+    // hold the exclusive lock for the whole sequence so concurrent approvals
+    // cannot lose registry entries.
+    let _lock = WorkspaceLock::acquire(&layout)?;
+    crate::journal::ensure_no_interrupted_apply(&layout)?;
     let path = layout.review_dir.join(format!("{id}.json"));
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("review item {id} not found ({})", path.display()))?;
@@ -410,7 +416,7 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
             item.proposal.sanitized_text.clone(),
         );
         config.save(&layout)?;
-        index_single_file(root, Path::new(&item.file))
+        index_single_file_locked(root, &layout, Path::new(&item.file), true)
             .with_context(|| format!("reindex {} after approval", item.file))?;
         item.status = ReviewStatus::Approved;
     } else {

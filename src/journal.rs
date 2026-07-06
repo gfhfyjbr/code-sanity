@@ -1,5 +1,5 @@
 use crate::config::Layout;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -67,6 +67,10 @@ pub fn read_journal(path: &Path) -> Result<JournalEntry> {
 }
 
 /// All journal entries in id order (id is a sortable UTC timestamp).
+///
+/// A corrupt entry is quarantined (renamed to `<name>.corrupt`, logged) and
+/// skipped instead of blocking the listing — `recover` runs exactly when the
+/// last session ended badly, so one damaged file must not wedge it.
 pub fn list_journal_entries(layout: &Layout) -> Result<Vec<(PathBuf, JournalEntry)>> {
     let mut out = Vec::new();
     let read_dir = match fs::read_dir(&layout.journal_dir) {
@@ -82,9 +86,44 @@ pub fn list_journal_entries(layout: &Layout) -> Result<Vec<(PathBuf, JournalEntr
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let parsed = read_journal(&path)?;
-        out.push((path, parsed));
+        match read_journal(&path) {
+            Ok(parsed) => out.push((path, parsed)),
+            Err(err) => {
+                let quarantined = path.with_extension("json.corrupt");
+                log::warn!(
+                    "journal entry {} is corrupt ({err:#}); quarantining as {}",
+                    path.display(),
+                    quarantined.display()
+                );
+                let _ = fs::rename(&path, &quarantined);
+            }
+        }
     }
     out.sort_by(|a, b| a.1.id.cmp(&b.1.id));
     Ok(out)
+}
+
+/// Entries stuck in `Applying`: an apply was interrupted mid-write and awaits
+/// `recover`.
+pub fn find_interrupted(layout: &Layout) -> Result<Vec<(PathBuf, JournalEntry)>> {
+    Ok(list_journal_entries(layout)?
+        .into_iter()
+        .filter(|(_, entry)| entry.status == JournalStatus::Applying)
+        .collect())
+}
+
+/// Refuse to proceed while an interrupted apply awaits recovery: any command
+/// that reads or mutates workspace state would otherwise build on top of
+/// half-written real files.
+pub fn ensure_no_interrupted_apply(layout: &Layout) -> Result<()> {
+    let interrupted = find_interrupted(layout)?;
+    if let Some((_, entry)) = interrupted.first() {
+        bail!(
+            "interrupted apply {} found ({} pending); run `code-sanity recover` to replay \
+             it or `code-sanity recover --rollback` to undo it",
+            entry.id,
+            interrupted.len()
+        );
+    }
+    Ok(())
 }

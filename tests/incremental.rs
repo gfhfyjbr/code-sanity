@@ -163,3 +163,53 @@ fn parallel_apply_and_sync_stress_keeps_consistency() {
     assert!(mirror.contains("    50"));
     assert!(verify_workspace(repo.path()).is_ok());
 }
+
+#[test]
+fn crashed_mirror_write_self_heals_instead_of_reading_as_pending() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("plain.rs"),
+        "fn plain() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // Simulate a crash between the mirror write and the db commit: real file
+    // and mirror already hold the new content, the db row still has the old
+    // hashes. This must converge, not read as a pending agent edit forever.
+    let next = "fn plain() -> usize {\n    2\n}\n";
+    fs::write(repo.path().join("plain.rs"), next).unwrap();
+    fs::write(repo.path().join(".code-sanity/mirror/plain.rs"), next).unwrap();
+
+    let report = index_workspace(repo.path()).unwrap();
+    assert_eq!(report.pending, 0, "stale db row read as a pending edit");
+    assert!(verify_workspace(repo.path()).is_ok());
+    let after = index_workspace(repo.path()).unwrap();
+    assert_eq!(after.indexed, 0);
+}
+
+#[test]
+fn sync_force_stashes_the_discarded_pending_edit() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("lib.rs"),
+        "// dangerous comment\nfn calc() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // The agent edited the mirror; the edit is pending (not projected).
+    let mirror_path = repo.path().join(".code-sanity/mirror/lib.rs");
+    let mirror = fs::read_to_string(&mirror_path).unwrap();
+    let edited = mirror.replace("    1\n", "    6\n");
+    assert_ne!(mirror, edited);
+    fs::write(&mirror_path, &edited).unwrap();
+
+    // A force reset discards the edit but keeps a durable copy.
+    let report = code_sanity::index::index_workspace_force(repo.path()).unwrap();
+    assert_eq!(report.stashed.len(), 1, "{:?}", report.stashed);
+    let stash = fs::read_to_string(&report.stashed[0]).unwrap();
+    assert_eq!(stash, edited);
+    assert_eq!(fs::read_to_string(&mirror_path).unwrap(), mirror);
+    assert!(verify_workspace(repo.path()).is_ok());
+}
