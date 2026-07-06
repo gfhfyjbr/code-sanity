@@ -28,7 +28,9 @@ pub fn serve<R: BufRead, W: Write>(root: &Path, mut reader: R, mut writer: W) ->
     let mut line = String::new();
     loop {
         line.clear();
-        let read = reader.read_line(&mut line).context("read MCP request line")?;
+        let read = reader
+            .read_line(&mut line)
+            .context("read MCP request line")?;
         if read == 0 {
             break;
         }

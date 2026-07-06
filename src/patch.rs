@@ -705,7 +705,9 @@ fn created_content_from_patch(file_patch: &FilePatch) -> Result<String> {
 fn whole_file_delete_patch(rel: &str, content: &str) -> String {
     let count = content.lines().count();
     let mut out = String::new();
-    out.push_str(&format!("--- a/{rel}\n+++ /dev/null\n@@ -1,{count} +0,0 @@\n"));
+    out.push_str(&format!(
+        "--- a/{rel}\n+++ /dev/null\n@@ -1,{count} +0,0 @@\n"
+    ));
     for line in content.lines() {
         out.push_str(&format!("-{line}\n"));
     }
@@ -851,8 +853,7 @@ fn set_file_state(
         Some(content) => {
             atomic_write(&real_path, content)
                 .with_context(|| format!("write {}", real_path.display()))?;
-            index_single_file(root, rel)
-                .with_context(|| format!("reindex {}", rel.display()))?;
+            index_single_file(root, rel).with_context(|| format!("reindex {}", rel.display()))?;
         }
         None => {
             remove_file_if_exists(&real_path)?;
@@ -1400,8 +1401,14 @@ fn find_whole_word(hay: &str, word: &str) -> Option<(usize, usize)> {
     while let Some(rel) = hay[from..].find(word) {
         let start = from + rel;
         let end = start + word.len();
-        let before_ok = hay[..start].chars().next_back().is_none_or(|ch| !is_ident_char(ch));
-        let after_ok = hay[end..].chars().next().is_none_or(|ch| !is_ident_char(ch));
+        let before_ok = hay[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_ident_char(ch));
+        let after_ok = hay[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_ident_char(ch));
         if before_ok && after_ok {
             return Some((start, end));
         }
@@ -1426,7 +1433,10 @@ fn replace_whole_word(content: &str, target: &str, replacement: &str) -> (String
             .chars()
             .next_back()
             .is_none_or(|ch| !is_ident_char(ch));
-        let after_ok = content[end..].chars().next().is_none_or(|ch| !is_ident_char(ch));
+        let after_ok = content[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_ident_char(ch));
         if before_ok && after_ok {
             out.push_str(&content[cursor..start]);
             out.push_str(replacement);

@@ -183,9 +183,17 @@ code-sanity strict-run -- cat src/lib.rs
 
 These are guardrails, not a hard sandbox: absolute paths, network, or escaping the worktree can still reach the real repo. True isolation needs an overlay/FUSE/container (optional; not implemented). Known bypasses are catalogued in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
+## Docs
+
+- [docs/MCP.md](docs/MCP.md) — connect Codex, Claude Code, and opencode to the MCP server.
+- [docs/HOOKS_MATRIX.md](docs/HOOKS_MATRIX.md) — per-adapter capability matrix and why hooks are guardrails.
+- [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — assets, enforcement tiers, known bypasses, and guarantees.
+
 ## Safety Notes
 
 This tool is for lexical normalization and privacy reduction, not for hiding real behavior. The sanitizer should not rewrite control flow, imports, public APIs, auth semantics, dangerous APIs, protocol strings, SQL, shell commands, or other behavior-bearing text.
+
+Known bypasses and residual risks are catalogued in [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 Hooks are not a complete enforcement boundary. Strict protection requires running agents inside the sanitized mirror or an overlay/sandbox where raw repository reads are physically unavailable.
 

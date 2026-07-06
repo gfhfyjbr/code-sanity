@@ -127,7 +127,11 @@ impl ProposalProvider for HeuristicProposalProvider {
         let mut proposals = Vec::new();
         for term in &config.sanitizer.denylist {
             let lower = term.to_lowercase();
-            if config.sanitizer.dictionary.keys().any(|k| k.eq_ignore_ascii_case(term))
+            if config
+                .sanitizer
+                .dictionary
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case(term))
                 || config.sanitizer.alias_registry.contains_key(term)
                 || !seen.insert(lower.clone())
             {
@@ -187,8 +191,8 @@ pub fn propose_sanitize(root: &Path, rel: Option<&Path>) -> Result<ProposeReport
 
     let mut report = ProposeReport::default();
     for file in files {
-        let real = std::fs::read_to_string(root.join(&file))
-            .with_context(|| format!("read {file}"))?;
+        let real =
+            std::fs::read_to_string(root.join(&file)).with_context(|| format!("read {file}"))?;
         let proposals = provider.propose(Path::new(&file), &real, &config)?;
         for proposal in proposals {
             report.proposed += 1;
@@ -286,7 +290,9 @@ pub fn list_review(root: &Path, include_resolved: bool) -> Result<Vec<ReviewItem
     let read_dir = match std::fs::read_dir(&layout.review_dir) {
         Ok(read_dir) => read_dir,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(items),
-        Err(err) => return Err(err).with_context(|| format!("read {}", layout.review_dir.display())),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read {}", layout.review_dir.display()));
+        }
     };
     for entry in read_dir {
         let path = entry.context("read review dir entry")?.path();
@@ -294,8 +300,8 @@ pub fn list_review(root: &Path, include_resolved: bool) -> Result<Vec<ReviewItem
             continue;
         }
         let raw = std::fs::read_to_string(&path)?;
-        let item: ReviewItem = serde_json::from_str(&raw)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let item: ReviewItem =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         if include_resolved || item.status == ReviewStatus::Pending {
             items.push(item);
         }
@@ -312,8 +318,8 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
     let path = layout.review_dir.join(format!("{id}.json"));
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("review item {id} not found ({})", path.display()))?;
-    let mut item: ReviewItem = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let mut item: ReviewItem =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     if item.status != ReviewStatus::Pending {
         bail!("review item {id} is already {:?}", item.status);
     }
@@ -398,7 +404,10 @@ fn contains_whole_word(content: &str, word: &str) -> bool {
     while let Some(rel) = content[from..].find(word) {
         let start = from + rel;
         let end = start + word.len();
-        let before = content[..start].chars().next_back().is_none_or(|ch| !is_ident(ch));
+        let before = content[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_ident(ch));
         let after = content[end..].chars().next().is_none_or(|ch| !is_ident(ch));
         if before && after {
             return true;

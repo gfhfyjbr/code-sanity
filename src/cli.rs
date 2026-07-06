@@ -193,13 +193,8 @@ pub fn run() -> Result<()> {
             agent,
             session_id,
         } => {
-            let report = rename_alias(
-                &root,
-                &path,
-                &from,
-                &to,
-                ApplyOptions { session_id, agent },
-            )?;
+            let report =
+                rename_alias(&root, &path, &from, &to, ApplyOptions { session_id, agent })?;
             println!(
                 "renamed real={} -> {} occurrences={} sanitized_now={} files={} journal={}",
                 report.real_from,
@@ -390,7 +385,11 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>) -> Result<()> {
                 && fs::read_to_string(&pre)
                     .map(|body| body.contains("permissionDecision"))
                     .unwrap_or(false);
-            println!("codex hooks.json={} exists={}", hooks.display(), hooks.exists());
+            println!(
+                "codex hooks.json={} exists={}",
+                hooks.display(),
+                hooks.exists()
+            );
             println!("codex pre_tool_use.py exists={}", pre.exists());
             println!("codex post_tool_use.py exists={}", post.exists());
             println!(

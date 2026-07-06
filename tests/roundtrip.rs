@@ -487,7 +487,11 @@ fn gitignore_full_syntax_is_respected() {
     let repo = tempfile::tempdir().unwrap();
     fs::create_dir_all(repo.path().join("src/logs")).unwrap();
     fs::create_dir_all(repo.path().join("secret")).unwrap();
-    fs::write(repo.path().join(".gitignore"), "**/*.log\n!keep.log\nsecret/\n").unwrap();
+    fs::write(
+        repo.path().join(".gitignore"),
+        "**/*.log\n!keep.log\nsecret/\n",
+    )
+    .unwrap();
     fs::write(repo.path().join("src/app.rs"), "fn safe() {}\n").unwrap();
     fs::write(repo.path().join("src/logs/debug.log"), "log line\n").unwrap();
     fs::write(repo.path().join("keep.log"), "keep line\n").unwrap();
@@ -609,7 +613,11 @@ fn opencode_bridge_creates_real_file_from_new_mirror_file() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
     let new_mirror_path = repo.path().join(".code-sanity/mirror/src/created.rs");
-    fs::write(&new_mirror_path, "pub fn created_ok() -> usize {\n    2\n}\n").unwrap();
+    fs::write(
+        &new_mirror_path,
+        "pub fn created_ok() -> usize {\n    2\n}\n",
+    )
+    .unwrap();
 
     code_sanity::project_mirror_edit(
         repo.path(),
@@ -654,8 +662,12 @@ fn mcp_server_reads_sanitized_and_applies_patch() {
         .collect::<Vec<_>>()
         .join("\n");
     let mut out = Vec::new();
-    code_sanity::mcp::serve(repo.path(), std::io::Cursor::new(input.into_bytes()), &mut out)
-        .unwrap();
+    code_sanity::mcp::serve(
+        repo.path(),
+        std::io::Cursor::new(input.into_bytes()),
+        &mut out,
+    )
+    .unwrap();
     let responses: Vec<Value> = String::from_utf8(out)
         .unwrap()
         .lines()
@@ -725,11 +737,7 @@ fn codex_and_claude_hooks_generate_and_verify() {
     serde_json::from_str::<Value>(&codex_hooks).unwrap();
     let claude_settings = fs::read_to_string(repo.path().join(".claude/settings.json")).unwrap();
     serde_json::from_str::<Value>(&claude_settings).unwrap();
-    assert!(
-        repo.path()
-            .join(".claude/hooks/session_start.py")
-            .exists()
-    );
+    assert!(repo.path().join(".claude/hooks/session_start.py").exists());
 }
 
 #[test]
@@ -776,7 +784,10 @@ fn codex_and_claude_hooks_enforce_strict_mode() {
             .to_string(),
     );
     assert!(allow.contains("\"allow\""), "codex allow: {allow}");
-    assert!(!allow.contains("deny"), "codex mirror edit not denied: {allow}");
+    assert!(
+        !allow.contains("deny"),
+        "codex mirror edit not denied: {allow}"
+    );
 
     // Codex: obvious shell reads are redirected to the mirror.
     let redirect = run_hook(
@@ -843,7 +854,8 @@ fn external_model_proposals_validated_queued_and_applied_on_approval() {
     config.save(&layout).unwrap();
 
     let report =
-        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs"))).unwrap();
+        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")))
+            .unwrap();
     assert_eq!(report.proposed, 3);
     assert_eq!(report.queued, 1);
     assert_eq!(report.rejected.len(), 2);
@@ -912,7 +924,8 @@ fn heuristic_provider_queues_denylist_terms() {
     config.save(&layout).unwrap();
 
     let report =
-        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs"))).unwrap();
+        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")))
+            .unwrap();
     assert_eq!(report.queued, 1);
     let items = code_sanity::proposal::list_review(repo.path(), false).unwrap();
     assert_eq!(items.len(), 1);
@@ -926,11 +939,7 @@ fn review_sanitize_reports_applied_replacements() {
     index_workspace(repo.path()).unwrap();
     Command::cargo_bin("code-sanity")
         .unwrap()
-        .args([
-            "--root",
-            repo.path().to_str().unwrap(),
-            "review-sanitize",
-        ])
+        .args(["--root", repo.path().to_str().unwrap(), "review-sanitize"])
         .assert()
         .success()
         .stdout(predicate::str::contains("dangerous -> neutral"))
