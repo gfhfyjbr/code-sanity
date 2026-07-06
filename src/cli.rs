@@ -1,5 +1,8 @@
 use crate::index::{index_workspace, init_workspace};
-use crate::patch::{ApplyOptions, apply_patch_text_with_options, write_sanitized_content};
+use crate::patch::{
+    ApplyOptions, apply_patch_text_with_options, recover_workspace, rename_alias,
+    write_sanitized_content,
+};
 use crate::search::{read_sanitized_file, search_mirror};
 use crate::verify::verify_workspace;
 use anyhow::{Context, Result};
@@ -45,6 +48,24 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         sanitized_content: Option<PathBuf>,
+    },
+    /// Rename a sanitized alias to a new name (renames the real symbol).
+    Rename {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Replay or roll back an apply interrupted mid-write.
+    Recover {
+        #[arg(long)]
+        rollback: bool,
     },
     Sync,
     Verify,
@@ -123,6 +144,38 @@ pub fn run() -> Result<()> {
                 "wrote files={} journal={}",
                 report.files.join(","),
                 report.journal_path.display()
+            );
+        }
+        Command::Rename {
+            path,
+            from,
+            to,
+            agent,
+            session_id,
+        } => {
+            let report = rename_alias(
+                &root,
+                &path,
+                &from,
+                &to,
+                ApplyOptions { session_id, agent },
+            )?;
+            println!(
+                "renamed real={} -> {} occurrences={} sanitized_now={} files={} journal={}",
+                report.real_from,
+                to,
+                report.occurrences,
+                report.sanitized_to,
+                report.apply.files.join(","),
+                report.apply.journal_path.display()
+            );
+        }
+        Command::Recover { rollback } => {
+            let report = recover_workspace(&root, rollback)?;
+            println!(
+                "recovered entries={} rolled_back={}",
+                report.recovered.len(),
+                report.rolled_back
             );
         }
         Command::Sync => {

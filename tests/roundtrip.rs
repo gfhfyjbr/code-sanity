@@ -282,6 +282,184 @@ fn write_command_back_projects_sanitized_content() {
 }
 
 #[test]
+fn create_patch_adds_new_real_file() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let patch = "\
+--- /dev/null
++++ b/src/added.rs
+@@ -0,0 +1,3 @@
++pub fn added() -> usize {
++    7
++}
+";
+    let report = apply_patch_text(repo.path(), patch).unwrap();
+    assert_eq!(report.files, vec!["src/added.rs"]);
+    let real = fs::read_to_string(repo.path().join("src/added.rs")).unwrap();
+    assert_eq!(real, "pub fn added() -> usize {\n    7\n}\n");
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/added.rs")).unwrap();
+    assert_eq!(mirror, real);
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn create_patch_with_sanitizable_content_conflicts() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let patch = "\
+--- /dev/null
++++ b/src/added.rs
+@@ -0,0 +1,1 @@
++// dangerous new comment
+";
+    let err = apply_patch_text(repo.path(), patch).unwrap_err();
+    assert!(err.to_string().contains("sanitizable"));
+    assert!(!repo.path().join("src/added.rs").exists());
+}
+
+#[test]
+fn delete_patch_removes_file_mirror_and_map() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    let count = mirror.lines().count();
+    let mut patch = String::from("--- a/src/lib.rs\n+++ /dev/null\n");
+    patch.push_str(&format!("@@ -1,{count} +0,0 @@\n"));
+    for line in mirror.lines() {
+        patch.push_str(&format!("-{line}\n"));
+    }
+    let report = apply_patch_text(repo.path(), &patch).unwrap();
+    assert_eq!(report.files, vec!["src/lib.rs"]);
+    assert!(!repo.path().join("src/lib.rs").exists());
+    assert!(!repo.path().join(".code-sanity/mirror/src/lib.rs").exists());
+    assert!(
+        !repo
+            .path()
+            .join(".code-sanity/maps/src/lib.rs.map.json")
+            .exists()
+    );
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn recover_replays_interrupted_apply() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let real_path = repo.path().join("src/lib.rs");
+    let before = fs::read_to_string(&real_path).unwrap();
+    let after = before.replace("    1\n", "    9\n");
+    assert_ne!(before, after);
+
+    // Simulate a crash: the `applying` journal is durably written, but the real
+    // file was not modified yet, and the stale apply lock is still on disk.
+    let layout = code_sanity::config::Layout::new(repo.path());
+    fs::write(layout.tmp_dir.join("apply.lock"), "stale").unwrap();
+    let entry = code_sanity::journal::JournalEntry {
+        id: code_sanity::journal::new_journal_id(),
+        status: code_sanity::journal::JournalStatus::Applying,
+        session_id: None,
+        agent: None,
+        files: vec!["src/lib.rs".to_string()],
+        sanitized_patch: String::new(),
+        original_patch: String::new(),
+        error: None,
+        created_at: "now".to_string(),
+        pending: Some(vec![code_sanity::journal::PendingFile {
+            rel: "src/lib.rs".to_string(),
+            before: Some(before.clone()),
+            after: Some(after.clone()),
+        }]),
+    };
+    code_sanity::journal::write_journal(&layout, &entry).unwrap();
+
+    let report = code_sanity::recover_workspace(repo.path(), false).unwrap();
+    assert_eq!(report.recovered.len(), 1);
+    assert!(!report.rolled_back);
+    assert_eq!(fs::read_to_string(&real_path).unwrap(), after);
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn recover_rolls_back_interrupted_apply() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let real_path = repo.path().join("src/lib.rs");
+    let before = fs::read_to_string(&real_path).unwrap();
+    let after = before.replace("    1\n", "    9\n");
+    // Simulate a crash after the real file was written but before finalize.
+    fs::write(&real_path, &after).unwrap();
+
+    let layout = code_sanity::config::Layout::new(repo.path());
+    let entry = code_sanity::journal::JournalEntry {
+        id: code_sanity::journal::new_journal_id(),
+        status: code_sanity::journal::JournalStatus::Applying,
+        session_id: None,
+        agent: None,
+        files: vec!["src/lib.rs".to_string()],
+        sanitized_patch: String::new(),
+        original_patch: String::new(),
+        error: None,
+        created_at: "now".to_string(),
+        pending: Some(vec![code_sanity::journal::PendingFile {
+            rel: "src/lib.rs".to_string(),
+            before: Some(before.clone()),
+            after: Some(after.clone()),
+        }]),
+    };
+    code_sanity::journal::write_journal(&layout, &entry).unwrap();
+
+    let report = code_sanity::recover_workspace(repo.path(), true).unwrap();
+    assert_eq!(report.recovered.len(), 1);
+    assert!(report.rolled_back);
+    assert_eq!(fs::read_to_string(&real_path).unwrap(), before);
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn rename_alias_renames_real_symbol() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+
+    let report = code_sanity::rename_alias(
+        repo.path(),
+        Path::new("src/lib.rs"),
+        "neutral_parser",
+        "friendly_parser",
+        code_sanity::patch::ApplyOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(report.real_from, "dangerous_parser");
+    assert_eq!(report.sanitized_to, "friendly_parser");
+    assert_eq!(report.occurrences, 1);
+
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(real.contains("fn friendly_parser()"));
+    assert!(!real.contains("dangerous_parser"));
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    assert!(mirror.contains("fn friendly_parser()"));
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn gitignore_full_syntax_is_respected() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src/logs")).unwrap();
+    fs::create_dir_all(repo.path().join("secret")).unwrap();
+    fs::write(repo.path().join(".gitignore"), "**/*.log\n!keep.log\nsecret/\n").unwrap();
+    fs::write(repo.path().join("src/app.rs"), "fn safe() {}\n").unwrap();
+    fs::write(repo.path().join("src/logs/debug.log"), "log line\n").unwrap();
+    fs::write(repo.path().join("keep.log"), "keep line\n").unwrap();
+    fs::write(repo.path().join("secret/data.rs"), "fn secret_thing() {}\n").unwrap();
+
+    index_workspace(repo.path()).unwrap();
+    let mirror = repo.path().join(".code-sanity/mirror");
+    assert!(mirror.join("src/app.rs").exists());
+    assert!(!mirror.join("src/logs/debug.log").exists()); // matched by **/*.log
+    assert!(mirror.join("keep.log").exists()); // negated by !keep.log
+    assert!(!mirror.join("secret/data.rs").exists()); // dir pattern secret/
+}
+
+#[test]
 fn cli_index_read_search_verify_smoke() {
     let repo = copy_fixture("basic-rust");
     Command::cargo_bin("code-sanity")

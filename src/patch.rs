@@ -1,7 +1,9 @@
 use crate::config::{Config, Layout, normalize_rel_path, normalize_safe_rel_path};
 use crate::db;
 use crate::index::{index_single_file, init_workspace};
-use crate::journal::{JournalEntry, JournalStatus, new_journal_id, write_journal};
+use crate::journal::{
+    JournalEntry, JournalStatus, PendingFile, list_journal_entries, new_journal_id, write_journal,
+};
 use crate::map::{SpanMap, common_changed_range, load_span_map, sha256_hex};
 use crate::sanitize::sanitize_content;
 use crate::search::{ensure_existing_path_inside, normalize_sanitized_rel_path};
@@ -99,113 +101,45 @@ fn apply_patch_text_with_options_inner(
     let mut files = Vec::new();
 
     for file_patch in parsed.files {
-        let rel = normalize_patch_file_path(&file_patch.new_path, root, &layout)
-            .or_else(|_| normalize_patch_file_path(&file_patch.old_path, root, &layout))
-            .with_context(|| {
-                format!(
-                    "patch paths are not inside sanitized mirror or repo: {} -> {}",
-                    file_patch.old_path, file_patch.new_path
-                )
-            })?;
-        let rel_string = normalize_rel_path(&rel);
-        let real_path = root.join(&rel);
-        let mirror_path = layout.mirror_dir.join(&rel);
-        let map_path = layout.map_path(&rel);
-
-        let span_map = load_span_map(&map_path)
-            .with_context(|| format!("load span map {}; run index first", map_path.display()))?;
-        let (db_original_hash, db_sanitized_hash) = db::file_hashes(&conn, &rel_string)?
-            .ok_or_else(|| anyhow!("{rel_string}: file is not tracked; run index first"))?;
-        let real_content = fs::read_to_string(&real_path)
-            .with_context(|| format!("read real file {}", real_path.display()))?;
-        let mirror_content = fs::read_to_string(&mirror_path)
-            .with_context(|| format!("read mirror file {}", mirror_path.display()))?;
-
-        let real_hash = sha256_hex(real_content.as_bytes());
-        let mirror_hash = sha256_hex(mirror_content.as_bytes());
-        if real_hash != db_original_hash {
-            return write_conflict_and_bail(
+        match classify_file_op(&file_patch) {
+            FileOp::Modify => plan_modify(
+                root,
+                &layout,
+                &config,
+                &conn,
+                &options,
+                patch_text,
+                &file_patch,
+                &mut planned,
+                &mut original_patch,
+                &mut files,
+            )?,
+            FileOp::Create => plan_create(
+                root,
+                &layout,
+                &config,
+                &conn,
+                &options,
+                patch_text,
+                &file_patch,
+                &mut planned,
+                &mut original_patch,
+                &mut files,
+            )?,
+            FileOp::Delete => plan_delete(
+                root,
                 &layout,
                 &conn,
                 &options,
                 patch_text,
-                &original_patch,
-                &files,
-                format!("{rel_string}: real file drifted since last index; run `code-sanity sync`"),
-            );
+                &file_patch,
+                &mut planned,
+                &mut original_patch,
+                &mut files,
+            )?,
         }
-        if mirror_hash != db_sanitized_hash || mirror_hash != span_map.sanitized_hash {
-            return write_conflict_and_bail(
-                &layout,
-                &conn,
-                &options,
-                patch_text,
-                &original_patch,
-                &files,
-                format!(
-                    "{rel_string}: sanitized mirror drifted since last index; run `code-sanity sync`"
-                ),
-            );
-        }
-
-        for (start, end) in changed_ranges(&mirror_content, &file_patch)? {
-            if span_map.conflicts_with_sanitized_edit(start, end) {
-                return write_conflict_and_bail(
-                    &layout,
-                    &conn,
-                    &options,
-                    patch_text,
-                    &original_patch,
-                    &files,
-                    format!(
-                        "{rel_string}: patch edits sanitized replacement span at bytes {start}..{end}; automatic apply refused"
-                    ),
-                );
-            }
-        }
-
-        let patched_sanitized = apply_file_patch_to_content(&mirror_content, &file_patch)
-            .with_context(|| format!("apply sanitized patch to {rel_string}"))?;
-        let original_file_patch = translate_file_patch(&file_patch, &span_map, &mirror_content)?;
-        let patched_original = apply_file_patch_to_content(&real_content, &original_file_patch)
-            .with_context(|| format!("apply translated patch to {rel_string}"))?;
-        let rendered_after = sanitize_content(&rel, &patched_original, &config)
-            .with_context(|| format!("resanitize patched {rel_string}"))?;
-        if rendered_after.sanitized != patched_sanitized {
-            return write_conflict_and_bail(
-                &layout,
-                &conn,
-                &options,
-                patch_text,
-                &render_file_patch(&original_file_patch),
-                &files,
-                format!(
-                    "{rel_string}: translated patch does not preserve sanitize(real) == patched mirror invariant"
-                ),
-            );
-        }
-
-        original_patch.push_str(&render_file_patch(&original_file_patch));
-        files.push(rel_string.clone());
-        planned.push(PlannedFileApply {
-            rel,
-            real_path,
-            next_content: patched_original,
-        });
     }
 
-    let backups = planned
-        .iter()
-        .map(|planned_file| {
-            fs::read_to_string(&planned_file.real_path)
-                .with_context(|| format!("backup {}", planned_file.real_path.display()))
-                .map(|content| FileBackup {
-                    rel: planned_file.rel.clone(),
-                    real_path: planned_file.real_path.clone(),
-                    content,
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
     let journal_path = commit_planned_apply(
         root,
         &layout,
@@ -215,7 +149,6 @@ fn apply_patch_text_with_options_inner(
         &original_patch,
         &files,
         &planned,
-        &backups,
         fail_after_writes_for_test,
     )?;
 
@@ -223,6 +156,271 @@ fn apply_patch_text_with_options_inner(
         files,
         journal_path,
     })
+}
+
+enum FileOp {
+    Modify,
+    Create,
+    Delete,
+}
+
+fn classify_file_op(file_patch: &FilePatch) -> FileOp {
+    let old_null = file_patch.old_path == "/dev/null";
+    let new_null = file_patch.new_path == "/dev/null";
+    match (old_null, new_null) {
+        (true, false) => FileOp::Create,
+        (false, true) => FileOp::Delete,
+        _ => FileOp::Modify,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_modify(
+    root: &Path,
+    layout: &Layout,
+    config: &Config,
+    conn: &rusqlite::Connection,
+    options: &ApplyOptions,
+    patch_text: &str,
+    file_patch: &FilePatch,
+    planned: &mut Vec<PlannedFileApply>,
+    original_patch: &mut String,
+    files: &mut Vec<String>,
+) -> Result<()> {
+    let rel = normalize_patch_file_path(&file_patch.new_path, root, layout)
+        .or_else(|_| normalize_patch_file_path(&file_patch.old_path, root, layout))
+        .with_context(|| {
+            format!(
+                "patch paths are not inside sanitized mirror or repo: {} -> {}",
+                file_patch.old_path, file_patch.new_path
+            )
+        })?;
+    let rel_string = normalize_rel_path(&rel);
+    let real_path = root.join(&rel);
+    let mirror_path = layout.mirror_dir.join(&rel);
+    let map_path = layout.map_path(&rel);
+
+    let span_map = load_span_map(&map_path)
+        .with_context(|| format!("load span map {}; run index first", map_path.display()))?;
+    let (db_original_hash, db_sanitized_hash) = db::file_hashes(conn, &rel_string)?
+        .ok_or_else(|| anyhow!("{rel_string}: file is not tracked; run index first"))?;
+    let real_content = fs::read_to_string(&real_path)
+        .with_context(|| format!("read real file {}", real_path.display()))?;
+    let mirror_content = fs::read_to_string(&mirror_path)
+        .with_context(|| format!("read mirror file {}", mirror_path.display()))?;
+
+    let real_hash = sha256_hex(real_content.as_bytes());
+    let mirror_hash = sha256_hex(mirror_content.as_bytes());
+    if real_hash != db_original_hash {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            original_patch,
+            files,
+            format!("{rel_string}: real file drifted since last index; run `code-sanity sync`"),
+        );
+    }
+    if mirror_hash != db_sanitized_hash || mirror_hash != span_map.sanitized_hash {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            original_patch,
+            files,
+            format!(
+                "{rel_string}: sanitized mirror drifted since last index; run `code-sanity sync`"
+            ),
+        );
+    }
+
+    for (start, end) in changed_ranges(&mirror_content, file_patch)? {
+        if span_map.conflicts_with_sanitized_edit(start, end) {
+            return write_conflict_and_bail(
+                layout,
+                conn,
+                options,
+                patch_text,
+                original_patch,
+                files,
+                format!(
+                    "{rel_string}: patch edits sanitized replacement span at bytes {start}..{end}; automatic apply refused"
+                ),
+            );
+        }
+    }
+
+    let patched_sanitized = apply_file_patch_to_content(&mirror_content, file_patch)
+        .with_context(|| format!("apply sanitized patch to {rel_string}"))?;
+    let original_file_patch = translate_file_patch(file_patch, &span_map, &mirror_content)?;
+    let patched_original = apply_file_patch_to_content(&real_content, &original_file_patch)
+        .with_context(|| format!("apply translated patch to {rel_string}"))?;
+    let rendered_after = sanitize_content(&rel, &patched_original, config)
+        .with_context(|| format!("resanitize patched {rel_string}"))?;
+    if rendered_after.sanitized != patched_sanitized {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            &render_file_patch(&original_file_patch),
+            files,
+            format!(
+                "{rel_string}: translated patch does not preserve sanitize(real) == patched mirror invariant"
+            ),
+        );
+    }
+
+    original_patch.push_str(&render_file_patch(&original_file_patch));
+    files.push(rel_string);
+    planned.push(PlannedFileApply {
+        rel,
+        before: Some(real_content),
+        op: PlannedOp::Write(patched_original),
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_create(
+    root: &Path,
+    layout: &Layout,
+    config: &Config,
+    conn: &rusqlite::Connection,
+    options: &ApplyOptions,
+    patch_text: &str,
+    file_patch: &FilePatch,
+    planned: &mut Vec<PlannedFileApply>,
+    original_patch: &mut String,
+    files: &mut Vec<String>,
+) -> Result<()> {
+    let rel = normalize_patch_file_path(&file_patch.new_path, root, layout)
+        .with_context(|| format!("create target is not inside repo: {}", file_patch.new_path))?;
+    let rel_string = normalize_rel_path(&rel);
+    let real_path = root.join(&rel);
+
+    if real_path.exists() {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            original_patch,
+            files,
+            format!("{rel_string}: create target already exists; send a modify patch instead"),
+        );
+    }
+
+    let created = created_content_from_patch(file_patch)
+        .with_context(|| format!("build created content for {rel_string}"))?;
+    // A created file's patch is written against the mirror, so the added lines
+    // become the real file directly. The real repo stays the source of truth,
+    // so the new file must already be neutral: sanitize(real) must equal the
+    // content the agent sent, otherwise what they see after create would drift.
+    let rendered = sanitize_content(&rel, &created, config)
+        .with_context(|| format!("sanitize created {rel_string}"))?;
+    if rendered.sanitized != created {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            original_patch,
+            files,
+            format!(
+                "{rel_string}: created file contains sanitizable text; create already-neutral content or rename after create"
+            ),
+        );
+    }
+
+    original_patch.push_str(&render_file_patch(file_patch));
+    files.push(rel_string);
+    planned.push(PlannedFileApply {
+        rel,
+        before: None,
+        op: PlannedOp::Write(created),
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_delete(
+    root: &Path,
+    layout: &Layout,
+    conn: &rusqlite::Connection,
+    options: &ApplyOptions,
+    patch_text: &str,
+    file_patch: &FilePatch,
+    planned: &mut Vec<PlannedFileApply>,
+    original_patch: &mut String,
+    files: &mut Vec<String>,
+) -> Result<()> {
+    let rel = normalize_patch_file_path(&file_patch.old_path, root, layout)
+        .with_context(|| format!("delete target is not inside repo: {}", file_patch.old_path))?;
+    let rel_string = normalize_rel_path(&rel);
+    let real_path = root.join(&rel);
+    let mirror_path = layout.mirror_dir.join(&rel);
+    let map_path = layout.map_path(&rel);
+
+    let span_map = load_span_map(&map_path)
+        .with_context(|| format!("load span map {}; run index first", map_path.display()))?;
+    let (db_original_hash, db_sanitized_hash) = db::file_hashes(conn, &rel_string)?
+        .ok_or_else(|| anyhow!("{rel_string}: file is not tracked; run index first"))?;
+    let real_content = fs::read_to_string(&real_path)
+        .with_context(|| format!("read real file {}", real_path.display()))?;
+    let mirror_content = fs::read_to_string(&mirror_path)
+        .with_context(|| format!("read mirror file {}", mirror_path.display()))?;
+
+    if sha256_hex(real_content.as_bytes()) != db_original_hash {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            original_patch,
+            files,
+            format!("{rel_string}: real file drifted since last index; run `code-sanity sync`"),
+        );
+    }
+    let mirror_hash = sha256_hex(mirror_content.as_bytes());
+    if mirror_hash != db_sanitized_hash || mirror_hash != span_map.sanitized_hash {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            original_patch,
+            files,
+            format!(
+                "{rel_string}: sanitized mirror drifted since last index; run `code-sanity sync`"
+            ),
+        );
+    }
+
+    let patched_mirror = apply_file_patch_to_content(&mirror_content, file_patch)
+        .with_context(|| format!("apply delete patch to {rel_string}"))?;
+    if !patched_mirror.is_empty() {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            original_patch,
+            files,
+            format!("{rel_string}: delete patch must remove the entire file"),
+        );
+    }
+
+    original_patch.push_str(&whole_file_delete_patch(&rel_string, &real_content));
+    files.push(rel_string);
+    planned.push(PlannedFileApply {
+        rel,
+        before: Some(real_content),
+        op: PlannedOp::Delete,
+    });
+    Ok(())
 }
 
 pub fn write_sanitized_content(
@@ -252,6 +450,7 @@ pub fn write_sanitized_content(
             original_patch: String::new(),
             error: None,
             created_at: Utc::now().to_rfc3339(),
+            pending: None,
         };
         let journal_path = write_journal(&layout, &entry)?;
         return Ok(ApplyReport {
@@ -263,16 +462,232 @@ pub fn write_sanitized_content(
     apply_patch_text(root, &patch)
 }
 
-struct PlannedFileApply {
-    rel: PathBuf,
-    real_path: PathBuf,
-    next_content: String,
+#[derive(Debug, Clone)]
+pub struct RenameReport {
+    pub apply: ApplyReport,
+    pub real_from: String,
+    pub sanitized_to: String,
+    pub occurrences: usize,
 }
 
-struct FileBackup {
+/// Rename a symbol the agent sees under a sanitized alias. Editing inside a
+/// replacement span via a normal patch is refused on purpose; this is the
+/// sanctioned path. `from` is the sanitized identifier visible in the mirror;
+/// it is reversed through the span map to the real identifier, which is then
+/// renamed to `to` across the real file and reindexed. Because the real repo is
+/// the source of truth, the rename lands on the real symbol, not just the alias.
+pub fn rename_alias(
+    root: &Path,
+    rel_path: &Path,
+    from: &str,
+    to: &str,
+    options: ApplyOptions,
+) -> Result<RenameReport> {
+    if from.is_empty() {
+        bail!("rename source alias must not be empty");
+    }
+    if !is_valid_identifier(to) {
+        bail!("rename target {to:?} is not a valid identifier");
+    }
+
+    let layout = init_workspace(root)?;
+    let conn = db::connect(&layout)?;
+    db::init_schema(&conn)?;
+    let _lock = ApplyLock::acquire(layout.tmp_dir.join("apply.lock"))?;
+
+    let rel = normalize_sanitized_rel_path(rel_path)?;
+    let rel_string = normalize_rel_path(&rel);
+    let real_path = root.join(&rel);
+    let mirror_path = layout.mirror_dir.join(&rel);
+    let map_path = layout.map_path(&rel);
+
+    let span_map = load_span_map(&map_path)
+        .with_context(|| format!("load span map {}; run index first", map_path.display()))?;
+    let (db_original_hash, db_sanitized_hash) = db::file_hashes(&conn, &rel_string)?
+        .ok_or_else(|| anyhow!("{rel_string}: file is not tracked; run index first"))?;
+    let real_content = fs::read_to_string(&real_path)
+        .with_context(|| format!("read real file {}", real_path.display()))?;
+    let mirror_content = fs::read_to_string(&mirror_path)
+        .with_context(|| format!("read mirror file {}", mirror_path.display()))?;
+    if sha256_hex(real_content.as_bytes()) != db_original_hash
+        || sha256_hex(mirror_content.as_bytes()) != db_sanitized_hash
+    {
+        bail!("{rel_string}: real or mirror drifted since last index; run `code-sanity sync`");
+    }
+
+    let (from_start, from_end) = find_whole_word(&mirror_content, from)
+        .ok_or_else(|| anyhow!("alias {from:?} not found as a whole word in {rel_string}"))?;
+    let real_from = reverse_sanitized_region(&span_map, &mirror_content, from_start, from_end);
+    if real_from == to {
+        bail!("{rel_string}: alias {from:?} already maps to real identifier {to:?}");
+    }
+
+    let (next_real, occurrences) = replace_whole_word(&real_content, &real_from, to);
+    if occurrences == 0 {
+        bail!("{rel_string}: could not locate real identifier {real_from:?} for alias {from:?}");
+    }
+
+    let original_patch = whole_file_patch(&rel, &real_content, &next_real);
+    let note = format!("rename alias {from} -> {to} (real {real_from} -> {to})");
+    let planned = vec![PlannedFileApply {
+        rel: rel.clone(),
+        before: Some(real_content),
+        op: PlannedOp::Write(next_real),
+    }];
+    let journal_path = commit_planned_apply(
+        root,
+        &layout,
+        &conn,
+        &options,
+        &note,
+        &original_patch,
+        std::slice::from_ref(&rel_string),
+        &planned,
+        None,
+    )?;
+
+    let sanitized_after = fs::read_to_string(&mirror_path).unwrap_or_default();
+    let sanitized_to = find_whole_word(&sanitized_after, to)
+        .map(|_| to.to_string())
+        .unwrap_or_else(|| "<re-aliased>".to_string());
+
+    Ok(RenameReport {
+        apply: ApplyReport {
+            files: vec![rel_string],
+            journal_path,
+        },
+        real_from,
+        sanitized_to,
+        occurrences,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecoverReport {
+    pub recovered: Vec<String>,
+    pub rolled_back: bool,
+}
+
+/// Finish or undo any apply that was interrupted after its `applying` journal
+/// entry was written but before it reached a terminal state. By default the
+/// apply is replayed to its recorded `after` state (roll-forward). With
+/// `rollback`, every touched file is restored to its `before` state instead.
+pub fn recover_workspace(root: &Path, rollback: bool) -> Result<RecoverReport> {
+    let layout = init_workspace(root)?;
+    let conn = db::connect(&layout)?;
+    db::init_schema(&conn)?;
+    // A crash mid-apply leaves a stale lock behind (Drop never ran). recover is
+    // the tool for exactly that state, so it clears a leftover lock before
+    // taking its own. It assumes no live apply is running concurrently.
+    let lock_path = layout.tmp_dir.join("apply.lock");
+    let _ = fs::remove_file(&lock_path);
+    let _lock = ApplyLock::acquire(lock_path)?;
+
+    let mut report = RecoverReport {
+        rolled_back: rollback,
+        ..RecoverReport::default()
+    };
+    for (path, mut entry) in list_journal_entries(&layout)? {
+        if entry.status != JournalStatus::Applying {
+            continue;
+        }
+        let Some(pending) = entry.pending.clone() else {
+            continue;
+        };
+        for pending_file in &pending {
+            let rel = PathBuf::from(&pending_file.rel);
+            let target = if rollback {
+                pending_file.before.as_deref()
+            } else {
+                pending_file.after.as_deref()
+            };
+            set_file_state(root, &layout, &conn, &rel, target)
+                .with_context(|| format!("recover {}", pending_file.rel))?;
+        }
+        entry.status = if rollback {
+            JournalStatus::RolledBack
+        } else {
+            JournalStatus::Success
+        };
+        entry.pending = None;
+        entry.error = Some(if rollback {
+            "recovered: rolled back interrupted apply".to_string()
+        } else {
+            "recovered: replayed interrupted apply".to_string()
+        });
+        write_journal(&layout, &entry)?;
+        db::insert_journal_row(
+            &conn,
+            entry.session_id.as_deref(),
+            entry.agent.as_deref(),
+            &entry.sanitized_patch,
+            &entry.original_patch,
+            if rollback { "rolled-back" } else { "success" },
+            &Utc::now().to_rfc3339(),
+        )?;
+        report.recovered.push(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    Ok(report)
+}
+
+/// Reconstruct a created file's content from a pure-add patch hunk.
+fn created_content_from_patch(file_patch: &FilePatch) -> Result<String> {
+    let mut out = String::new();
+    for hunk in &file_patch.hunks {
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Add(text) => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                HunkLine::Context(_) | HunkLine::Remove(_) => {
+                    bail!("create patch must contain only added lines");
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        bail!("create patch adds no content");
+    }
+    Ok(out)
+}
+
+fn whole_file_delete_patch(rel: &str, content: &str) -> String {
+    let count = content.lines().count();
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{rel}\n+++ /dev/null\n@@ -1,{count} +0,0 @@\n"));
+    for line in content.lines() {
+        out.push_str(&format!("-{line}\n"));
+    }
+    out
+}
+
+struct PlannedFileApply {
     rel: PathBuf,
-    real_path: PathBuf,
-    content: String,
+    /// Content before this apply, or `None` if the file is being created.
+    before: Option<String>,
+    op: PlannedOp,
+}
+
+enum PlannedOp {
+    /// Create or modify: the file's final content.
+    Write(String),
+    /// Remove the file, mirror, map, and db row.
+    Delete,
+}
+
+impl PlannedFileApply {
+    fn after(&self) -> Option<&str> {
+        match &self.op {
+            PlannedOp::Write(content) => Some(content.as_str()),
+            PlannedOp::Delete => None,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -285,73 +700,131 @@ fn commit_planned_apply(
     original_patch: &str,
     files: &[String],
     planned: &[PlannedFileApply],
-    backups: &[FileBackup],
     fail_after_writes_for_test: Option<usize>,
 ) -> Result<PathBuf> {
-    let mut written = Vec::<PathBuf>::new();
-    let commit_result = (|| -> Result<PathBuf> {
+    // Record the full intent (before/after per file) BEFORE touching any real
+    // file. If the process dies mid-apply, this durable `applying` entry lets
+    // `code-sanity recover` replay or roll back the half-finished apply.
+    let pending: Vec<PendingFile> = planned
+        .iter()
+        .map(|planned_file| PendingFile {
+            rel: normalize_rel_path(&planned_file.rel),
+            before: planned_file.before.clone(),
+            after: planned_file.after().map(ToOwned::to_owned),
+        })
+        .collect();
+    let id = new_journal_id();
+    let created_at = Utc::now().to_rfc3339();
+    let mut entry = JournalEntry {
+        id,
+        status: JournalStatus::Applying,
+        session_id: options.session_id.clone(),
+        agent: options.agent.clone(),
+        files: files.to_vec(),
+        sanitized_patch: sanitized_patch.to_string(),
+        original_patch: original_patch.to_string(),
+        error: None,
+        created_at,
+        pending: Some(pending),
+    };
+    let journal_path = write_journal(layout, &entry)?;
+
+    let mut applied = Vec::<usize>::new();
+    let commit_result = (|| -> Result<()> {
         for (idx, planned_file) in planned.iter().enumerate() {
-            atomic_write(&planned_file.real_path, &planned_file.next_content)
-                .with_context(|| format!("write {}", planned_file.real_path.display()))?;
-            written.push(planned_file.real_path.clone());
+            set_file_state(root, layout, conn, &planned_file.rel, planned_file.after())
+                .with_context(|| format!("apply {}", planned_file.rel.display()))?;
+            applied.push(idx);
             if fail_after_writes_for_test == Some(idx + 1) {
                 bail!("simulated apply failure after {} write(s)", idx + 1);
             }
         }
-        for planned_file in planned {
-            index_single_file(root, &planned_file.rel)
-                .with_context(|| format!("reindex {}", planned_file.rel.display()))?;
-        }
-
-        let entry = JournalEntry {
-            id: new_journal_id(),
-            status: JournalStatus::Success,
-            session_id: options.session_id.clone(),
-            agent: options.agent.clone(),
-            files: files.to_vec(),
-            sanitized_patch: sanitized_patch.to_string(),
-            original_patch: original_patch.to_string(),
-            error: None,
-            created_at: Utc::now().to_rfc3339(),
-        };
-        let journal_path = write_journal(layout, &entry)?;
-        if let Err(err) = db::insert_journal_row(
-            conn,
-            options.session_id.as_deref(),
-            options.agent.as_deref(),
-            sanitized_patch,
-            original_patch,
-            "success",
-            &entry.created_at,
-        ) {
-            let _ = fs::remove_file(&journal_path);
-            return Err(err);
-        }
-        Ok(journal_path)
+        Ok(())
     })();
 
     match commit_result {
-        Ok(journal_path) => Ok(journal_path),
+        Ok(()) => {
+            entry.status = JournalStatus::Success;
+            entry.pending = None;
+            write_journal(layout, &entry)?;
+            db::insert_journal_row(
+                conn,
+                options.session_id.as_deref(),
+                options.agent.as_deref(),
+                sanitized_patch,
+                original_patch,
+                "success",
+                &entry.created_at,
+            )?;
+            Ok(journal_path)
+        }
         Err(err) => {
-            rollback_real_files(root, backups, &written)
-                .with_context(|| format!("apply failed ({err}); rollback failed"))?;
+            let rollback = (|| -> Result<()> {
+                for &idx in applied.iter().rev() {
+                    let planned_file = &planned[idx];
+                    set_file_state(
+                        root,
+                        layout,
+                        conn,
+                        &planned_file.rel,
+                        planned_file.before.as_deref(),
+                    )?;
+                }
+                Ok(())
+            })();
+            rollback.with_context(|| format!("apply failed ({err}); rollback failed"))?;
+            entry.status = JournalStatus::RolledBack;
+            entry.error = Some(err.to_string());
+            write_journal(layout, &entry)?;
+            db::insert_journal_row(
+                conn,
+                options.session_id.as_deref(),
+                options.agent.as_deref(),
+                sanitized_patch,
+                original_patch,
+                "rolled-back",
+                &entry.created_at,
+            )?;
             Err(err.context("apply failed after writes; rolled back real files"))
         }
     }
 }
 
-fn rollback_real_files(root: &Path, backups: &[FileBackup], written: &[PathBuf]) -> Result<()> {
-    for backup in backups {
-        if written.iter().any(|path| path == &backup.real_path) {
-            atomic_write(&backup.real_path, &backup.content)
-                .with_context(|| format!("restore {}", backup.real_path.display()))?;
+/// Drive `rel` to a target state: `Some(content)` writes the real file and
+/// reindexes its mirror/map/db; `None` deletes the real file plus its mirror,
+/// map, and db row. This is the single primitive shared by apply, rollback,
+/// and recover so every path is create/delete/modify aware.
+fn set_file_state(
+    root: &Path,
+    layout: &Layout,
+    conn: &rusqlite::Connection,
+    rel: &Path,
+    target: Option<&str>,
+) -> Result<()> {
+    let real_path = root.join(rel);
+    match target {
+        Some(content) => {
+            atomic_write(&real_path, content)
+                .with_context(|| format!("write {}", real_path.display()))?;
+            index_single_file(root, rel)
+                .with_context(|| format!("reindex {}", rel.display()))?;
+        }
+        None => {
+            remove_file_if_exists(&real_path)?;
+            remove_file_if_exists(&layout.mirror_dir.join(rel))?;
+            remove_file_if_exists(&layout.map_path(rel))?;
+            db::remove_file(conn, &normalize_rel_path(rel))?;
         }
     }
-    for backup in backups {
-        index_single_file(root, &backup.rel)
-            .with_context(|| format!("reindex restored {}", backup.rel.display()))?;
-    }
     Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
@@ -428,6 +901,7 @@ fn write_conflict_and_bail<T>(
         original_patch: original_patch.to_string(),
         error: Some(error.clone()),
         created_at: Utc::now().to_rfc3339(),
+        pending: None,
     };
     let journal_path = write_journal(layout, &entry)?;
     db::insert_journal_row(
@@ -856,6 +1330,94 @@ fn split_lines(content: &str) -> Vec<String> {
 fn line_body(line: &str) -> &str {
     let without_lf = line.strip_suffix('\n').unwrap_or(line);
     without_lf.strip_suffix('\r').unwrap_or(without_lf)
+}
+
+fn is_ident_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn is_valid_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(is_ident_char)
+}
+
+/// Find the first occurrence of `word` in `hay` bounded by non-identifier
+/// characters on both sides (a whole-token match).
+fn find_whole_word(hay: &str, word: &str) -> Option<(usize, usize)> {
+    if word.is_empty() {
+        return None;
+    }
+    let mut from = 0usize;
+    while let Some(rel) = hay[from..].find(word) {
+        let start = from + rel;
+        let end = start + word.len();
+        let before_ok = hay[..start].chars().next_back().is_none_or(|ch| !is_ident_char(ch));
+        let after_ok = hay[end..].chars().next().is_none_or(|ch| !is_ident_char(ch));
+        if before_ok && after_ok {
+            return Some((start, end));
+        }
+        from = end;
+    }
+    None
+}
+
+/// Replace every whole-word occurrence of `target` with `replacement`, returning
+/// the new text and the number of replacements made.
+fn replace_whole_word(content: &str, target: &str, replacement: &str) -> (String, usize) {
+    if target.is_empty() {
+        return (content.to_string(), 0);
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    while let Some(rel) = content[cursor..].find(target) {
+        let start = cursor + rel;
+        let end = start + target.len();
+        let before_ok = content[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_ident_char(ch));
+        let after_ok = content[end..].chars().next().is_none_or(|ch| !is_ident_char(ch));
+        if before_ok && after_ok {
+            out.push_str(&content[cursor..start]);
+            out.push_str(replacement);
+            cursor = end;
+            count += 1;
+        } else {
+            out.push_str(&content[cursor..end]);
+            cursor = end;
+        }
+    }
+    out.push_str(&content[cursor..]);
+    (out, count)
+}
+
+/// Reconstruct the original text of a sanitized byte range by splicing each
+/// fully-contained replacement's original text back in; unchanged regions in a
+/// span map already hold identical bytes in both views.
+fn reverse_sanitized_region(span_map: &SpanMap, mirror: &str, start: usize, end: usize) -> String {
+    let mut replacements: Vec<_> = span_map
+        .replacements
+        .iter()
+        .filter(|replacement| {
+            replacement.sanitized_start >= start && replacement.sanitized_end <= end
+        })
+        .collect();
+    replacements.sort_by_key(|replacement| replacement.sanitized_start);
+
+    let mut out = String::new();
+    let mut cursor = start;
+    for replacement in replacements {
+        out.push_str(&mirror[cursor..replacement.sanitized_start]);
+        out.push_str(&replacement.original_text);
+        cursor = replacement.sanitized_end;
+    }
+    out.push_str(&mirror[cursor..end]);
+    out
 }
 
 fn line_starts(content: &str) -> Vec<usize> {

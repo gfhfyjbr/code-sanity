@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
@@ -16,13 +16,34 @@ pub struct JournalEntry {
     pub original_patch: String,
     pub error: Option<String>,
     pub created_at: String,
+    /// Per-file before/after snapshots recorded *before* any real file is
+    /// touched, so an interrupted apply can be replayed or rolled back by
+    /// `code-sanity recover`. `None` for terminal entries that never entered
+    /// the applying state (e.g. conflicts detected before planning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Vec<PendingFile>>,
+}
+
+/// One file's transition captured for crash recovery. `before`/`after` are the
+/// full file contents (`None` means the file did not / must not exist, i.e.
+/// create and delete respectively).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingFile {
+    pub rel: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum JournalStatus {
+    /// Intent recorded; real files are being written. A durable entry with this
+    /// status means an apply was interrupted and `recover` should finish it.
+    Applying,
     Success,
     Conflict,
+    /// Apply failed after writes started and the real files were restored.
+    RolledBack,
 }
 
 pub fn new_journal_id() -> String {
@@ -36,4 +57,32 @@ pub fn write_journal(layout: &Layout, entry: &JournalEntry) -> Result<PathBuf> {
     let raw = serde_json::to_string_pretty(entry).context("serialize journal entry")?;
     fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+pub fn read_journal(path: &Path) -> Result<JournalEntry> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+}
+
+/// All journal entries in id order (id is a sortable UTC timestamp).
+pub fn list_journal_entries(layout: &Layout) -> Result<Vec<(PathBuf, JournalEntry)>> {
+    let mut out = Vec::new();
+    let read_dir = match fs::read_dir(&layout.journal_dir) {
+        Ok(read_dir) => read_dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read {}", layout.journal_dir.display()));
+        }
+    };
+    for entry in read_dir {
+        let entry = entry.context("read journal dir entry")?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let parsed = read_journal(&path)?;
+        out.push((path, parsed));
+    }
+    out.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+    Ok(out)
 }

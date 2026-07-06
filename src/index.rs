@@ -45,7 +45,7 @@ pub fn index_workspace(root: &Path) -> Result<IndexReport> {
             continue;
         }
         let rel = rel_path(root, entry.path())?;
-        if should_skip_file(root, &rel, entry.path(), &config)? {
+        if should_skip_file(&rel, entry.path(), &config)? {
             report.skipped += 1;
             continue;
         }
@@ -139,8 +139,10 @@ fn walk_repo(
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
+        .git_global(false)
         .git_exclude(true)
-        .parents(true)
+        .parents(false)
+        .require_git(false)
         .filter_entry(move |entry| {
             let name = entry.file_name().to_string_lossy();
             !extra_dirs.contains(name.as_ref())
@@ -150,13 +152,10 @@ fn walk_repo(
     Ok(walker)
 }
 
-fn should_skip_file(root: &Path, rel: &Path, path: &Path, config: &Config) -> Result<bool> {
+fn should_skip_file(rel: &Path, path: &Path, config: &Config) -> Result<bool> {
     let Some(file_name) = rel.file_name().and_then(|name| name.to_str()) else {
         return Ok(true);
     };
-    if is_ignored_by_root_gitignore(root, rel)? {
-        return Ok(true);
-    }
     if config.ignore.lockfiles.iter().any(|lock| lock == file_name) {
         return Ok(true);
     }
@@ -168,34 +167,6 @@ fn should_skip_file(root: &Path, rel: &Path, path: &Path, config: &Config) -> Re
         return Ok(true);
     }
     is_binary(path)
-}
-
-fn is_ignored_by_root_gitignore(root: &Path, rel: &Path) -> Result<bool> {
-    let gitignore = root.join(".gitignore");
-    let Ok(raw) = fs::read_to_string(&gitignore) else {
-        return Ok(false);
-    };
-    let rel_norm = normalize_rel_path(rel);
-    let file_name = rel.file_name().and_then(|name| name.to_str()).unwrap_or("");
-    for line in raw.lines() {
-        let pattern = line.trim();
-        if pattern.is_empty() || pattern.starts_with('#') || pattern.starts_with('!') {
-            continue;
-        }
-        let pattern = pattern.trim_start_matches('/');
-        if let Some(dir) = pattern.strip_suffix('/') {
-            if rel_norm == dir || rel_norm.starts_with(&format!("{dir}/")) {
-                return Ok(true);
-            }
-        } else if (!pattern.contains('/') && file_name == pattern) || rel_norm == pattern {
-            return Ok(true);
-        } else if let Some(suffix) = pattern.strip_prefix("*.")
-            && rel_norm.ends_with(&format!(".{suffix}"))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn is_binary(path: &Path) -> Result<bool> {
