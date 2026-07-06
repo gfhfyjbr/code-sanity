@@ -1,13 +1,21 @@
+// Workspace locking is flock-based and file durability relies on unix fd
+// semantics; other platforms would compile into silently unsafe binaries.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("code-sanity supports Linux and macOS only (flock-based locking and unix fd APIs)");
+
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod fsutil;
 pub mod index;
 pub mod journal;
 pub mod lock;
+pub mod logging;
 pub mod map;
 pub mod mcp;
 pub mod patch;
 pub mod proposal;
+pub mod redact;
 pub mod sanitize;
 pub mod search;
 pub mod strict;

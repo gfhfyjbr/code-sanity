@@ -237,6 +237,7 @@ dependencies = [
  "clap",
  "ignore",
  "libc",
+ "log",
  "predicates",
  "proptest",
  "regex",

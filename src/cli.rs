@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(long, global = true, default_value = ".")]
     root: PathBuf,
 
+    /// Raise log verbosity (-v: debug to log file, info to stderr; -vv: trace).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -154,6 +158,7 @@ enum Agent {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root.canonicalize().unwrap_or(cli.root);
+    crate::logging::init(&crate::config::Layout::new(&root), cli.verbose);
 
     match dispatch(cli.command, &root) {
         Ok(()) => Ok(()),

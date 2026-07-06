@@ -10,6 +10,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
 libc = "0.2"
+log = { version = "0.4", features = ["std"] }
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

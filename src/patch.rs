@@ -114,10 +114,28 @@ fn apply_patch_text_with_options_inner(
     fail_after_writes_for_test: Option<usize>,
 ) -> Result<ApplyReport> {
     let layout = init_workspace(root)?;
-    let config = Config::load_or_default(&layout)?;
-    let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
     let _lock = WorkspaceLock::acquire(&layout)?;
+    apply_patch_text_locked(
+        root,
+        &layout,
+        patch_text,
+        options,
+        fail_after_writes_for_test,
+    )
+}
+
+/// Apply a patch with the exclusive workspace lock already held by the caller
+/// (multi-step flows like project-edit hold one lock across refresh + apply).
+pub(crate) fn apply_patch_text_locked(
+    root: &Path,
+    layout: &Layout,
+    patch_text: &str,
+    options: ApplyOptions,
+    fail_after_writes_for_test: Option<usize>,
+) -> Result<ApplyReport> {
+    let config = Config::load_or_default(layout)?;
+    let conn = db::connect(layout)?;
+    db::init_schema(&conn)?;
 
     let parsed = parse_unified_patch(patch_text)?;
     if parsed.files.is_empty() {
@@ -132,7 +150,7 @@ fn apply_patch_text_with_options_inner(
         match classify_file_op(&file_patch) {
             FileOp::Modify => plan_modify(
                 root,
-                &layout,
+                layout,
                 &config,
                 &conn,
                 &options,
@@ -144,7 +162,7 @@ fn apply_patch_text_with_options_inner(
             )?,
             FileOp::Create => plan_create(
                 root,
-                &layout,
+                layout,
                 &config,
                 &conn,
                 &options,
@@ -156,7 +174,7 @@ fn apply_patch_text_with_options_inner(
             )?,
             FileOp::Delete => plan_delete(
                 root,
-                &layout,
+                layout,
                 &conn,
                 &options,
                 patch_text,
@@ -170,7 +188,7 @@ fn apply_patch_text_with_options_inner(
 
     let journal_path = commit_planned_apply(
         root,
-        &layout,
+        layout,
         &conn,
         &options,
         patch_text,
@@ -611,9 +629,9 @@ pub fn rename_alias(
     }
 
     let layout = init_workspace(root)?;
+    let _lock = WorkspaceLock::acquire(&layout)?;
     let conn = db::connect(&layout)?;
     db::init_schema(&conn)?;
-    let _lock = WorkspaceLock::acquire(&layout)?;
 
     let rel = normalize_sanitized_rel_path(rel_path)?;
     let rel_string = normalize_rel_path(&rel);
@@ -694,11 +712,11 @@ pub struct RecoverReport {
 /// `rollback`, every touched file is restored to its `before` state instead.
 pub fn recover_workspace(root: &Path, rollback: bool) -> Result<RecoverReport> {
     let layout = init_workspace(root)?;
-    let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
     // flock is released by the kernel when the crashed process died, so a
     // leftover lock file is harmless; recover just takes the lock normally.
     let _lock = WorkspaceLock::acquire(&layout)?;
+    let conn = db::connect(&layout)?;
+    db::init_schema(&conn)?;
 
     let mut report = RecoverReport {
         rolled_back: rollback,
@@ -942,7 +960,7 @@ fn set_file_state(
     let real_path = root.join(rel);
     match target {
         Some(content) => {
-            atomic_write(&real_path, content)
+            crate::fsutil::atomic_write_sync(&real_path, content)
                 .with_context(|| format!("write {}", real_path.display()))?;
             let (_, _, protected_changed) = index_single_file_locked(root, layout, rel, true)
                 .with_context(|| format!("reindex {}", rel.display()))?;
@@ -968,32 +986,6 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
     }
-}
-
-fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let nonce = Utc::now().timestamp_nanos_opt().map_or_else(
-        || Utc::now().timestamp_micros().to_string(),
-        |value| value.to_string(),
-    );
-    let tmp_path = parent.join(format!(
-        ".{file_name}.code-sanity-tmp-{}-{nonce}",
-        std::process::id()
-    ));
-    let write_result = fs::write(&tmp_path, content)
-        .and_then(|()| fs::rename(&tmp_path, path))
-        .with_context(|| format!("atomic write {}", path.display()));
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    write_result
 }
 
 fn write_conflict_and_bail<T>(
