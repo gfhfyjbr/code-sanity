@@ -1,0 +1,298 @@
+//! Minimal Model Context Protocol server over stdio.
+//!
+//! MCP stdio transport is JSON-RPC 2.0 with one message per line (no embedded
+//! newlines, no Content-Length framing), so this is a dependency-free line loop
+//! rather than an async runtime. Every tool reuses the existing bridge: reads
+//! and search only ever touch the sanitized mirror, and `apply_patch` goes
+//! through the same span-aware, conflict-safe path as the CLI.
+
+use crate::patch::{ApplyOptions, apply_patch_text_with_options};
+use crate::search::{list_mirror_files, read_sanitized_file, search_mirror};
+use crate::verify::verify_workspace;
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
+use std::io::{self, BufRead, Write};
+use std::path::Path;
+
+const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Serve MCP over the process stdio, blocking until stdin reaches EOF.
+pub fn serve_stdio(root: &Path) -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    serve(root, stdin.lock(), stdout.lock())
+}
+
+/// Serve MCP over arbitrary line-oriented streams (used directly in tests).
+pub fn serve<R: BufRead, W: Write>(root: &Path, mut reader: R, mut writer: W) -> Result<()> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).context("read MCP request line")?;
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(response) = handle_message(root, trimmed) {
+            let serialized = serde_json::to_string(&response).context("serialize MCP response")?;
+            writeln!(writer, "{serialized}").context("write MCP response")?;
+            writer.flush().context("flush MCP response")?;
+        }
+    }
+    Ok(())
+}
+
+/// The `tools/list` result, pretty-printed for `serve --once` inspection.
+pub fn tools_manifest_json() -> String {
+    serde_json::to_string_pretty(&json!({ "tools": tools_manifest() }))
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn handle_message(root: &Path, raw: &str) -> Option<Value> {
+    let message: Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(err) => {
+            return Some(error_response(
+                Value::Null,
+                -32700,
+                &format!("parse error: {err}"),
+            ));
+        }
+    };
+    let id = message.get("id").cloned();
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let is_notification = id.is_none();
+
+    match method {
+        "initialize" => Some(result_response(
+            id.unwrap_or(Value::Null),
+            initialize_result(&message),
+        )),
+        "ping" => Some(result_response(id.unwrap_or(Value::Null), json!({}))),
+        "tools/list" => Some(result_response(
+            id.unwrap_or(Value::Null),
+            json!({ "tools": tools_manifest() }),
+        )),
+        "tools/call" => {
+            let id = id.unwrap_or(Value::Null);
+            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+            let result = match call_tool(root, name, &args) {
+                Ok(text) => json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": false,
+                }),
+                Err(err) => json!({
+                    "content": [{ "type": "text", "text": format!("error: {err:#}") }],
+                    "isError": true,
+                }),
+            };
+            Some(result_response(id, result))
+        }
+        _ if is_notification => None,
+        _ => Some(error_response(
+            id.unwrap_or(Value::Null),
+            -32601,
+            &format!("method not found: {method}"),
+        )),
+    }
+}
+
+fn initialize_result(message: &Value) -> Value {
+    let requested = message
+        .get("params")
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    json!({
+        "protocolVersion": requested,
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "code-sanity", "version": env!("CARGO_PKG_VERSION") },
+        "instructions": "Sanitized mirror tools. read_file/search/list_files return sanitized content only; apply_patch projects a sanitized patch back onto the real repo through the bridge.",
+    })
+}
+
+fn tools_manifest() -> Value {
+    json!([
+        {
+            "name": "read_file",
+            "description": "Read a file from the sanitized mirror. Returns sanitized content only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Repo-relative path, e.g. src/lib.rs" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "search",
+            "description": "Search the sanitized mirror. Returns path:line:column:text lines (sanitized).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Substring to search for" },
+                    "glob": { "type": "string", "description": "Optional glob filter, e.g. *.rs" }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "list_files",
+            "description": "List repo-relative paths tracked in the sanitized mirror.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "glob": { "type": "string", "description": "Optional glob filter, e.g. src/**" }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "apply_patch",
+            "description": "Apply a unified diff written against sanitized mirror paths. Projected back onto the real repo through the span-aware bridge; edits inside replacement spans conflict.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string", "description": "Unified diff against a/ b/ mirror paths" },
+                    "agent": { "type": "string" },
+                    "session_id": { "type": "string" }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "verify",
+            "description": "Verify mirror/map/hash consistency for all tracked files.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        }
+    ])
+}
+
+fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
+    match name {
+        "read_file" => {
+            let path = required_str(args, "path")?;
+            read_sanitized_file(root, Path::new(&path))
+        }
+        "search" => {
+            let query = required_str(args, "query")?;
+            let glob = optional_str(args, "glob");
+            let hits = search_mirror(root, &query, glob.as_deref())?;
+            Ok(hits
+                .iter()
+                .map(|hit| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        hit.rel_path, hit.line, hit.column, hit.line_text
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "list_files" => {
+            let glob = optional_str(args, "glob");
+            Ok(list_mirror_files(root, glob.as_deref())?.join("\n"))
+        }
+        "apply_patch" => {
+            let patch = required_str(args, "patch")?;
+            let report = apply_patch_text_with_options(
+                root,
+                &patch,
+                ApplyOptions {
+                    agent: optional_str(args, "agent"),
+                    session_id: optional_str(args, "session_id"),
+                },
+            )?;
+            Ok(format!(
+                "applied files={} journal={}",
+                report.files.join(","),
+                report.journal_path.display()
+            ))
+        }
+        "verify" => {
+            let report = verify_workspace(root)?;
+            Ok(format!("verified tracked_files={}", report.checked))
+        }
+        other => bail!("unknown tool: {other}"),
+    }
+}
+
+fn required_str(args: &Value, key: &str) -> Result<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("missing required string argument: {key}"))
+}
+
+fn optional_str(args: &Value, key: &str) -> Option<String> {
+    args.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
+}
+
+fn result_response(id: Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+fn error_response(id: Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn call(root: &Path, requests: &[&str]) -> Vec<Value> {
+        let input = requests.join("\n");
+        let mut output = Vec::new();
+        serve(root, Cursor::new(input.into_bytes()), &mut output).unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn initialize_and_list_tools() {
+        let repo = tempfile::tempdir().unwrap();
+        let responses = call(
+            repo.path(),
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            ],
+        );
+        // The notification produces no response.
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(responses[0]["result"]["serverInfo"]["name"], "code-sanity");
+        let tools = responses[1]["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["read_file", "search", "list_files", "apply_patch", "verify"]
+        );
+    }
+
+    #[test]
+    fn unknown_method_is_json_rpc_error() {
+        let repo = tempfile::tempdir().unwrap();
+        let responses = call(
+            repo.path(),
+            &[r#"{"jsonrpc":"2.0","id":9,"method":"does/not/exist"}"#],
+        );
+        assert_eq!(responses[0]["error"]["code"], -32601);
+    }
+}

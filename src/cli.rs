@@ -230,13 +230,11 @@ pub fn run() -> Result<()> {
         }
         Command::Serve { once } => {
             if once {
-                println!(
-                    "serve --once: daemon scaffold is reachable; MCP/HTTP API is not implemented in MVP"
-                );
+                // Inspection mode: print the tool manifest and exit without
+                // blocking on stdio, so callers can verify the server wiring.
+                println!("{}", crate::mcp::tools_manifest_json());
             } else {
-                println!(
-                    "daemon scaffold only; use CLI read/search/apply-patch/write/sync/verify for MVP"
-                );
+                crate::mcp::serve_stdio(&root)?;
             }
         }
     }

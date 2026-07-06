@@ -582,6 +582,82 @@ fn opencode_bridge_creates_real_file_from_new_mirror_file() {
 }
 
 #[test]
+fn mcp_server_reads_sanitized_and_applies_patch() {
+    use serde_json::{Value, json};
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+
+    let patch = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2,3 +2,3 @@
+ fn neutral_parser() -> usize {
+-    1
++    2
+ }
+";
+    let requests = [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"read_file","arguments":{"path":"src/lib.rs"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"apply_patch","arguments":{"patch":patch,"agent":"mcp"}}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"verify","arguments":{}}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"list_files","arguments":{}}}),
+    ];
+    let input = requests
+        .iter()
+        .map(|request| request.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    code_sanity::mcp::serve(repo.path(), std::io::Cursor::new(input.into_bytes()), &mut out)
+        .unwrap();
+    let responses: Vec<Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // read_file returns sanitized content only.
+    let read_text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(read_text.contains("fn neutral_parser()"));
+    assert!(!read_text.contains("dangerous_parser"));
+    assert_eq!(responses[0]["result"]["isError"], false);
+
+    // apply_patch projects to the real repo through the bridge.
+    let apply_text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(apply_text.contains("applied files=src/lib.rs"));
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(real.contains("    2"));
+    assert!(real.contains("fn dangerous_parser()"));
+
+    assert_eq!(responses[2]["result"]["isError"], false);
+    let list_text = responses[3]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(list_text.contains("src/lib.rs"));
+}
+
+#[test]
+fn cli_serve_once_prints_tool_manifest() {
+    let repo = copy_fixture("basic-rust");
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", repo.path().to_str().unwrap(), "serve", "--once"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("read_file"))
+        .stdout(predicate::str::contains("apply_patch"))
+        .stdout(predicate::str::contains("inputSchema"));
+}
+
+#[test]
 fn cli_index_read_search_verify_smoke() {
     let repo = copy_fixture("basic-rust");
     Command::cargo_bin("code-sanity")

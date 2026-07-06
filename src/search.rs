@@ -70,6 +70,34 @@ pub fn search_mirror(root: &Path, query: &str, glob: Option<&str>) -> Result<Vec
     Ok(matches)
 }
 
+pub fn list_mirror_files(root: &Path, glob: Option<&str>) -> Result<Vec<String>> {
+    let layout = Layout::new(root);
+    if !layout.mirror_dir.exists() {
+        bail!("sanitized mirror is missing; run `code-sanity index` first");
+    }
+    let mut files = Vec::new();
+    for entry in WalkBuilder::new(&layout.mirror_dir)
+        .hidden(false)
+        .git_ignore(false)
+        .build()
+    {
+        let entry = entry.context("walk sanitized mirror")?;
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(&layout.mirror_dir)?.to_path_buf();
+        if !matches_glob(&rel, glob) {
+            continue;
+        }
+        files.push(normalize_rel_path(&rel));
+    }
+    files.sort();
+    Ok(files)
+}
+
 pub(crate) fn normalize_sanitized_rel_path(path: &Path) -> Result<PathBuf> {
     normalize_safe_rel_path(path, "sanitized mirror")
 }

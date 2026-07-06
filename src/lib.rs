@@ -4,6 +4,7 @@ pub mod db;
 pub mod index;
 pub mod journal;
 pub mod map;
+pub mod mcp;
 pub mod patch;
 pub mod sanitize;
 pub mod search;

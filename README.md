@@ -117,7 +117,11 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `install-hooks --agent codex|claude|opencode`
 - `serve [--once]`
 
-`serve` and the Codex/Claude hooks are still scaffolds. The opencode plugin is a working adapter.
+The Codex/Claude hooks are still scaffolds. The opencode plugin and the MCP server are working adapters.
+
+## MCP Server
+
+`code-sanity serve` runs a Model Context Protocol server over stdio with tools `read_file`, `search`, `list_files`, `apply_patch`, and `verify`. Reads and search return sanitized content only; `apply_patch` projects a sanitized diff back onto the real repo through the bridge. Inspect the manifest with `code-sanity serve --once`. See [docs/MCP.md](docs/MCP.md) for Codex, Claude Code, and opencode connection config.
 
 ## Agent Adapters
 
@@ -146,8 +150,8 @@ Hooks are not a complete enforcement boundary. Strict protection requires runnin
 - `rename` is single-file scoped; it does not chase references across files.
 - Public API detection is conservative heuristic protection, not a full language-aware symbol graph.
 - `.gitignore` support is delegated to the `ignore` crate (full gitignore language, `require_git(false)`); the walker does not follow parent-directory or global gitignores, for determinism.
-- The opencode plugin is a working guardrail adapter, not a hard boundary; it does not intercept reads via `bash` or other non-file tools.
-- LLM provider, MCP server, and Codex/Claude hooks remain scaffolds for later phases.
+- The opencode plugin and MCP server are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
+- LLM provider and Codex/Claude hooks remain scaffolds for later phases.
 
 ## Tests
 
