@@ -3,7 +3,7 @@ use crate::patch::{
     ApplyOptions, apply_patch_text_with_options, project_mirror_edit, recover_workspace,
     rename_alias, write_sanitized_content,
 };
-use crate::search::{read_sanitized_file, search_mirror};
+use crate::search::read_sanitized_file;
 use crate::verify::verify_workspace;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -34,6 +34,9 @@ enum Command {
         query: String,
         #[arg(long)]
         glob: Option<String>,
+        /// Cap on returned matches (default 200, hard max 1000).
+        #[arg(long)]
+        max_results: Option<usize>,
     },
     ApplyPatch {
         #[arg(long)]
@@ -82,6 +85,9 @@ enum Command {
     ProposeSanitize {
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Confirm executing the provider command from repo-local config.
+        #[arg(long)]
+        allow_provider_command: bool,
     },
     /// List or resolve queued sanitization proposals.
     Review {
@@ -181,11 +187,27 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         Command::Read { path } => {
             print!("{}", read_sanitized_file(&root, &path)?);
         }
-        Command::Search { query, glob } => {
-            for hit in search_mirror(&root, &query, glob.as_deref())? {
+        Command::Search {
+            query,
+            glob,
+            max_results,
+        } => {
+            let (hits, truncated) = crate::search::search_mirror_limited(
+                &root,
+                &query,
+                glob.as_deref(),
+                max_results,
+            )?;
+            for hit in &hits {
                 println!(
                     "{}:{}:{}:{}",
                     hit.rel_path, hit.line, hit.column, hit.line_text
+                );
+            }
+            if truncated {
+                eprintln!(
+                    "[truncated to {} results; refine the query or raise --max-results]",
+                    hits.len()
                 );
             }
         }
@@ -267,8 +289,12 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             };
             println!("{mode}");
         }
-        Command::ProposeSanitize { path } => {
-            let report = crate::proposal::propose_sanitize(&root, path.as_deref())?;
+        Command::ProposeSanitize {
+            path,
+            allow_provider_command,
+        } => {
+            let report =
+                crate::proposal::propose_sanitize(&root, path.as_deref(), allow_provider_command)?;
             println!(
                 "proposed={} queued={} rejected={}",
                 report.proposed,

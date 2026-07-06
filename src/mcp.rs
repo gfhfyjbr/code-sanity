@@ -7,7 +7,7 @@
 //! through the same span-aware, conflict-safe path as the CLI.
 
 use crate::patch::{ApplyOptions, apply_patch_text_with_options};
-use crate::search::{list_mirror_files, read_sanitized_file, search_mirror};
+use crate::search::{list_mirror_files, read_sanitized_file};
 use crate::verify::verify_workspace;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -139,7 +139,13 @@ fn tools_manifest() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Substring to search for" },
-                    "glob": { "type": "string", "description": "Optional glob filter, e.g. *.rs" }
+                    "glob": { "type": "string", "description": "Optional glob filter, e.g. *.rs" },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": crate::search::HARD_MAX_RESULTS,
+                        "description": "Result cap (default 200, hard max 1000)"
+                    }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -187,8 +193,13 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
         "search" => {
             let query = required_str(args, "query")?;
             let glob = optional_str(args, "glob");
-            let hits = search_mirror(root, &query, glob.as_deref())?;
-            Ok(hits
+            let max_results = args
+                .get("max_results")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize);
+            let (hits, truncated) =
+                crate::search::search_mirror_limited(root, &query, glob.as_deref(), max_results)?;
+            let mut out = hits
                 .iter()
                 .map(|hit| {
                     format!(
@@ -197,7 +208,14 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
                     )
                 })
                 .collect::<Vec<_>>()
-                .join("\n"))
+                .join("\n");
+            if truncated {
+                out.push_str(&format!(
+                    "\n[truncated to {} results; refine the query or raise max_results]",
+                    hits.len()
+                ));
+            }
+            Ok(out)
         }
         "list_files" => {
             let glob = optional_str(args, "glob");

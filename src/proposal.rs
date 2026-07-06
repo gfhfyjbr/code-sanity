@@ -76,8 +76,12 @@ pub trait ProposalProvider {
 
 /// Offline/local model provider: `command` is invoked with `{rel, content}` JSON
 /// on stdin and must emit a `ProposalBatch` (or a bare proposal array) on stdout.
+/// stdin is written from a dedicated thread while stdout/stderr are drained
+/// concurrently (no pipe deadlock on large files), and the child is killed if
+/// it exceeds the timeout.
 pub struct ExternalProposalProvider {
     pub command: Vec<String>,
+    pub timeout: std::time::Duration,
 }
 
 impl ProposalProvider for ExternalProposalProvider {
@@ -97,22 +101,73 @@ impl ProposalProvider for ExternalProposalProvider {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawn external provider {program}"))?;
-        child
+
+        let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| anyhow!("external provider stdin unavailable"))?
-            .write_all(payload.as_bytes())
-            .context("write external provider stdin")?;
-        let output = child
-            .wait_with_output()
-            .context("wait for external provider")?;
-        if !output.status.success() {
-            bail!(
-                "external provider failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            .ok_or_else(|| anyhow!("external provider stdin unavailable"))?;
+        let payload_bytes = payload.into_bytes();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            stdin.write_all(&payload_bytes)
+            // stdin drops (closes) here so the child sees EOF.
+        });
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("external provider stdout unavailable"))?;
+        let stdout_reader = std::thread::spawn(move || -> std::io::Result<String> {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut stdout_pipe, &mut buf)?;
+            Ok(buf)
+        });
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("external provider stderr unavailable"))?;
+        let stderr_reader = std::thread::spawn(move || -> std::io::Result<String> {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut stderr_pipe, &mut buf)?;
+            Ok(buf)
+        });
+
+        let deadline = std::time::Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait().context("poll external provider")? {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "external provider timed out after {:?}: {program}",
+                        self.timeout
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(25)),
+            }
+        };
+
+        // The writer may fail with EPIPE if the child exited without reading
+        // all input; only surface that when the child itself failed.
+        let write_result = writer
+            .join()
+            .map_err(|_| anyhow!("external provider stdin writer panicked"))?;
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| anyhow!("external provider stdout reader panicked"))?
+            .context("read external provider stdout")?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow!("external provider stderr reader panicked"))?
+            .context("read external provider stderr")?;
+        if !status.success() {
+            bail!("external provider failed: {}", stderr.trim());
         }
-        parse_proposals(&String::from_utf8_lossy(&output.stdout))
+        if let Err(err) = write_result
+            && err.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(err).context("write external provider stdin");
+        }
+        parse_proposals(&stdout)
     }
 }
 
@@ -164,21 +219,40 @@ fn parse_proposals(raw: &str) -> Result<Vec<Proposal>> {
         .context("parse proposals (expected a ProposalBatch or a proposal array)")
 }
 
-fn provider_for(config: &Config) -> Box<dyn ProposalProvider> {
+fn provider_for(config: &Config, allow_external: bool) -> Result<Box<dyn ProposalProvider>> {
     match &config.sanitizer.provider {
-        ProviderConfig::External { command } => Box::new(ExternalProposalProvider {
-            command: command.clone(),
-        }),
-        _ => Box::new(HeuristicProposalProvider),
+        ProviderConfig::External {
+            command,
+            timeout_secs,
+        } => {
+            if !allow_external {
+                bail!(
+                    "the configured provider runs a repo-supplied command ({:?}); \
+                     re-run with --allow-provider-command after reviewing it",
+                    command.join(" ")
+                );
+            }
+            Ok(Box::new(ExternalProposalProvider {
+                command: command.clone(),
+                timeout: std::time::Duration::from_secs(timeout_secs.unwrap_or(60)),
+            }))
+        }
+        _ => Ok(Box::new(HeuristicProposalProvider)),
     }
 }
 
 /// Run the configured provider over one file (or all tracked files) and enqueue
 /// surviving, validated proposals for review. Nothing is applied here.
-pub fn propose_sanitize(root: &Path, rel: Option<&Path>) -> Result<ProposeReport> {
+/// `allow_external` is the explicit human confirmation required to execute a
+/// repo-supplied provider command.
+pub fn propose_sanitize(
+    root: &Path,
+    rel: Option<&Path>,
+    allow_external: bool,
+) -> Result<ProposeReport> {
     let layout = crate::index::init_workspace(root)?;
     let config = Config::load_or_default(&layout)?;
-    let provider = provider_for(&config);
+    let provider = provider_for(&config, allow_external)?;
 
     let files = match rel {
         Some(rel) => vec![crate::config::normalize_rel_path(rel)],

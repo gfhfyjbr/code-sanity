@@ -1101,11 +1101,18 @@ fn external_model_proposals_validated_queued_and_applied_on_approval() {
     let mut config = Config::load_or_default(&layout).unwrap();
     config.sanitizer.provider = ProviderConfig::External {
         command: vec![py.to_string(), script.to_str().unwrap().to_string()],
+        timeout_secs: Some(60),
     };
     config.save(&layout).unwrap();
 
+    // Repo-supplied provider commands require explicit confirmation.
+    let refused =
+        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")), false)
+            .unwrap_err();
+    assert!(refused.to_string().contains("--allow-provider-command"));
+
     let report =
-        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")))
+        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")), true)
             .unwrap();
     assert_eq!(report.proposed, 3);
     assert_eq!(report.queued, 1);
@@ -1175,7 +1182,7 @@ fn heuristic_provider_queues_denylist_terms() {
     config.save(&layout).unwrap();
 
     let report =
-        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")))
+        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")), false)
             .unwrap();
     assert_eq!(report.queued, 1);
     let items = code_sanity::proposal::list_review(repo.path(), false).unwrap();
@@ -1241,6 +1248,79 @@ fn strict_run_reads_sanitized_worktree() {
         .success()
         .stdout(predicate::str::contains("fn neutral_parser()"))
         .stdout(predicate::str::contains("dangerous_parser").not());
+}
+
+#[test]
+#[cfg(unix)]
+fn strict_sh_streams_output_before_command_finishes() {
+    use std::io::BufRead as _;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+
+    // The child prints one line, then sleeps well past our read deadline. If
+    // output were buffered until exit (the old Command::output behavior), the
+    // first line would not arrive in time.
+    let bin = assert_cmd::cargo::cargo_bin("code-sanity");
+    let mut child = std::process::Command::new(bin)
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "sh",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo dangerous_parser; sleep 5",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut line).ok();
+        tx.send(line).ok();
+    });
+    let line = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("no output within 3s; strict sh is not streaming");
+    assert!(line.contains("neutral_parser"), "line: {line}");
+    assert!(!line.contains("dangerous"));
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+fn search_results_are_capped_with_truncation_notice() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    let mut body = String::new();
+    for i in 0..40 {
+        body.push_str(&format!("fn needle_{i}() -> usize {{ {i} }}\n"));
+    }
+    fs::write(repo.path().join("src/lib.rs"), body).unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let (hits, truncated) =
+        code_sanity::search::search_mirror_limited(repo.path(), "needle_", None, Some(10)).unwrap();
+    assert_eq!(hits.len(), 10);
+    assert!(truncated);
+
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "grep",
+            "needle_",
+            "--max-results",
+            "10",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("truncated to 10 results"));
 }
 
 #[test]

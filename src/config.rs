@@ -111,9 +111,13 @@ pub enum ProviderConfig {
     Stub,
     /// Offline/local model provider: `command` is invoked with `{rel, content}`
     /// JSON on stdin and must emit a proposal batch on stdout. Used by
-    /// `propose-sanitize` only; never during index/verify.
+    /// `propose-sanitize` only; never during index/verify. Because the command
+    /// comes from repo-local config, running it requires explicit confirmation
+    /// (`--allow-provider-command`).
     External {
         command: Vec<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
     },
     LlmStub {
         endpoint: Option<String>,

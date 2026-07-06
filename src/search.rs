@@ -25,10 +25,29 @@ pub fn read_sanitized_file(root: &Path, rel_path: &Path) -> Result<String> {
     })
 }
 
+/// Default and hard caps on returned matches; an unbounded grep over a large
+/// mirror would otherwise flood an MCP response.
+pub const DEFAULT_MAX_RESULTS: usize = 200;
+pub const HARD_MAX_RESULTS: usize = 1000;
+
 pub fn search_mirror(root: &Path, query: &str, glob: Option<&str>) -> Result<Vec<SearchMatch>> {
+    Ok(search_mirror_limited(root, query, glob, None)?.0)
+}
+
+/// Search the mirror with a result limit (clamped to [1, HARD_MAX_RESULTS]).
+/// Returns the matches and whether the result set was truncated.
+pub fn search_mirror_limited(
+    root: &Path,
+    query: &str,
+    glob: Option<&str>,
+    max_results: Option<usize>,
+) -> Result<(Vec<SearchMatch>, bool)> {
     if query.is_empty() {
         bail!("search query must not be empty");
     }
+    let limit = max_results
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .clamp(1, HARD_MAX_RESULTS);
     let layout = Layout::new(root);
     let mut matches = Vec::new();
     if !layout.mirror_dir.exists() {
@@ -38,6 +57,7 @@ pub fn search_mirror(root: &Path, query: &str, glob: Option<&str>) -> Result<Vec
     for entry in WalkBuilder::new(&layout.mirror_dir)
         .hidden(false)
         .git_ignore(false)
+        .sort_by_file_path(Ord::cmp)
         .build()
     {
         let entry = entry.context("walk sanitized mirror")?;
@@ -57,6 +77,9 @@ pub fn search_mirror(root: &Path, query: &str, glob: Option<&str>) -> Result<Vec
             let mut search_at = 0usize;
             while let Some(found) = line[search_at..].find(query) {
                 let byte_col = search_at + found;
+                if matches.len() >= limit {
+                    return Ok((matches, true));
+                }
                 matches.push(SearchMatch {
                     rel_path: normalize_rel_path(&rel),
                     line: line_idx + 1,
@@ -67,7 +90,7 @@ pub fn search_mirror(root: &Path, query: &str, glob: Option<&str>) -> Result<Vec
             }
         }
     }
-    Ok(matches)
+    Ok((matches, false))
 }
 
 pub fn list_mirror_files(root: &Path, glob: Option<&str>) -> Result<Vec<String>> {
