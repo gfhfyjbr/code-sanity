@@ -82,7 +82,10 @@ pub(crate) fn normalize_term(term: &str) -> String {
 
 /// Deterministic alias for a term with no human-chosen mapping yet.
 pub fn derive_alias(salt: &str, original: &str) -> String {
-    format!("sym_{}", &sha256_hex(format!("{salt}:{original}").as_bytes())[..8])
+    format!(
+        "sym_{}",
+        &sha256_hex(format!("{salt}:{original}").as_bytes())[..8]
+    )
 }
 
 /// A term occurrence inside a word run.
@@ -193,7 +196,10 @@ pub fn collect_protected_identifiers(content: &str) -> BTreeSet<String> {
     // `pub fn name(args)` signatures, `export const x`.
     let mut line_start = 0usize;
     for line in content.split_inclusive('\n') {
-        let code_end = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
+        let code_end = line
+            .find("//")
+            .or_else(|| line.find('#'))
+            .unwrap_or(line.len());
         let code = &line[..code_end];
         let runs = word_runs(code);
         let lead: Vec<&str> = runs
@@ -699,13 +705,12 @@ mod tests {
             .sanitizer
             .alias_registry
             .insert("AcmeClient".to_string(), "GadgetSvc".to_string());
-        let content =
-            "fn a() { AcmeClient::new(); }\nconst ACME_CLIENT: u8 = 1;\nlet f = acmeClientFactory;\n";
+        let content = "fn a() { AcmeClient::new(); }\nconst ACME_CLIENT: u8 = 1;\nlet f = acmeClientFactory;\n";
         let rendered =
             sanitize_content(Path::new("src/lib.rs"), content, &config, &BTreeSet::new()).unwrap();
         assert!(rendered.sanitized.contains("GadgetSvc::new()"));
         assert!(rendered.sanitized.contains("const GADGETSVC: u8"));
-        assert!(rendered.sanitized.contains("gadgetSvcFactory") == false);
+        assert!(rendered.sanitized.contains("GadgetSvcFactory"));
         assert!(!rendered.sanitized.to_lowercase().contains("acme"));
     }
 

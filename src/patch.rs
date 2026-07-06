@@ -283,28 +283,32 @@ fn plan_modify(
     let patched_sanitized = apply_file_patch_to_content(&mirror_content, file_patch)
         .with_context(|| format!("apply sanitized patch to {rel_string}"))?;
     let stored_union = crate::index::stored_protected_union(conn)?;
-    let original_file_patch =
-        match translate_file_patch(file_patch, &span_map, &mirror_content, config, &stored_union) {
-            Ok(translated) => translated,
-            Err(err) => {
-                return write_conflict_and_bail(
-                    layout,
-                    conn,
-                    options,
-                    patch_text,
-                    original_patch,
-                    files,
-                    format!("{rel_string}: {err:#}"),
-                );
-            }
-        };
+    let original_file_patch = match translate_file_patch(
+        file_patch,
+        &span_map,
+        &mirror_content,
+        config,
+        &stored_union,
+    ) {
+        Ok(translated) => translated,
+        Err(err) => {
+            return write_conflict_and_bail(
+                layout,
+                conn,
+                options,
+                patch_text,
+                original_patch,
+                files,
+                format!("{rel_string}: {err:#}"),
+            );
+        }
+    };
     let patched_original = apply_file_patch_to_content(&real_content, &original_file_patch)
         .with_context(|| format!("apply translated patch to {rel_string}"))?;
     // Sanitize with the protected union that will hold AFTER this file lands,
     // exactly what the post-apply reindex of this file will use.
     let fresh_protected = collect_protected_identifiers(&patched_original);
-    let union_after =
-        stored_protected_union_with_override(conn, &rel_string, &fresh_protected)?;
+    let union_after = stored_protected_union_with_override(conn, &rel_string, &fresh_protected)?;
     let rendered_after = sanitize_content(&rel, &patched_original, config, &union_after)
         .with_context(|| format!("resanitize patched {rel_string}"))?;
     if rendered_after.sanitized != patched_sanitized {

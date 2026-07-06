@@ -11,7 +11,9 @@ use crate::config::{Config, Layout, normalize_rel_path, rel_path};
 use crate::db::{self, IndexState};
 use crate::lock::WorkspaceLock;
 use crate::map::{SpanMap, load_span_map, sha256_hex};
-use crate::sanitize::{SANITIZER_BEHAVIOR_VERSION, collect_protected_identifiers, sanitize_content};
+use crate::sanitize::{
+    SANITIZER_BEHAVIOR_VERSION, collect_protected_identifiers, sanitize_content,
+};
 use anyhow::{Context, Result};
 use ignore::{DirEntry, WalkBuilder};
 use std::collections::{BTreeMap, BTreeSet};
@@ -169,7 +171,12 @@ pub(crate) fn index_workspace_locked(root: &Path, layout: &Layout) -> Result<Ind
             && layout.mirror_dir.join(&candidate.rel).exists()
             && layout.map_path(&candidate.rel).exists()
         {
-            db::touch_index_state(&conn, &candidate.rel_string, candidate.mtime_ns, candidate.size)?;
+            db::touch_index_state(
+                &conn,
+                &candidate.rel_string,
+                candidate.mtime_ns,
+                candidate.size,
+            )?;
             report.unchanged += 1;
             continue;
         }

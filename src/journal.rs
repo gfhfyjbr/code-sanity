@@ -70,8 +70,7 @@ pub fn write_journal(layout: &Layout, entry: &JournalEntry) -> Result<PathBuf> {
             .with_context(|| format!("write {}", tmp.display()))?;
         file.sync_all()
             .with_context(|| format!("fsync {}", tmp.display()))?;
-        fs::rename(&tmp, &path)
-            .with_context(|| format!("rename into {}", path.display()))?;
+        fs::rename(&tmp, &path).with_context(|| format!("rename into {}", path.display()))?;
         fs::File::open(&layout.journal_dir)
             .and_then(|dir| dir.sync_all())
             .with_context(|| format!("fsync {}", layout.journal_dir.display()))?;

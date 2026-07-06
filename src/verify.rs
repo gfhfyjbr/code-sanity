@@ -2,9 +2,7 @@ use crate::config::{Config, Layout};
 use crate::db;
 use crate::lock::WorkspaceLock;
 use crate::map::{load_span_map, sha256_hex};
-use crate::sanitize::{
-    collect_protected_identifiers, find_leaks, sanitize_content, term_table,
-};
+use crate::sanitize::{collect_protected_identifiers, find_leaks, sanitize_content, term_table};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -31,7 +29,11 @@ pub struct VerifyFailed {
 
 impl std::fmt::Display for VerifyFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "verify failed with {} issue(s)", self.report.failures.len())?;
+        writeln!(
+            f,
+            "verify failed with {} issue(s)",
+            self.report.failures.len()
+        )?;
         for failure in &self.report.failures {
             writeln!(f, "  {failure}")?;
         }
@@ -189,7 +191,8 @@ fn walkdir_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
-        for entry in fs::read_dir(&current).with_context(|| format!("read {}", current.display()))?
+        for entry in
+            fs::read_dir(&current).with_context(|| format!("read {}", current.display()))?
         {
             let entry = entry.context("read mirror dir entry")?;
             let path = entry.path();

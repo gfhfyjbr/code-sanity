@@ -400,6 +400,74 @@ fn apply_patch_inside_replacement_conflicts_and_leaves_real_file() {
 }
 
 #[test]
+fn sync_preserves_pending_mirror_edit() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let mirror_path = repo.path().join(".code-sanity/mirror/src/lib.rs");
+
+    // The agent edited the mirror in place; the edit has not been projected
+    // yet (mirror hash != db sanitized hash). A sync storm must not clobber it.
+    let mirror = fs::read_to_string(&mirror_path).unwrap();
+    let edited = mirror.replace("    1\n", "    6\n");
+    assert_ne!(mirror, edited);
+    fs::write(&mirror_path, &edited).unwrap();
+
+    // Unchanged real file: the fast path leaves the mirror alone entirely.
+    index_workspace(repo.path()).unwrap();
+    assert_eq!(fs::read_to_string(&mirror_path).unwrap(), edited);
+
+    // Changed real file: the file is re-rendered, but the pending mirror edit
+    // still wins over the fresh render and is reported.
+    let real_path = repo.path().join("src/lib.rs");
+    let mut real = fs::read_to_string(&real_path).unwrap();
+    real.push_str("// external note\n");
+    fs::write(&real_path, real).unwrap();
+    let report = index_workspace(repo.path()).unwrap();
+    assert_eq!(report.pending, 1, "pending mirror edit not detected");
+    assert_eq!(fs::read_to_string(&mirror_path).unwrap(), edited);
+
+    // Reconciling a pending mirror edit against a real file that ALSO drifted
+    // externally cannot be done automatically: project-edit conflicts, the
+    // real file keeps the external change, and the workspace stays coherent.
+    let real_before = fs::read_to_string(&real_path).unwrap();
+    let err = code_sanity::project_mirror_edit(
+        repo.path(),
+        Path::new("src/lib.rs"),
+        code_sanity::patch::ApplyOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("conflict journal"));
+    assert_eq!(fs::read_to_string(&real_path).unwrap(), real_before);
+    let after = index_workspace(repo.path()).unwrap();
+    assert_eq!(after.pending, 0);
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn init_generates_random_workspace_salt() {
+    let repo_a = tempfile::tempdir().unwrap();
+    let repo_b = tempfile::tempdir().unwrap();
+    code_sanity::init_workspace(repo_a.path()).unwrap();
+    code_sanity::init_workspace(repo_b.path()).unwrap();
+    let layout_a = code_sanity::config::Layout::new(repo_a.path());
+    let layout_b = code_sanity::config::Layout::new(repo_b.path());
+    let salt_a = code_sanity::config::Config::load_or_default(&layout_a)
+        .unwrap()
+        .salt;
+    let salt_b = code_sanity::config::Config::load_or_default(&layout_b)
+        .unwrap()
+        .salt;
+    assert_ne!(salt_a, "code-sanity-local-stub");
+    assert_ne!(salt_a, salt_b, "salts must differ per workspace");
+    // init is idempotent: reinitializing keeps the existing salt.
+    code_sanity::init_workspace(repo_a.path()).unwrap();
+    let salt_a_again = code_sanity::config::Config::load_or_default(&layout_a)
+        .unwrap()
+        .salt;
+    assert_eq!(salt_a, salt_a_again);
+}
+
+#[test]
 fn sync_repairs_external_real_edit() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
@@ -877,7 +945,11 @@ fn install_hooks_merges_and_uninstall_preserves_foreign_settings() {
             ]
         }
     });
-    fs::write(&settings_path, serde_json::to_string_pretty(&foreign).unwrap()).unwrap();
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&foreign).unwrap(),
+    )
+    .unwrap();
 
     Command::cargo_bin("code-sanity")
         .unwrap()
@@ -885,20 +957,21 @@ fn install_hooks_merges_and_uninstall_preserves_foreign_settings() {
         .assert()
         .success();
 
-    let merged: Value =
-        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let merged: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
     // Foreign keys and hooks survive the merge.
     assert_eq!(merged["permissions"]["allow"][0], "Bash(cargo:*)");
     assert_eq!(merged["env"]["FOO"], "bar");
     let pre = merged["hooks"]["PreToolUse"].as_array().unwrap();
-    assert!(pre.iter().any(|entry| entry["hooks"][0]["command"] == "echo foreign"));
     assert!(
         pre.iter()
-            .any(|entry| entry["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .contains("pre_tool_use.py"))
+            .any(|entry| entry["hooks"][0]["command"] == "echo foreign")
     );
+    assert!(pre.iter().any(|entry| {
+        entry["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("pre_tool_use.py")
+    }));
     // A backup of the pre-merge file exists.
     assert!(repo.path().join(".claude/settings.json.bak").exists());
     // Idempotent: reinstalling does not duplicate entries.
@@ -907,8 +980,7 @@ fn install_hooks_merges_and_uninstall_preserves_foreign_settings() {
         .args(["--root", root, "install-hooks", "--agent", "claude"])
         .assert()
         .success();
-    let again: Value =
-        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let again: Value = serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
     assert_eq!(
         again["hooks"]["PreToolUse"].as_array().unwrap().len(),
         pre.len()

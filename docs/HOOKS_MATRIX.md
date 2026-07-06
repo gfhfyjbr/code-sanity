@@ -14,7 +14,7 @@ Legend: ✅ supported · 🟡 best-effort / partial · ❌ not intercepted / n/a
 | Block raw real-repo edit (strict) | ✅ throws | ✅ `permissionDecision: deny` | ✅ `permissionDecision: deny` | n/a (only sanctioned ops) |
 | Nudge to sanctioned tools (guided) | ✅ | ✅ message | ✅ `SessionStart` context | n/a |
 | Sanitize shell/build output | 🟡 use `code-sanity sh` | 🟡 use `code-sanity sh` | 🟡 use `code-sanity sh` | n/a |
-| Sync after edit | ✅ `file.edited` → `sync` | ✅ `PostToolUse` → `sync` | ✅ `PostToolUse` → `sync` | ✅ apply reindexes |
+| Sync after edit | ✅ `project-edit` + `sync --path` | ✅ `PostToolUse` → `project-edit`/`sync --path` | ✅ `PostToolUse` → `project-edit`/`sync --path` | ✅ apply reindexes |
 | Reads via arbitrary shell/IDE/LSP | ❌ not intercepted | ❌ not fully intercepted | ❌ not intercepted | ❌ out of band |
 
 `➡️` means the capability is provided through the MCP `apply_patch` tool rather
@@ -42,8 +42,10 @@ it does not intercept every shell path (`unified_exec`, some tools), and
 `PreToolUse` can block a tool via `permissionDecision: deny`; code-sanity blocks
 raw real-repo `Read`/`Edit`/`Write` in strict (edits in guided) and steers to the
 MCP server. `SessionStart` injects guidance to use the code-sanity tools;
-`PostToolUse` syncs. Claude's API does not offer a general `updatedInput` rewrite
-contract, so the adapter is "guard + MCP", not a transparent read rewrite.
+`PostToolUse` back-projects mirror edits (`project-edit`) and then syncs only the
+touched path, logging failures to `.code-sanity/logs/hooks.log`. Claude's API
+does not offer a general `updatedInput` rewrite contract, so the adapter is
+"guard + MCP", not a transparent read rewrite.
 
 ### MCP server (`code-sanity serve`)
 The sanctioned tool surface: `read_file`, `search`, `list_files` return sanitized

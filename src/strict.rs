@@ -99,7 +99,9 @@ pub fn run(root: &Path, command: &[String], in_worktree: bool) -> Result<i32> {
         stream_sanitized(stderr, &mut std::io::stderr().lock(), &err_sanitizer)
     });
 
-    let status = child.wait().with_context(|| format!("wait for {program}"))?;
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for {program}"))?;
     out_thread
         .join()
         .map_err(|_| anyhow::anyhow!("stdout stream thread panicked"))?
@@ -123,7 +125,9 @@ fn stream_sanitized(
     let mut line = Vec::new();
     loop {
         line.clear();
-        let read = reader.read_until(b'\n', &mut line).context("read child output")?;
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .context("read child output")?;
         if read == 0 {
             break;
         }

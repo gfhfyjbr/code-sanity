@@ -50,7 +50,12 @@ fn incremental_index_is_fast_and_reindexes_exactly_one_changed_file() {
     fs::remove_file(repo.path().join("src/f0007.rs")).unwrap();
     let after_delete = index_workspace(repo.path()).unwrap();
     assert_eq!(after_delete.removed, 1);
-    assert!(!repo.path().join(".code-sanity/mirror/src/f0007.rs").exists());
+    assert!(
+        !repo
+            .path()
+            .join(".code-sanity/mirror/src/f0007.rs")
+            .exists()
+    );
     assert!(
         !repo
             .path()

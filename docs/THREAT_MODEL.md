@@ -24,15 +24,24 @@ Protected (kept out of the agent-facing mirror where policy allows):
 
 - private identifiers (local/private function, variable, type names);
 - comments and doc comments;
-- string literals in tests/fixtures;
-- private domain terms, client names, internal aliases;
+- configured terms in **all** string literals (the string's structure and
+  semantics are untouched; only the term's lexical spelling is replaced);
+- private domain terms, client names, internal aliases — matched case- and
+  underscore-insensitively, including inside larger identifiers (`AcmeClient`
+  also catches `ACME_CLIENT` and `acmeClientFactory`);
+- denylisted terms (replaced immediately with deterministic salted aliases,
+  even before a human approves a nicer name);
 - provocative/toxic lexicon normalized to neutral wording.
 
 Deliberately **not** hidden (behavior must remain legible):
 
 - control flow, imports/exports, module paths, filenames;
-- public API names;
-- SQL, shell commands, env var names, feature flags;
+- public API names — the repo-wide protected identifier set (public
+  declarations, import-position names) keeps one decision per symbol across
+  the whole mirror;
+- SQL statements, shell commands, env var names, feature flags (a configured
+  term inside them is still lexically replaced, but structure and semantics
+  never change);
 - syscall/protocol/crypto/auth semantics.
 
 ## Trust boundaries and enforcement tiers
@@ -95,10 +104,13 @@ The real file changes outside the bridge, so the mirror is stale.
 
 ### 6. Crash mid-apply
 The process dies after real files start changing.
-- **Mitigation:** the full before/after intent is journaled as `applying` before
-  any real write; `recover` replays (roll-forward) or `--rollback` undoes it and
-  clears the stale lock.
-- **Residual risk:** single-process MVP; not a cross-crash transactional FS/DB.
+- **Mitigation:** the full before/after intent is journaled as `applying` and
+  fsync'd (temp + rename + directory fsync) before any real write; `recover`
+  replays (roll-forward) or `--rollback` undoes it. All writers serialize on a
+  blocking `flock` that the kernel releases when the process dies, so a crash
+  never wedges the workspace.
+- **Residual risk:** not a cross-crash transactional FS/DB; the sqlite state is
+  derived and rebuilt by `index`.
 
 ### 7. Model proposal error
 A model proposes an unsafe or wrong alias.
@@ -106,35 +118,65 @@ A model proposes an unsafe or wrong alias.
   policy-validated (allowlist, denylist-in-output, identifier validity, public-API
   guard, confidence threshold) and queued for human review; approval re-validates
   and records a deterministic alias. `index`/`verify` use only the deterministic
-  engine.
+  engine. Executing a repo-supplied provider command requires an explicit
+  `--allow-provider-command`, runs with concurrent pipe I/O, and is killed on
+  timeout.
 - **Residual risk:** a human can approve a bad alias; the audit (`review-sanitize`)
-  makes every applied replacement inspectable.
+  makes every applied replacement inspectable, and the verify backstop rejects
+  aliases that still contain a term.
 
 ### 8. Compiler/test output leaks real names
 `cargo`/`rustc`/`pytest` print real identifiers and paths.
-- **Mitigation:** `code-sanity sh -- <cmd>` reverse-maps stdout/stderr.
-- **Residual risk:** substring-based, covers only terms in the span maps/
-  dictionary/registry; novel real names in output are not hidden.
+- **Mitigation:** `code-sanity sh -- <cmd>` streams stdout/stderr through a
+  leftmost-longest Aho-Corasick rewrite built from the span maps, dictionary,
+  registry, and denylist; `strict-run` additionally executes in a unique
+  owner-only (0700) sanitized worktree.
+- **Residual risk:** covers only known terms; novel real names in output are
+  not hidden.
 
 ### 9. Sanitization breaks the code
 A replacement produces invalid code or renames a public symbol.
-- **Mitigation:** conservative heuristics skip public/`pub`/`export`/import-adjacent
-  identifiers, keywords, and behavior-bearing regions (SQL/shell/strings outside
-  tests); identifier aliases are validated as identifiers.
-- **Residual risk:** regex/byte-scanner tokenization is not AST-aware; cross-file
-  private renames can be inconsistent, so a sanitized worktree may not compile
-  (use `sh` against the real repo for builds).
+- **Mitigation:** the repo-wide protected identifier set (public declarations,
+  import-position names) is skipped everywhere — one symbol, one decision — and
+  identifier aliases are validated as identifiers. Terms and their case
+  variants map to one deterministic alias, so cross-file renames stay
+  consistent.
+- **Residual risk:** regex/byte-scanner tokenization is not AST-aware; a
+  sanitized worktree may still not compile in edge cases (use `sh` against the
+  real repo for builds).
+
+### 10. A term leaks into the mirror despite everything
+A sanitizer bug, a bad replacement value, or a planted mirror file leaves a
+term visible.
+- **Mitigation:** `verify` runs an independent leak backstop: it rescans the
+  mirror and every span-map replacement output with the same matching primitive
+  and recomputes the protected set from the real files; any unsanctioned term
+  occurrence, and any untracked file inside the mirror, fails verification
+  (exit code 3, each failure printed).
+- **Residual risk:** residues inside protected identifiers are sanctioned by
+  policy (public names stay real); the backstop shares the matching primitive
+  with the sanitizer, so a bug in that primitive itself would blind both.
 
 ## Guarantees vs non-guarantees
 
 **Guarantees**
 - `sanitize(real)` is deterministic and equals the mirror after `index`/`sync`
   (checked by `verify`).
-- The patch bridge preserves `sanitize(apply_original) == apply_sanitized` for
-  edits outside replacement spans, or conflicts and leaves the real file
-  untouched.
+- The patch bridge preserves the invariant in both directions for edits outside
+  replacement spans: `sanitize(apply_original(patch)) == apply_sanitized(patch)`
+  and reverse-projecting the patched mirror reproduces the patched real file
+  byte-for-byte — or it conflicts (exit code 2) and leaves the real file
+  untouched. Aliases in newly added lines are reverse-mapped to their real
+  originals; an ambiguous alias is a conflict.
+- One symbol, one decision: a protected name stays real everywhere; a term maps
+  to one alias everywhere (including case/underscore variants).
+- No dictionary/denylist/registry term survives into the mirror outside a
+  protected identifier — enforced independently by the `verify` leak backstop.
 - The model never writes the mirror; only the deterministic engine does.
-- Apply intent is journaled before any real write.
+- Apply intent is journaled (fsync'd) before any real write, and every writer
+  holds the workspace flock.
+- Sync never overwrites a mirror file holding a pending, not-yet-projected
+  agent edit.
 
 **Non-guarantees**
 - That every byte the model sees passed through the sanitizer.

@@ -189,7 +189,12 @@ pub fn upsert_indexed_file(
 
 /// Refresh only the input pre-check columns (content proved unchanged by hash,
 /// but mtime/size moved).
-pub fn touch_index_state(conn: &Connection, rel_path: &str, mtime_ns: i64, size: i64) -> Result<()> {
+pub fn touch_index_state(
+    conn: &Connection,
+    rel_path: &str,
+    mtime_ns: i64,
+    size: i64,
+) -> Result<()> {
     conn.execute(
         "update index_state set mtime_ns = ?2, size = ?3 where rel_path = ?1",
         params![rel_path, mtime_ns, size],

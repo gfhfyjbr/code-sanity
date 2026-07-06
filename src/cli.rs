@@ -192,12 +192,8 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             glob,
             max_results,
         } => {
-            let (hits, truncated) = crate::search::search_mirror_limited(
-                &root,
-                &query,
-                glob.as_deref(),
-                max_results,
-            )?;
+            let (hits, truncated) =
+                crate::search::search_mirror_limited(&root, &query, glob.as_deref(), max_results)?;
             for hit in &hits {
                 println!(
                     "{}:{}:{}:{}",
@@ -580,7 +576,9 @@ fn merge_hooks_json(
     let hooks = hooks_slot.as_object_mut().expect("checked object");
 
     for (event, our_entries) in ours["hooks"].as_object().expect("builtin hooks object") {
-        let slot = hooks.entry(event.clone()).or_insert_with(|| serde_json::json!([]));
+        let slot = hooks
+            .entry(event.clone())
+            .or_insert_with(|| serde_json::json!([]));
         let Some(entries) = slot.as_array_mut() else {
             anyhow::bail!("{}: hooks.{event} is not an array", path.display());
         };
@@ -604,7 +602,10 @@ fn strip_hooks_json(path: &std::path::Path, ours_raw: &str) -> Result<Option<ser
     let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return Ok(None);
     };
-    let Some(hooks) = existing.get_mut("hooks").and_then(|value| value.as_object_mut()) else {
+    let Some(hooks) = existing
+        .get_mut("hooks")
+        .and_then(|value| value.as_object_mut())
+    else {
         return Ok(Some(existing));
     };
     for (event, our_entries) in ours["hooks"].as_object().expect("builtin hooks object") {
@@ -651,10 +652,7 @@ fn install_hooks(root: &std::path::Path, agent: Agent, force: bool) -> Result<()
         Agent::Opencode => {
             let dir = root.join(".opencode/plugins");
             write_with_backup(&dir.join("code-sanity.ts"), OPENCODE_PLUGIN_TS)?;
-            write_with_backup(
-                &root.join(".opencode/package.json"),
-                OPENCODE_PACKAGE_JSON,
-            )?;
+            write_with_backup(&root.join(".opencode/package.json"), OPENCODE_PACKAGE_JSON)?;
         }
     }
     println!("installed hooks for {installed}");
@@ -1157,7 +1155,6 @@ def main():
 if __name__ == "__main__":
     main()
 "##;
-
 
 const CLAUDE_SESSION_START_PY: &str = r##"#!/usr/bin/env python3
 # code-sanity Claude Code SessionStart: inject guidance to use the code-sanity tools.

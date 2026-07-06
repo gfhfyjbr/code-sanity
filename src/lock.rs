@@ -35,8 +35,7 @@ impl WorkspaceLock {
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            return Err(err)
-                .with_context(|| format!("acquire workspace lock {}", path.display()));
+            return Err(err).with_context(|| format!("acquire workspace lock {}", path.display()));
         }
         Ok(Self { _file: file })
     }
