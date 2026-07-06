@@ -506,7 +506,13 @@ fn is_binary(path: &Path) -> Result<bool> {
     if buf[..read].contains(&0) {
         return Ok(true);
     }
-    Ok(std::str::from_utf8(&buf[..read]).is_err())
+    match std::str::from_utf8(&buf[..read]) {
+        Ok(_) => Ok(false),
+        // An incomplete multibyte sequence at the end of a full probe merely
+        // straddles the probe boundary; only a sequence invalid mid-buffer (or
+        // truncated at true EOF) marks the file binary.
+        Err(err) => Ok(!(err.error_len().is_none() && read == buf.len())),
+    }
 }
 
 fn write_if_changed(path: &Path, content: &str) -> Result<()> {
@@ -545,4 +551,43 @@ fn ensure_gitignore_entry(root: &Path, entry: &str) -> Result<()> {
     next.push_str(entry);
     next.push('\n');
     fs::write(&path, next).with_context(|| format!("write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multibyte_char_straddling_probe_boundary_is_not_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boundary.txt");
+        // 8191 ASCII bytes then a 2-byte char: its second byte falls outside
+        // the 8192-byte probe window.
+        let mut content = "a".repeat(8191);
+        content.push('\u{e9}');
+        content.push_str(" tail");
+        fs::write(&path, &content).unwrap();
+        assert!(!is_binary(&path).unwrap());
+    }
+
+    #[test]
+    fn nul_bytes_and_invalid_utf8_mid_buffer_are_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let nul = dir.path().join("nul.bin");
+        fs::write(&nul, b"abc\0def").unwrap();
+        assert!(is_binary(&nul).unwrap());
+        let bad = dir.path().join("bad.bin");
+        fs::write(&bad, [b'a', 0xC3, b'(', b'b']).unwrap();
+        assert!(is_binary(&bad).unwrap());
+    }
+
+    #[test]
+    fn truncated_sequence_at_true_eof_is_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trunc.bin");
+        let mut bytes = b"abc".to_vec();
+        bytes.push(0xC3);
+        fs::write(&path, bytes).unwrap();
+        assert!(is_binary(&path).unwrap());
+    }
 }

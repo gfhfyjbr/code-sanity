@@ -1445,3 +1445,122 @@ fn cli_index_read_search_verify_smoke() {
         .success()
         .stdout(predicate::str::contains("verified tracked_files="));
 }
+
+#[test]
+fn crlf_file_roundtrips_through_the_patch_bridge() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    // A CRLF file containing a dictionary term (dangerous -> neutral).
+    fs::write(
+        repo.path().join("src/win.rs"),
+        "// dangerous note\r\nfn calc() -> u32 {\r\n    1\r\n}\r\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/win.rs")).unwrap();
+    assert!(mirror.contains("// neutral note\r\n"), "{mirror:?}");
+
+    // Whole-file write through the bridge: edit one line of the mirror.
+    let edited = mirror.replace("    1\r\n", "    2\r\n");
+    assert_ne!(mirror, edited);
+    write_sanitized_content(repo.path(), Path::new("src/win.rs"), &edited).unwrap();
+
+    let real = fs::read_to_string(repo.path().join("src/win.rs")).unwrap();
+    assert_eq!(
+        real,
+        "// dangerous note\r\nfn calc() -> u32 {\r\n    2\r\n}\r\n"
+    );
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn diff_u0_insertion_lands_after_the_anchor_line() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("src/a.rs"),
+        "fn one() {}\nfn two() {}\nfn three() {}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+    // Minimal-context insertion exactly as `diff -U0` emits it: insert AFTER
+    // line 1.
+    let patch = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,0 +2 @@\n+fn inserted() {}\n";
+    apply_patch_text(repo.path(), patch).unwrap();
+    let real = fs::read_to_string(repo.path().join("src/a.rs")).unwrap();
+    assert_eq!(
+        real,
+        "fn one() {}\nfn inserted() {}\nfn two() {}\nfn three() {}\n"
+    );
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn added_comment_and_string_with_alias_words_stay_verbatim_in_real_file() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    // Add a comment and a string that mention the alias word "neutral"
+    // (dictionary: dangerous -> neutral) as plain language. Reverse mapping
+    // must not rewrite prose into the real term "dangerous".
+    let edited = mirror.replace(
+        "fn neutral_parser()",
+        "// stay neutral here\nfn neutral_parser()",
+    );
+    assert_ne!(mirror, edited);
+    write_sanitized_content(repo.path(), Path::new("src/lib.rs"), &edited).unwrap();
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(
+        real.contains("// stay neutral here"),
+        "comment was reverse-mapped into a real term: {real}"
+    );
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn removed_sql_comment_projects_end_to_end() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("q.sql"),
+        "select 1;\n-- dangerous audit trail\nselect 2;\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+    let mirror = read_sanitized_file(repo.path(), Path::new("q.sql")).unwrap();
+    let edited = mirror
+        .lines()
+        .filter(|line| !line.starts_with("--"))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    write_sanitized_content(repo.path(), Path::new("q.sql"), &edited).unwrap();
+    let real = fs::read_to_string(repo.path().join("q.sql")).unwrap();
+    assert_eq!(real, "select 1;\nselect 2;\n");
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn disjoint_whole_file_edits_straddling_an_alias_apply_without_conflict() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    // The alias for dangerous_parser sits between the two edited lines.
+    fs::write(
+        repo.path().join("src/lib.rs"),
+        "fn top() -> u32 {\n    1\n}\nfn dangerous_parser() {}\nfn bottom() -> u32 {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    assert!(mirror.contains("neutral_parser"));
+    // Two disjoint edits, one above and one below the alias line.
+    let edited = mirror.replacen("    1\n", "    10\n", 1);
+    let pos = edited.rfind("    1\n").unwrap();
+    let mut edited2 = edited.clone();
+    edited2.replace_range(pos..pos + "    1\n".len(), "    20\n");
+    assert_ne!(mirror, edited2);
+    write_sanitized_content(repo.path(), Path::new("src/lib.rs"), &edited2).unwrap();
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(real.contains("    10\n"), "{real}");
+    assert!(real.contains("    20\n"), "{real}");
+    assert!(real.contains("fn dangerous_parser() {}"), "{real}");
+    assert!(verify_workspace(repo.path()).is_ok());
+}

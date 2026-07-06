@@ -305,6 +305,7 @@ fn plan_modify(
         file_patch,
         &span_map,
         &mirror_content,
+        &patched_sanitized,
         config,
         &stored_union,
     ) {
@@ -587,6 +588,41 @@ pub fn project_mirror_edit(
         return apply_patch_text_with_options(root, &patch, options);
     }
 
+    // A mirror edit is only projectable against the baseline it was made on.
+    // If the real file drifted since the last index, the agent edited a stale
+    // view: blindly diffing against a refreshed baseline would silently revert
+    // the external change. Record the edit in a conflict journal entry (the
+    // durable copy), reset the mirror to sanitize(real), and refuse.
+    let layout = init_workspace(root)?;
+    let conn = db::connect(&layout)?;
+    db::init_schema(&conn)?;
+    let rel_string = normalize_rel_path(&rel);
+    let real_content = fs::read_to_string(&real_path)
+        .with_context(|| format!("read real file {}", real_path.display()))?;
+    let drifted = match db::file_hashes(&conn, &rel_string)? {
+        Some((original_hash, _)) => sha256_hex(real_content.as_bytes()) != original_hash,
+        None => false,
+    };
+    if drifted {
+        index_single_file(root, &rel)?;
+        let baseline = fs::read_to_string(&mirror_path)
+            .with_context(|| format!("read refreshed mirror {}", rel.display()))?;
+        let recorded_edit = whole_file_patch(&rel, &baseline, &new_mirror);
+        return write_conflict_and_bail(
+            &layout,
+            &conn,
+            &options,
+            &recorded_edit,
+            "",
+            std::slice::from_ref(&rel_string),
+            format!(
+                "{rel_string}: real file drifted since the mirror edit was made; the edit \
+                 is recorded in the conflict journal and the mirror was reset to \
+                 sanitize(real) — re-apply it against the fresh mirror"
+            ),
+        );
+    }
+
     // Refresh the baseline: reindex real so the mirror on disk and the db both
     // hold sanitize(real) again. `new_mirror` was captured first, so the agent's
     // edit is preserved.
@@ -653,9 +689,37 @@ pub fn rename_alias(
         bail!("{rel_string}: real or mirror drifted since last index; run `code-sanity sync`");
     }
 
-    let (from_start, from_end) = find_whole_word(&mirror_content, from)
-        .ok_or_else(|| anyhow!("alias {from:?} not found as a whole word in {rel_string}"))?;
-    let real_from = reverse_sanitized_region(&span_map, &mirror_content, from_start, from_end);
+    // Resolve `from` through the span map first: replacement spans record
+    // exactly which real identifier each alias stands for, so a colliding
+    // plain identifier with the same spelling can never be renamed by mistake.
+    let alias_originals: BTreeSet<&str> = span_map
+        .replacements
+        .iter()
+        .filter(|replacement| replacement.sanitized_text == from)
+        .map(|replacement| replacement.original_text.as_str())
+        .collect();
+    let real_from = match alias_originals.len() {
+        0 => {
+            // Not an alias in this file: rename a plain (unsanitized) word.
+            let (from_start, from_end) =
+                find_whole_word(&mirror_content, from).ok_or_else(|| {
+                    anyhow!("alias {from:?} not found as a whole word in {rel_string}")
+                })?;
+            reverse_sanitized_region(&span_map, &mirror_content, from_start, from_end)
+        }
+        1 => {
+            let original = alias_originals.iter().next().expect("one original");
+            if find_whole_word(&mirror_content, from).is_none() && !mirror_content.contains(from) {
+                bail!("alias {from:?} not found in {rel_string}");
+            }
+            (*original).to_string()
+        }
+        _ => bail!(
+            "{rel_string}: alias {from:?} is ambiguous (stands for {} different real \
+             identifiers); rename is refused",
+            alias_originals.len()
+        ),
+    };
     if real_from == to {
         bail!("{rel_string}: alias {from:?} already maps to real identifier {to:?}");
     }
@@ -1068,25 +1132,58 @@ fn parse_unified_patch(input: &str) -> Result<UnifiedPatch> {
                 .map(|m| m.as_str().parse::<usize>())
                 .transpose()?
                 .unwrap_or(1);
+            // Consume exactly the number of lines the header declares. Peeking
+            // for the next "@@ "/"--- " marker instead would misparse content
+            // that legitimately starts with those bytes (a removed SQL/Lua
+            // `-- comment` renders as `--- comment`).
             let mut hunk_lines = Vec::new();
-            while let Some(peek) = lines.peek().copied() {
-                if peek.starts_with("@@ ") || peek.starts_with("--- ") {
-                    break;
-                }
-                let hunk_line = lines.next().unwrap();
+            let mut remaining_old = old_count;
+            let mut remaining_new = new_count;
+            while remaining_old > 0 || remaining_new > 0 {
+                let Some(hunk_line) = lines.next() else {
+                    bail!(
+                        "hunk @@ -{old_start},{old_count} +{new_start},{new_count} @@ \
+                         ends before its declared line counts are satisfied"
+                    );
+                };
                 if hunk_line.starts_with('\\') {
+                    // "\ No newline at end of file" annotates the previous line.
                     continue;
                 }
+                let take = |n: &mut usize| -> Result<()> {
+                    *n = n.checked_sub(1).ok_or_else(|| {
+                        anyhow!("hunk line counts exceed header at {hunk_line:?}")
+                    })?;
+                    Ok(())
+                };
                 let Some(prefix) = hunk_line.as_bytes().first().copied() else {
-                    bail!("empty hunk line");
+                    // Some tools strip the trailing space from empty context lines.
+                    take(&mut remaining_old)?;
+                    take(&mut remaining_new)?;
+                    hunk_lines.push(HunkLine::Context(String::new()));
+                    continue;
                 };
                 let content = hunk_line[1..].to_string();
                 match prefix {
-                    b' ' => hunk_lines.push(HunkLine::Context(content)),
-                    b'+' => hunk_lines.push(HunkLine::Add(content)),
-                    b'-' => hunk_lines.push(HunkLine::Remove(content)),
+                    b' ' => {
+                        take(&mut remaining_old)?;
+                        take(&mut remaining_new)?;
+                        hunk_lines.push(HunkLine::Context(content));
+                    }
+                    b'+' => {
+                        take(&mut remaining_new)?;
+                        hunk_lines.push(HunkLine::Add(content));
+                    }
+                    b'-' => {
+                        take(&mut remaining_old)?;
+                        hunk_lines.push(HunkLine::Remove(content));
+                    }
                     other => bail!("invalid hunk line prefix {}", other as char),
                 }
+            }
+            // A trailing no-newline marker for the hunk's last line.
+            while lines.peek().is_some_and(|line| line.starts_with('\\')) {
+                lines.next();
             }
             hunks.push(Hunk {
                 old_start,
@@ -1152,31 +1249,101 @@ fn normalize_patch_file_path(path: &str, root: &Path, layout: &Layout) -> Result
     normalize_safe_rel_path(&candidate, "repo")
 }
 
+/// 0-based cursor of the first old-file line a hunk touches. For a pure
+/// insertion (old_count == 0) the unified-diff convention is "insert AFTER
+/// line old_start", so the cursor sits one line further down; `@@ -0,0 ...`
+/// inserts at the top of the file.
+fn hunk_anchor_line(hunk: &Hunk) -> usize {
+    if hunk.old_count == 0 {
+        hunk.old_start
+    } else {
+        hunk.old_start.saturating_sub(1)
+    }
+}
+
+/// 0-based new-file cursor of the first line a hunk produces.
+fn hunk_new_anchor_line(hunk: &Hunk) -> usize {
+    if hunk.new_count == 0 {
+        hunk.new_start
+    } else {
+        hunk.new_start.saturating_sub(1)
+    }
+}
+
+/// The dominant line terminator of `content`: "\r\n" when at least half of
+/// the newlines are CRLF, else "\n". Added lines adopt it so a patch does not
+/// mix endings into a CRLF file.
+fn dominant_eol(content: &str) -> &'static str {
+    let total = content.matches('\n').count();
+    let crlf = content.matches("\r\n").count();
+    if total > 0 && crlf * 2 >= total {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Hunk-line content without a trailing '\r' (a diff of a CRLF file carries
+/// the CR inside the line content).
+fn line_body_text(text: &str) -> &str {
+    text.strip_suffix('\r').unwrap_or(text)
+}
+
+/// Byte ranges of the old content this patch edits, at line and sub-line
+/// granularity: a removed line paired with its added replacement narrows to
+/// their changed byte range, and a pure insertion contributes an empty range
+/// at its insertion point. A purely deleted line contributes nothing — its
+/// spans are removed whole, which is safe, unlike a partial span edit.
+/// Disjoint edits inside one hunk stay disjoint, so an untouched alias
+/// between them no longer reads as edited.
 fn changed_ranges(content: &str, file_patch: &FilePatch) -> Result<Vec<(usize, usize)>> {
     let line_starts = line_starts(content);
+    let lines = split_lines(content);
     let mut ranges = Vec::new();
     for hunk in &file_patch.hunks {
-        let start = byte_for_line(&line_starts, content.len(), hunk.old_start);
-        let end = byte_after_lines(&line_starts, content.len(), hunk.old_start, hunk.old_count);
-        let old_region = &content[start..end];
-        let new_region = hunk_new_region(hunk);
-        let (local_start, local_end) = common_changed_range(old_region, &new_region);
-        ranges.push((start + local_start, start + local_end));
+        let mut line_idx = hunk_anchor_line(hunk);
+        let mut removed: std::collections::VecDeque<(usize, usize)> =
+            std::collections::VecDeque::new();
+        for line in &hunk.lines {
+            match line {
+                HunkLine::Context(_) => {
+                    removed.clear();
+                    line_idx += 1;
+                }
+                HunkLine::Remove(_) => {
+                    let start = byte_for_line(&line_starts, content.len(), line_idx + 1);
+                    let body_len = lines
+                        .get(line_idx)
+                        .map(|line| line_body(line).len())
+                        .unwrap_or(0);
+                    removed.push_back((start, start + body_len));
+                    line_idx += 1;
+                }
+                HunkLine::Add(text) => {
+                    if let Some((start, end)) = removed.pop_front() {
+                        let old_body = &content[start..end];
+                        let (local_start, local_end) =
+                            common_changed_range(old_body, line_body_text(text));
+                        ranges.push((start + local_start, start + local_end));
+                    } else {
+                        let start = byte_for_line(&line_starts, content.len(), line_idx + 1);
+                        ranges.push((start, start));
+                    }
+                }
+            }
+        }
     }
     Ok(ranges)
 }
 
 fn apply_file_patch_to_content(content: &str, file_patch: &FilePatch) -> Result<String> {
     let lines = split_lines(content);
+    let eol = dominant_eol(content);
     let mut out = Vec::<String>::new();
     let mut cursor = 0usize;
 
     for hunk in &file_patch.hunks {
-        let start_idx = if hunk.old_start == 0 {
-            0
-        } else {
-            hunk.old_start - 1
-        };
+        let start_idx = hunk_anchor_line(hunk);
         if start_idx < cursor {
             bail!("overlapping hunks at line {}", hunk.old_start);
         }
@@ -1192,11 +1359,11 @@ fn apply_file_patch_to_content(content: &str, file_patch: &FilePatch) -> Result<
                     let actual = lines
                         .get(cursor)
                         .ok_or_else(|| anyhow!("missing context line {}", cursor + 1))?;
-                    if line_body(actual) != expected {
+                    if line_body(actual) != line_body_text(expected) {
                         bail!(
                             "context mismatch at line {}: expected {:?}, got {:?}",
                             cursor + 1,
-                            expected,
+                            line_body_text(expected),
                             line_body(actual)
                         );
                     }
@@ -1207,17 +1374,17 @@ fn apply_file_patch_to_content(content: &str, file_patch: &FilePatch) -> Result<
                     let actual = lines
                         .get(cursor)
                         .ok_or_else(|| anyhow!("missing remove line {}", cursor + 1))?;
-                    if line_body(actual) != expected {
+                    if line_body(actual) != line_body_text(expected) {
                         bail!(
                             "remove mismatch at line {}: expected {:?}, got {:?}",
                             cursor + 1,
-                            expected,
+                            line_body_text(expected),
                             line_body(actual)
                         );
                     }
                     cursor += 1;
                 }
-                HunkLine::Add(content) => out.push(format!("{content}\n")),
+                HunkLine::Add(content) => out.push(format!("{}{eol}", line_body_text(content))),
             }
         }
     }
@@ -1285,11 +1452,16 @@ fn reverse_alias_table(span_map: &SpanMap, config: &Config) -> ReverseAliases {
 /// if sanitizing the reversed run reproduces the run the agent wrote (the
 /// run-level roundtrip filter), so an innocent identifier that merely contains
 /// an alias-looking substring is left alone instead of being corrupted.
+///
+/// `in_prose` receives each run's byte offset within `text`: a run inside a
+/// comment or string literal of the patched mirror is plain language, not a
+/// symbol reference, and is never rewritten into a real term.
 fn reverse_map_new_text(
     text: &str,
     reverse: &ReverseAliases,
     terms: &[Term],
     protected: &BTreeSet<String>,
+    in_prose: &dyn Fn(usize) -> bool,
 ) -> Result<String> {
     if reverse.terms.is_empty() {
         return Ok(text.to_string());
@@ -1301,7 +1473,7 @@ fn reverse_map_new_text(
         out.push_str(&text[cursor..run_start]);
         cursor = run_end;
         let run = &text[run_start..run_end];
-        if protected.contains(run) {
+        if protected.contains(run) || in_prose(run_start) {
             out.push_str(run);
             continue;
         }
@@ -1344,16 +1516,50 @@ fn reverse_map_new_text(
     Ok(out)
 }
 
+/// Comment/string zones of the patched mirror plus its line offsets, used to
+/// keep reverse mapping out of prose in added lines.
+struct ProseZones {
+    strings: Vec<crate::sanitize::ByteRange>,
+    comments: Vec<crate::sanitize::ByteRange>,
+    line_starts: Vec<usize>,
+    len: usize,
+}
+
+impl ProseZones {
+    fn new(rel_path: &Path, patched_sanitized: &str) -> Self {
+        let language = crate::sanitize::detect_language(rel_path, patched_sanitized);
+        let strings = crate::sanitize::string_ranges(&language, patched_sanitized);
+        let comments = crate::sanitize::comment_ranges(&language, patched_sanitized, &strings);
+        Self {
+            strings,
+            comments,
+            line_starts: line_starts(patched_sanitized),
+            len: patched_sanitized.len(),
+        }
+    }
+
+    fn in_prose(&self, offset: usize) -> bool {
+        crate::sanitize::range_contains(&self.strings, offset)
+            || crate::sanitize::range_contains(&self.comments, offset)
+    }
+
+    fn line_offset(&self, one_based_line: usize) -> usize {
+        byte_for_line(&self.line_starts, self.len, one_based_line)
+    }
+}
+
 fn translate_file_patch(
     file_patch: &FilePatch,
     span_map: &SpanMap,
     sanitized_content: &str,
+    patched_sanitized: &str,
     config: &Config,
     protected: &BTreeSet<String>,
 ) -> Result<FilePatch> {
     let starts = line_starts(sanitized_content);
     let reverse = reverse_alias_table(span_map, config);
     let terms = term_table(config);
+    let prose = ProseZones::new(Path::new(&span_map.rel_path), patched_sanitized);
     let hunks = file_patch
         .hunks
         .iter()
@@ -1366,6 +1572,7 @@ fn translate_file_patch(
                 &reverse,
                 &terms,
                 protected,
+                &prose,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1376,6 +1583,13 @@ fn translate_file_patch(
     })
 }
 
+/// Translate one hunk line by line. Context/Remove lines translate the alias
+/// ranges recorded for their exact mirror line; an added line paired with a
+/// removed line (a modification) inherits that line's alias ranges projected
+/// through the pair's changed byte range, then reverse-maps any remaining
+/// alias words the agent wrote. Per-line pairing keeps disjoint edits in one
+/// hunk independent — CRLF or a length change in one line no longer skews
+/// alias offsets for the rest of the hunk.
 #[allow(clippy::too_many_arguments)]
 fn translate_hunk(
     hunk: &Hunk,
@@ -1385,44 +1599,68 @@ fn translate_hunk(
     reverse: &ReverseAliases,
     terms: &[Term],
     protected: &BTreeSet<String>,
+    prose: &ProseZones,
 ) -> Result<Hunk> {
-    let old_region_start = byte_for_line(line_starts, sanitized_content.len(), hunk.old_start);
-    let old_region_end = byte_after_lines(
-        line_starts,
-        sanitized_content.len(),
-        hunk.old_start,
-        hunk.old_count,
-    );
-    let old_region = &sanitized_content[old_region_start..old_region_end];
-    let new_region = hunk_new_region(hunk);
-    let old_alias_ranges = alias_ranges_for_region(span_map, old_region_start, old_region_end);
-    let new_alias_ranges =
-        project_alias_ranges_to_new_region(&old_alias_ranges, old_region, &new_region)?;
-
-    let mut old_cursor = 0usize;
-    let mut new_cursor = 0usize;
+    let mut old_line = hunk_anchor_line(hunk);
+    let mut new_line = hunk_new_anchor_line(hunk);
+    let mut removed: std::collections::VecDeque<(String, Vec<AliasRange>)> =
+        std::collections::VecDeque::new();
     let mut lines = Vec::with_capacity(hunk.lines.len());
+
     for line in &hunk.lines {
         match line {
             HunkLine::Context(text) => {
-                let translated = translate_known_alias_ranges(text, old_cursor, &old_alias_ranges)?;
-                old_cursor += text.len() + 1;
-                new_cursor += text.len() + 1;
+                removed.clear();
+                let (body, ranges) =
+                    line_alias_ranges(span_map, sanitized_content, line_starts, old_line)?;
+                if line_body_text(text) != body {
+                    bail!(
+                        "context mismatch at sanitized line {}: expected {:?}, got {:?}",
+                        old_line + 1,
+                        line_body_text(text),
+                        body
+                    );
+                }
+                let (translated, _) = translate_known_alias_ranges(body, &ranges)?;
                 lines.push(HunkLine::Context(translated));
+                old_line += 1;
+                new_line += 1;
             }
             HunkLine::Remove(text) => {
-                let translated = translate_known_alias_ranges(text, old_cursor, &old_alias_ranges)?;
-                old_cursor += text.len() + 1;
+                let (body, ranges) =
+                    line_alias_ranges(span_map, sanitized_content, line_starts, old_line)?;
+                if line_body_text(text) != body {
+                    bail!(
+                        "remove mismatch at sanitized line {}: expected {:?}, got {:?}",
+                        old_line + 1,
+                        line_body_text(text),
+                        body
+                    );
+                }
+                let (translated, _) = translate_known_alias_ranges(body, &ranges)?;
+                removed.push_back((body.to_string(), ranges));
                 lines.push(HunkLine::Remove(translated));
+                old_line += 1;
             }
             HunkLine::Add(text) => {
-                let translated = translate_known_alias_ranges(text, new_cursor, &new_alias_ranges)?;
+                let body = line_body_text(text);
+                let projected = match removed.pop_front() {
+                    Some((old_body, old_ranges)) => {
+                        project_line_alias_ranges(&old_body, body, &old_ranges)?
+                    }
+                    None => Vec::new(),
+                };
+                let (translated, splices) = translate_known_alias_ranges(body, &projected)?;
                 // Newly added text may use aliases the agent saw in the mirror
                 // (whole words or inside identifiers); map them back to the
                 // real names so the real file stays semantically coherent.
-                let translated = reverse_map_new_text(&translated, reverse, terms, protected)?;
-                new_cursor += text.len() + 1;
+                let line_abs = prose.line_offset(new_line + 1);
+                let translated =
+                    reverse_map_new_text(&translated, reverse, terms, protected, &|offset| {
+                        prose.in_prose(line_abs + body_offset_for(&splices, offset))
+                    })?;
                 lines.push(HunkLine::Add(translated));
+                new_line += 1;
             }
         }
     }
@@ -1436,42 +1674,57 @@ fn translate_hunk(
     })
 }
 
-fn alias_ranges_for_region(span_map: &SpanMap, start: usize, end: usize) -> Vec<AliasRange> {
-    span_map
-        .replacements
-        .iter()
-        .filter(|replacement| {
-            replacement.sanitized_start >= start && replacement.sanitized_end <= end
-        })
-        .map(|replacement| AliasRange {
-            start: replacement.sanitized_start - start,
-            end: replacement.sanitized_end - start,
-            sanitized_text: replacement.sanitized_text.clone(),
-            original_text: replacement.original_text.clone(),
-        })
-        .collect()
+/// The body text of 0-based `line_idx` in the sanitized content plus the alias
+/// ranges falling inside it, rebased to line-local offsets.
+fn line_alias_ranges<'content>(
+    span_map: &SpanMap,
+    sanitized_content: &'content str,
+    starts: &[usize],
+    line_idx: usize,
+) -> Result<(&'content str, Vec<AliasRange>)> {
+    let len = sanitized_content.len();
+    let line_start = byte_for_line(starts, len, line_idx + 1);
+    let line_end = byte_after_lines(starts, len, line_idx + 1, 1);
+    let body = line_body(&sanitized_content[line_start..line_end]);
+    let body_end = line_start + body.len();
+    let mut ranges = Vec::new();
+    for replacement in &span_map.replacements {
+        if replacement.sanitized_start >= line_start && replacement.sanitized_end <= body_end {
+            ranges.push(AliasRange {
+                start: replacement.sanitized_start - line_start,
+                end: replacement.sanitized_end - line_start,
+                sanitized_text: replacement.sanitized_text.clone(),
+                original_text: replacement.original_text.clone(),
+            });
+        }
+    }
+    Ok((body, ranges))
 }
 
-fn project_alias_ranges_to_new_region(
-    old_ranges: &[AliasRange],
-    old_region: &str,
-    new_region: &str,
+/// Project the alias ranges of a removed line onto its paired added line:
+/// ranges in the unchanged prefix keep their offsets, ranges in the unchanged
+/// suffix shift by the length delta, and a range overlapping the changed
+/// middle is a refused span edit.
+fn project_line_alias_ranges(
+    old_body: &str,
+    new_body: &str,
+    ranges: &[AliasRange],
 ) -> Result<Vec<AliasRange>> {
-    let (changed_start, changed_old_end) = common_changed_range(old_region, new_region);
-    let mut projected = Vec::with_capacity(old_ranges.len());
-    for range in old_ranges {
+    let (changed_start, changed_old_end) = common_changed_range(old_body, new_body);
+    let mut projected = Vec::with_capacity(ranges.len());
+    for range in ranges {
         let (start, end) = if range.end <= changed_start {
             (range.start, range.end)
         } else if range.start >= changed_old_end {
             (
-                new_region.len() - (old_region.len() - range.start),
-                new_region.len() - (old_region.len() - range.end),
+                new_body.len() - (old_body.len() - range.start),
+                new_body.len() - (old_body.len() - range.end),
             )
         } else {
             bail!("patch changes sanitized replacement span");
         };
-        if start > end || end > new_region.len() {
-            bail!("projected alias range is outside patched hunk");
+        if start > end || end > new_body.len() {
+            bail!("projected alias range is outside patched line");
         }
         projected.push(AliasRange {
             start,
@@ -1483,24 +1736,49 @@ fn project_alias_ranges_to_new_region(
     Ok(projected)
 }
 
+/// A splice performed by `translate_known_alias_ranges`: everything after
+/// `translated_end` in the translated text sits `delta` bytes away from its
+/// position in the pre-translation body.
+struct Splice {
+    translated_end: usize,
+    delta: isize,
+}
+
+/// Map an offset in the translated text back to the pre-translation body.
+fn body_offset_for(splices: &[Splice], translated_offset: usize) -> usize {
+    let mut delta = 0isize;
+    for splice in splices {
+        if splice.translated_end <= translated_offset {
+            delta = splice.delta;
+        } else {
+            break;
+        }
+    }
+    (translated_offset as isize - delta).max(0) as usize
+}
+
+/// Splice each line-local alias range's original text into `text`, verifying
+/// the range still holds the recorded sanitized text. Returns the translated
+/// line and the splice offsets (for mapping translated offsets back to the
+/// input body).
 fn translate_known_alias_ranges(
     text: &str,
-    line_start_in_region: usize,
     ranges: &[AliasRange],
-) -> Result<String> {
-    let line_end = line_start_in_region + text.len();
+) -> Result<(String, Vec<Splice>)> {
+    let mut sorted: Vec<&AliasRange> = ranges.iter().collect();
+    sorted.sort_by_key(|range| range.start);
     let mut cursor = 0usize;
     let mut out = String::with_capacity(text.len());
-    for range in ranges
-        .iter()
-        .filter(|range| range.start >= line_start_in_region && range.end <= line_end)
-    {
-        let local_start = range.start - line_start_in_region;
-        let local_end = range.end - line_start_in_region;
-        if !text.is_char_boundary(local_start) || !text.is_char_boundary(local_end) {
+    let mut splices = Vec::new();
+    let mut delta = 0isize;
+    for range in sorted {
+        if range.end > text.len() {
+            bail!("replacement span is outside line bounds");
+        }
+        if !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
             bail!("replacement span is not on UTF-8 boundaries");
         }
-        let actual = &text[local_start..local_end];
+        let actual = &text[range.start..range.end];
         if actual != range.sanitized_text {
             bail!(
                 "replacement span mismatch: expected {:?}, got {:?}",
@@ -1508,12 +1786,17 @@ fn translate_known_alias_ranges(
                 actual
             );
         }
-        out.push_str(&text[cursor..local_start]);
+        out.push_str(&text[cursor..range.start]);
         out.push_str(&range.original_text);
-        cursor = local_end;
+        cursor = range.end;
+        delta += range.original_text.len() as isize - (range.end - range.start) as isize;
+        splices.push(Splice {
+            translated_end: out.len(),
+            delta,
+        });
     }
     out.push_str(&text[cursor..]);
-    Ok(out)
+    Ok((out, splices))
 }
 
 fn render_file_patch(file_patch: &FilePatch) -> String {
@@ -1536,24 +1819,61 @@ fn render_file_patch(file_patch: &FilePatch) -> String {
     out
 }
 
+/// A unified diff between two versions of one file with localized hunks (a
+/// real line diff, not one whole-file hunk), so disjoint edits stay
+/// independent for conflict checks and per-line alias projection. Rendered by
+/// hand from the diff ops so hunk headers follow the exact `diff -U`
+/// conventions our parser and applier implement (including the
+/// insert-after-line form `-N,0`).
 fn whole_file_patch(rel_path: &Path, old: &str, new: &str) -> String {
-    let old_lines = old.lines().count();
-    let new_lines = new.lines().count();
-    let old_start = if old_lines == 0 { 0 } else { 1 };
-    let new_start = if new_lines == 0 { 0 } else { 1 };
     let rel = normalize_rel_path(rel_path);
-    let mut out = String::new();
-    out.push_str(&format!("--- a/{rel}\n"));
-    out.push_str(&format!("+++ b/{rel}\n"));
-    out.push_str(&format!(
-        "@@ -{},{} +{},{} @@\n",
-        old_start, old_lines, new_start, new_lines
-    ));
-    for line in old.lines() {
-        out.push_str(&format!("-{line}\n"));
-    }
-    for line in new.lines() {
-        out.push_str(&format!("+{line}\n"));
+    let diff = similar::TextDiff::from_lines(old, new);
+    let mut out = format!("--- a/{rel}\n+++ b/{rel}\n");
+    for group in diff.grouped_ops(3) {
+        if group.is_empty() {
+            continue;
+        }
+        // Hunk extents from the whole group: op index bookkeeping is not
+        // monotonic for degenerate diffs, so first/last ranges cannot be
+        // trusted, but starts and consumed-line sums always can.
+        let old_start = group
+            .iter()
+            .map(|op| op.old_range().start)
+            .min()
+            .unwrap_or(0);
+        let old_count: usize = group.iter().map(|op| op.old_range().len()).sum();
+        let new_start = group
+            .iter()
+            .map(|op| op.new_range().start)
+            .min()
+            .unwrap_or(0);
+        let new_count: usize = group.iter().map(|op| op.new_range().len()).sum();
+        out.push_str(&format!(
+            "@@ -{},{old_count} +{},{new_count} @@\n",
+            if old_count == 0 {
+                old_start
+            } else {
+                old_start + 1
+            },
+            if new_count == 0 {
+                new_start
+            } else {
+                new_start + 1
+            },
+        ));
+        for op in &group {
+            for change in diff.iter_changes(op) {
+                let sign = match change.tag() {
+                    similar::ChangeTag::Equal => ' ',
+                    similar::ChangeTag::Delete => '-',
+                    similar::ChangeTag::Insert => '+',
+                };
+                let value = change.value();
+                out.push(sign);
+                out.push_str(value.strip_suffix('\n').unwrap_or(value));
+                out.push('\n');
+            }
+        }
     }
     out
 }
@@ -1692,20 +2012,6 @@ fn byte_after_lines(starts: &[usize], len: usize, one_based_line: usize, count: 
     starts.get(start_idx + count).copied().unwrap_or(len)
 }
 
-fn hunk_new_region(hunk: &Hunk) -> String {
-    let mut out = String::new();
-    for line in &hunk.lines {
-        match line {
-            HunkLine::Context(text) | HunkLine::Add(text) => {
-                out.push_str(text);
-                out.push('\n');
-            }
-            HunkLine::Remove(_) => {}
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1732,6 +2038,183 @@ mod tests {
         let ranges = changed_ranges("fn neutral_parser() {}\n", &patch.files[0]).unwrap();
         assert_eq!(ranges.len(), 1);
         assert!(ranges[0].0 >= "fn neutral_parser(".len());
+    }
+
+    #[test]
+    fn insertion_hunk_lands_after_its_anchor_line() {
+        // Golden convention from `diff -U0`: "@@ -1,0 +2 @@" inserts AFTER
+        // line 1 of the old file.
+        let patch =
+            parse_unified_patch("--- a/f.txt\n+++ b/f.txt\n@@ -1,0 +2 @@\n+inserted\n").unwrap();
+        let next = apply_file_patch_to_content("one\ntwo\nthree\n", &patch.files[0]).unwrap();
+        assert_eq!(next, "one\ninserted\ntwo\nthree\n");
+
+        let top =
+            parse_unified_patch("--- a/f.txt\n+++ b/f.txt\n@@ -0,0 +1,2 @@\n+x\n+y\n").unwrap();
+        let next = apply_file_patch_to_content("one\n", &top.files[0]).unwrap();
+        assert_eq!(next, "x\ny\none\n");
+    }
+
+    #[test]
+    fn insertion_hunk_changed_range_is_empty_at_insertion_point() {
+        let patch =
+            parse_unified_patch("--- a/f.txt\n+++ b/f.txt\n@@ -1,0 +2 @@\n+inserted\n").unwrap();
+        let ranges = changed_ranges("one\ntwo\n", &patch.files[0]).unwrap();
+        assert_eq!(ranges, vec![(4, 4)]);
+    }
+
+    #[test]
+    fn removed_sql_comment_lines_parse_by_count_not_marker() {
+        // A removed `-- comment` renders as `--- comment`; counting hunk lines
+        // from the header keeps it inside the hunk.
+        let patch_text =
+            "--- a/q.sql\n+++ b/q.sql\n@@ -1,3 +1,2 @@\n select 1;\n--- drop me\n select 2;\n";
+        let patch = parse_unified_patch(patch_text).unwrap();
+        assert_eq!(patch.files.len(), 1);
+        assert_eq!(patch.files[0].hunks.len(), 1);
+        let next =
+            apply_file_patch_to_content("select 1;\n-- drop me\nselect 2;\n", &patch.files[0])
+                .unwrap();
+        assert_eq!(next, "select 1;\nselect 2;\n");
+    }
+
+    #[test]
+    fn empty_context_lines_without_leading_space_are_tolerated() {
+        let patch_text = "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n";
+        let patch = parse_unified_patch(patch_text).unwrap();
+        let next = apply_file_patch_to_content("a\n\nb\n", &patch.files[0]).unwrap();
+        assert_eq!(next, "a\n\nc\n");
+    }
+
+    #[test]
+    fn hunk_line_count_mismatch_is_rejected() {
+        let err = parse_unified_patch("--- a/f\n+++ b/f\n@@ -1,2 +1,1 @@\n-a\n").unwrap_err();
+        assert!(err.to_string().contains("ends before"), "{err:#}");
+    }
+
+    #[test]
+    fn crlf_added_lines_adopt_the_dominant_eol() {
+        let patch = parse_unified_patch(
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n alpha\n-beta\n+gamma\n+delta\n",
+        )
+        .unwrap();
+        let next = apply_file_patch_to_content("alpha\r\nbeta\r\n", &patch.files[0]).unwrap();
+        assert_eq!(next, "alpha\r\ngamma\r\ndelta\r\n");
+    }
+
+    #[test]
+    fn crlf_patch_content_with_carriage_returns_matches_lf_file() {
+        let patch = parse_unified_patch(
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n alpha\r\n-beta\r\n+gamma\r\n",
+        )
+        .unwrap();
+        let next = apply_file_patch_to_content("alpha\nbeta\n", &patch.files[0]).unwrap();
+        assert_eq!(next, "alpha\ngamma\n");
+    }
+
+    #[test]
+    fn disjoint_edits_in_one_hunk_produce_disjoint_ranges() {
+        let patch = parse_unified_patch(
+            "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n-aaa\n+axa\n keep\n-bbb\n+bxb\n",
+        )
+        .unwrap();
+        let content = "aaa\nkeep\nbbb\n";
+        let ranges = changed_ranges(content, &patch.files[0]).unwrap();
+        assert_eq!(ranges.len(), 2);
+        let keep_start = content.find("keep").unwrap();
+        let keep_end = keep_start + "keep".len();
+        for (start, end) in ranges {
+            assert!(
+                end <= keep_start || start >= keep_end,
+                "range {start}..{end} covers the untouched middle line"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_file_patch_localizes_disjoint_edits_into_separate_hunks() {
+        let old: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+        let new = old
+            .replace("line2\n", "edited2\n")
+            .replace("line18\n", "edited18\n");
+        let patch_text = whole_file_patch(Path::new("f.txt"), &old, &new);
+        let parsed = parse_unified_patch(&patch_text).unwrap();
+        assert_eq!(parsed.files[0].hunks.len(), 2, "{patch_text}");
+        let applied = apply_file_patch_to_content(&old, &parsed.files[0]).unwrap();
+        assert_eq!(applied, new);
+    }
+
+    #[test]
+    fn rename_resolves_alias_via_span_map_not_first_textual_occurrence() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        // The alias word "client" (dictionary: acme -> client) appears in a
+        // plain string BEFORE the aliased identifier; rename must target the
+        // real symbol behind the alias, not the first textual match.
+        std::fs::write(
+            repo.path().join("src/a.rs"),
+            "const S: &str = \"client says\";\nfn acme() -> usize {\n    1\n}\n",
+        )
+        .unwrap();
+        crate::index::index_workspace(repo.path()).unwrap();
+        rename_alias(
+            repo.path(),
+            Path::new("src/a.rs"),
+            "client",
+            "fetcher",
+            ApplyOptions::default(),
+        )
+        .unwrap();
+        let real = std::fs::read_to_string(repo.path().join("src/a.rs")).unwrap();
+        assert!(real.contains("fn fetcher()"), "{real}");
+        assert!(real.contains("\"client says\""), "{real}");
+        assert!(crate::verify::verify_workspace(repo.path()).is_ok());
+    }
+
+    #[test]
+    fn rename_refuses_an_ambiguous_alias() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/a.rs"),
+            "fn acme() {}\nfn corpx() {}\n",
+        )
+        .unwrap();
+        let layout = crate::index::init_workspace(repo.path()).unwrap();
+        let mut config = Config::load_or_default(&layout).unwrap();
+        config.sanitizer.dictionary = std::collections::BTreeMap::from([
+            ("acme".to_string(), "shared".to_string()),
+            ("corpx".to_string(), "shared".to_string()),
+        ]);
+        config.save(&layout).unwrap();
+        crate::index::index_workspace(repo.path()).unwrap();
+        let err = rename_alias(
+            repo.path(),
+            Path::new("src/a.rs"),
+            "shared",
+            "renamed",
+            ApplyOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err:#}");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn diff_parse_apply_roundtrips(
+            old_lines in proptest::collection::vec("[a-z ]{0,8}", 0..30),
+            new_lines in proptest::collection::vec("[a-z ]{0,8}", 0..30),
+        ) {
+            let old: String = old_lines.iter().map(|line| format!("{line}\n")).collect();
+            let new: String = new_lines.iter().map(|line| format!("{line}\n")).collect();
+            let patch_text = whole_file_patch(Path::new("f.txt"), &old, &new);
+            if old != new {
+                let parsed = parse_unified_patch(&patch_text).unwrap();
+                proptest::prop_assert_eq!(parsed.files.len(), 1);
+                let applied = apply_file_patch_to_content(&old, &parsed.files[0]).unwrap();
+                proptest::prop_assert_eq!(applied, new);
+            }
+        }
     }
 
     #[test]

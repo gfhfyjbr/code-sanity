@@ -435,7 +435,11 @@ fn is_keyword(ident: &str) -> bool {
     )
 }
 
-fn comment_ranges(language: &str, content: &str, string_ranges: &[ByteRange]) -> Vec<ByteRange> {
+pub(crate) fn comment_ranges(
+    language: &str,
+    content: &str,
+    string_ranges: &[ByteRange],
+) -> Vec<ByteRange> {
     if language == "markdown" {
         return vec![ByteRange {
             start: 0,
@@ -486,15 +490,15 @@ fn comment_ranges(language: &str, content: &str, string_ranges: &[ByteRange]) ->
 }
 
 #[derive(Debug, Clone)]
-struct ByteRange {
-    start: usize,
-    end: usize,
+pub(crate) struct ByteRange {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 /// String literal ranges (for categorization only; sanitization no longer
 /// depends on zone detection). `'` is not a string delimiter in Rust or Go —
 /// lifetimes (`&'a str`) and runes would otherwise open phantom strings.
-fn string_ranges(language: &str, content: &str) -> Vec<ByteRange> {
+pub(crate) fn string_ranges(language: &str, content: &str) -> Vec<ByteRange> {
     if matches!(language, "markdown" | "text") {
         return Vec::new();
     }
@@ -639,7 +643,7 @@ fn to_identifier_word(replacement: &str) -> String {
         .collect()
 }
 
-fn range_contains(ranges: &[ByteRange], point: usize) -> bool {
+pub(crate) fn range_contains(ranges: &[ByteRange], point: usize) -> bool {
     ranges
         .iter()
         .any(|range| point >= range.start && point < range.end)
