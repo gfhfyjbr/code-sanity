@@ -107,7 +107,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         command: Vec<String>,
     },
-    Sync,
+    Sync {
+        /// Sync only this repo-relative path (used by agent hooks).
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     Verify,
     Doctor {
         #[arg(long)]
@@ -134,7 +138,27 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root.canonicalize().unwrap_or(cli.root);
 
-    match cli.command {
+    match dispatch(cli.command, &root) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // Dedicated exit codes: 2 = patch conflict (real files untouched),
+            // 3 = workspace broken (verify failed). Everything else is 1.
+            if err.downcast_ref::<crate::patch::ConflictError>().is_some() {
+                eprintln!("{err:#}");
+                std::process::exit(2);
+            }
+            if let Some(failed) = err.downcast_ref::<crate::verify::VerifyFailed>() {
+                eprint!("{failed}");
+                std::process::exit(3);
+            }
+            Err(err)
+        }
+    }
+}
+
+fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
+    let root = root.to_path_buf();
+    match command {
         Command::Init => {
             let layout = init_workspace(&root)?;
             println!("initialized {}", layout.state_dir.display());
@@ -142,8 +166,8 @@ pub fn run() -> Result<()> {
         Command::Index => {
             let report = index_workspace(&root)?;
             println!(
-                "indexed={} unchanged={} skipped={} removed={}",
-                report.indexed, report.unchanged, report.skipped, report.removed
+                "indexed={} unchanged={} skipped={} removed={} pending={}",
+                report.indexed, report.unchanged, report.skipped, report.removed, report.pending
             );
         }
         Command::Read { path } => {
@@ -304,11 +328,14 @@ pub fn run() -> Result<()> {
             let code = crate::strict::run(&root, &command, true)?;
             std::process::exit(code);
         }
-        Command::Sync => {
-            let report = index_workspace(&root)?;
+        Command::Sync { path } => {
+            let report = match path {
+                Some(path) => crate::index::sync_single_file(&root, &path)?,
+                None => index_workspace(&root)?,
+            };
             println!(
-                "synced indexed={} unchanged={} skipped={} removed={}",
-                report.indexed, report.unchanged, report.skipped, report.removed
+                "synced indexed={} unchanged={} skipped={} removed={} pending={}",
+                report.indexed, report.unchanged, report.skipped, report.removed, report.pending
             );
         }
         Command::Verify => {

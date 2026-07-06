@@ -1,17 +1,45 @@
 use crate::config::{Config, Layout, normalize_rel_path, normalize_safe_rel_path};
 use crate::db;
-use crate::index::{index_single_file, init_workspace};
+use crate::index::{
+    index_single_file, index_single_file_locked, index_workspace_locked, init_workspace,
+    stored_protected_union_with_override,
+};
 use crate::journal::{
     JournalEntry, JournalStatus, PendingFile, list_journal_entries, new_journal_id, write_journal,
 };
+use crate::lock::WorkspaceLock;
 use crate::map::{SpanMap, common_changed_range, load_span_map, sha256_hex};
-use crate::sanitize::sanitize_content;
+use crate::sanitize::{
+    Term, adapt_replacement, collect_protected_identifiers, hits_in_run, normalize_term,
+    sanitize_content, sanitize_run_text, term_table, word_runs,
+};
 use crate::search::{ensure_existing_path_inside, normalize_sanitized_rel_path};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use regex::Regex;
-use std::fs::{self, OpenOptions};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+/// Typed conflict error so the CLI can exit with the dedicated conflict code.
+#[derive(Debug)]
+pub struct ConflictError {
+    pub message: String,
+    pub journal_path: PathBuf,
+}
+
+impl std::fmt::Display for ConflictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; conflict journal written to {}",
+            self.message,
+            self.journal_path.display()
+        )
+    }
+}
+
+impl std::error::Error for ConflictError {}
 
 #[derive(Debug, Clone)]
 pub struct ApplyReport {
@@ -89,7 +117,7 @@ fn apply_patch_text_with_options_inner(
     let config = Config::load_or_default(&layout)?;
     let conn = db::connect(&layout)?;
     db::init_schema(&conn)?;
-    let _lock = ApplyLock::acquire(layout.tmp_dir.join("apply.lock"))?;
+    let _lock = WorkspaceLock::acquire(&layout)?;
 
     let parsed = parse_unified_patch(patch_text)?;
     if parsed.files.is_empty() {
@@ -254,10 +282,30 @@ fn plan_modify(
 
     let patched_sanitized = apply_file_patch_to_content(&mirror_content, file_patch)
         .with_context(|| format!("apply sanitized patch to {rel_string}"))?;
-    let original_file_patch = translate_file_patch(file_patch, &span_map, &mirror_content)?;
+    let stored_union = crate::index::stored_protected_union(conn)?;
+    let original_file_patch =
+        match translate_file_patch(file_patch, &span_map, &mirror_content, config, &stored_union) {
+            Ok(translated) => translated,
+            Err(err) => {
+                return write_conflict_and_bail(
+                    layout,
+                    conn,
+                    options,
+                    patch_text,
+                    original_patch,
+                    files,
+                    format!("{rel_string}: {err:#}"),
+                );
+            }
+        };
     let patched_original = apply_file_patch_to_content(&real_content, &original_file_patch)
         .with_context(|| format!("apply translated patch to {rel_string}"))?;
-    let rendered_after = sanitize_content(&rel, &patched_original, config)
+    // Sanitize with the protected union that will hold AFTER this file lands,
+    // exactly what the post-apply reindex of this file will use.
+    let fresh_protected = collect_protected_identifiers(&patched_original);
+    let union_after =
+        stored_protected_union_with_override(conn, &rel_string, &fresh_protected)?;
+    let rendered_after = sanitize_content(&rel, &patched_original, config, &union_after)
         .with_context(|| format!("resanitize patched {rel_string}"))?;
     if rendered_after.sanitized != patched_sanitized {
         return write_conflict_and_bail(
@@ -269,6 +317,27 @@ fn plan_modify(
             files,
             format!(
                 "{rel_string}: translated patch does not preserve sanitize(real) == patched mirror invariant"
+            ),
+        );
+    }
+    // Bidirectional invariant: reverse-projecting the patched mirror through
+    // the fresh span map must reproduce the patched real file byte-for-byte.
+    let reverse_projected = reverse_sanitized_region(
+        &rendered_after.span_map,
+        &rendered_after.sanitized,
+        0,
+        rendered_after.sanitized.len(),
+    );
+    if reverse_projected != patched_original {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            &render_file_patch(&original_file_patch),
+            files,
+            format!(
+                "{rel_string}: reverse projection of patched mirror does not reproduce patched real file"
             ),
         );
     }
@@ -319,7 +388,9 @@ fn plan_create(
     // become the real file directly. The real repo stays the source of truth,
     // so the new file must already be neutral: sanitize(real) must equal the
     // content the agent sent, otherwise what they see after create would drift.
-    let rendered = sanitize_content(&rel, &created, config)
+    let fresh_protected = collect_protected_identifiers(&created);
+    let union_after = stored_protected_union_with_override(conn, &rel_string, &fresh_protected)?;
+    let rendered = sanitize_content(&rel, &created, config, &union_after)
         .with_context(|| format!("sanitize created {rel_string}"))?;
     if rendered.sanitized != created {
         return write_conflict_and_bail(
@@ -538,7 +609,7 @@ pub fn rename_alias(
     let layout = init_workspace(root)?;
     let conn = db::connect(&layout)?;
     db::init_schema(&conn)?;
-    let _lock = ApplyLock::acquire(layout.tmp_dir.join("apply.lock"))?;
+    let _lock = WorkspaceLock::acquire(&layout)?;
 
     let rel = normalize_sanitized_rel_path(rel_path)?;
     let rel_string = normalize_rel_path(&rel);
@@ -621,17 +692,15 @@ pub fn recover_workspace(root: &Path, rollback: bool) -> Result<RecoverReport> {
     let layout = init_workspace(root)?;
     let conn = db::connect(&layout)?;
     db::init_schema(&conn)?;
-    // A crash mid-apply leaves a stale lock behind (Drop never ran). recover is
-    // the tool for exactly that state, so it clears a leftover lock before
-    // taking its own. It assumes no live apply is running concurrently.
-    let lock_path = layout.tmp_dir.join("apply.lock");
-    let _ = fs::remove_file(&lock_path);
-    let _lock = ApplyLock::acquire(lock_path)?;
+    // flock is released by the kernel when the crashed process died, so a
+    // leftover lock file is harmless; recover just takes the lock normally.
+    let _lock = WorkspaceLock::acquire(&layout)?;
 
     let mut report = RecoverReport {
         rolled_back: rollback,
         ..RecoverReport::default()
     };
+    let mut protected_drift = false;
     for (path, mut entry) in list_journal_entries(&layout)? {
         if entry.status != JournalStatus::Applying {
             continue;
@@ -646,7 +715,7 @@ pub fn recover_workspace(root: &Path, rollback: bool) -> Result<RecoverReport> {
             } else {
                 pending_file.after.as_deref()
             };
-            set_file_state(root, &layout, &conn, &rel, target)
+            protected_drift |= set_file_state(root, &layout, &conn, &rel, target)
                 .with_context(|| format!("recover {}", pending_file.rel))?;
         }
         entry.status = if rollback {
@@ -676,6 +745,10 @@ pub fn recover_workspace(root: &Path, rollback: bool) -> Result<RecoverReport> {
                 .unwrap_or_default()
                 .to_string(),
         );
+    }
+    if protected_drift {
+        index_workspace_locked(root, &layout)
+            .context("reindex after recovered protected symbol change")?;
     }
     Ok(report)
 }
@@ -777,10 +850,12 @@ fn commit_planned_apply(
     let journal_path = write_journal(layout, &entry)?;
 
     let mut applied = Vec::<usize>::new();
+    let mut protected_drift = false;
     let commit_result = (|| -> Result<()> {
         for (idx, planned_file) in planned.iter().enumerate() {
-            set_file_state(root, layout, conn, &planned_file.rel, planned_file.after())
-                .with_context(|| format!("apply {}", planned_file.rel.display()))?;
+            protected_drift |=
+                set_file_state(root, layout, conn, &planned_file.rel, planned_file.after())
+                    .with_context(|| format!("apply {}", planned_file.rel.display()))?;
             applied.push(idx);
             if fail_after_writes_for_test == Some(idx + 1) {
                 bail!("simulated apply failure after {} write(s)", idx + 1);
@@ -803,19 +878,29 @@ fn commit_planned_apply(
                 "success",
                 &entry.created_at,
             )?;
+            if protected_drift {
+                // The repo-wide protected symbol set changed, so other files'
+                // renderings are stale; reconverge before releasing the lock.
+                index_workspace_locked(root, layout)
+                    .context("reindex after protected symbol change")?;
+            }
             Ok(journal_path)
         }
         Err(err) => {
             let rollback = (|| -> Result<()> {
                 for &idx in applied.iter().rev() {
                     let planned_file = &planned[idx];
-                    set_file_state(
+                    protected_drift |= set_file_state(
                         root,
                         layout,
                         conn,
                         &planned_file.rel,
                         planned_file.before.as_deref(),
                     )?;
+                }
+                if protected_drift {
+                    index_workspace_locked(root, layout)
+                        .context("reindex after rolled-back protected symbol change")?;
                 }
                 Ok(())
             })();
@@ -840,29 +925,37 @@ fn commit_planned_apply(
 /// Drive `rel` to a target state: `Some(content)` writes the real file and
 /// reindexes its mirror/map/db; `None` deletes the real file plus its mirror,
 /// map, and db row. This is the single primitive shared by apply, rollback,
-/// and recover so every path is create/delete/modify aware.
+/// and recover so every path is create/delete/modify aware. The caller must
+/// hold the workspace lock. Returns whether the repo-wide protected symbol
+/// set changed (the caller then owes a full reindex).
 fn set_file_state(
     root: &Path,
     layout: &Layout,
     conn: &rusqlite::Connection,
     rel: &Path,
     target: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     let real_path = root.join(rel);
     match target {
         Some(content) => {
             atomic_write(&real_path, content)
                 .with_context(|| format!("write {}", real_path.display()))?;
-            index_single_file(root, rel).with_context(|| format!("reindex {}", rel.display()))?;
+            let (_, _, protected_changed) = index_single_file_locked(root, layout, rel, true)
+                .with_context(|| format!("reindex {}", rel.display()))?;
+            Ok(protected_changed)
         }
         None => {
+            let rel_string = normalize_rel_path(rel);
+            let had_protected = db::all_index_states(conn)?
+                .iter()
+                .any(|state| state.rel_path == rel_string && !state.protected().is_empty());
             remove_file_if_exists(&real_path)?;
             remove_file_if_exists(&layout.mirror_dir.join(rel))?;
             remove_file_if_exists(&layout.map_path(rel))?;
-            db::remove_file(conn, &normalize_rel_path(rel))?;
+            db::remove_file(conn, &rel_string)?;
+            Ok(had_protected)
         }
     }
-    Ok(())
 }
 
 fn remove_file_if_exists(path: &Path) -> Result<()> {
@@ -899,35 +992,6 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     write_result
 }
 
-struct ApplyLock {
-    path: PathBuf,
-}
-
-impl ApplyLock {
-    fn acquire(path: PathBuf) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "acquire apply lock {}; another code-sanity apply may be running",
-                    path.display()
-                )
-            })?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for ApplyLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 fn write_conflict_and_bail<T>(
     layout: &Layout,
     conn: &rusqlite::Connection,
@@ -959,10 +1023,10 @@ fn write_conflict_and_bail<T>(
         "conflict",
         &entry.created_at,
     )?;
-    bail!(
-        "{error}; conflict journal written to {}",
-        journal_path.display()
-    )
+    Err(anyhow::Error::new(ConflictError {
+        message: error,
+        journal_path,
+    }))
 }
 
 fn parse_unified_patch(input: &str) -> Result<UnifiedPatch> {
@@ -1174,16 +1238,140 @@ struct AliasRange {
     original_text: String,
 }
 
+/// Reverse alias table for new (Add-line) text: normalized alias text mapped
+/// to the real original it stands for. Built from this file's span map plus
+/// the global alias registry. An alias observed with two different originals
+/// is ambiguous; using it in new text is a conflict.
+struct ReverseAliases {
+    /// Term list shaped for `hits_in_run` (replacement = representative
+    /// original text).
+    terms: Vec<Term>,
+    /// Normalized originals per entry, aligned with `terms`; len > 1 means
+    /// ambiguous.
+    originals: Vec<BTreeSet<String>>,
+}
+
+fn reverse_alias_table(span_map: &SpanMap, config: &Config) -> ReverseAliases {
+    let mut by_alias: BTreeMap<String, (String, String, BTreeSet<String>)> = BTreeMap::new();
+    let mut add = |alias: &str, original: &str| {
+        let key = normalize_term(alias);
+        if key.is_empty() || key == normalize_term(original) {
+            return;
+        }
+        let entry = by_alias
+            .entry(key)
+            .or_insert_with(|| (alias.to_string(), original.to_string(), BTreeSet::new()));
+        entry.2.insert(normalize_term(original));
+    };
+    for replacement in &span_map.replacements {
+        add(&replacement.sanitized_text, &replacement.original_text);
+    }
+    for (term, alias) in &config.sanitizer.alias_registry {
+        add(alias, term);
+    }
+
+    let mut terms = Vec::with_capacity(by_alias.len());
+    let mut originals = Vec::with_capacity(by_alias.len());
+    for (normalized, (raw_alias, original, normalized_originals)) in by_alias {
+        terms.push(Term {
+            raw: raw_alias,
+            normalized,
+            replacement: original,
+            policy_source: "reverse-alias",
+        });
+        originals.push(normalized_originals);
+    }
+    ReverseAliases { terms, originals }
+}
+
+/// Reverse-map aliases inside one line of newly added text. Every word run is
+/// scanned with the same primitive the sanitizer uses; a reversal is kept only
+/// if sanitizing the reversed run reproduces the run the agent wrote (the
+/// run-level roundtrip filter), so an innocent identifier that merely contains
+/// an alias-looking substring is left alone instead of being corrupted.
+fn reverse_map_new_text(
+    text: &str,
+    reverse: &ReverseAliases,
+    terms: &[Term],
+    protected: &BTreeSet<String>,
+) -> Result<String> {
+    if reverse.terms.is_empty() {
+        return Ok(text.to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut hits = Vec::new();
+    for (run_start, run_end) in word_runs(text) {
+        out.push_str(&text[cursor..run_start]);
+        cursor = run_end;
+        let run = &text[run_start..run_end];
+        if protected.contains(run) {
+            out.push_str(run);
+            continue;
+        }
+        hits.clear();
+        hits_in_run(run, 0, &reverse.terms, &mut hits);
+        hits.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| (b.end - b.start).cmp(&(a.end - a.start)))
+        });
+        let mut reversed = String::with_capacity(run.len());
+        let mut run_cursor = 0usize;
+        for hit in &hits {
+            if hit.start < run_cursor {
+                continue;
+            }
+            if reverse.originals[hit.term_index].len() > 1 {
+                bail!(
+                    "alias {:?} in added text is ambiguous (multiple originals); \
+                     rewrite the line without it or resolve the alias registry",
+                    reverse.terms[hit.term_index].raw
+                );
+            }
+            reversed.push_str(&run[run_cursor..hit.start]);
+            reversed.push_str(&adapt_replacement(
+                &run[hit.start..hit.end],
+                &reverse.terms[hit.term_index].replacement,
+            ));
+            run_cursor = hit.end;
+        }
+        reversed.push_str(&run[run_cursor..]);
+
+        if reversed != run && sanitize_run_text(&reversed, terms, protected) == run {
+            out.push_str(&reversed);
+        } else {
+            out.push_str(run);
+        }
+    }
+    out.push_str(&text[cursor..]);
+    Ok(out)
+}
+
 fn translate_file_patch(
     file_patch: &FilePatch,
     span_map: &SpanMap,
     sanitized_content: &str,
+    config: &Config,
+    protected: &BTreeSet<String>,
 ) -> Result<FilePatch> {
     let starts = line_starts(sanitized_content);
+    let reverse = reverse_alias_table(span_map, config);
+    let terms = term_table(config);
     let hunks = file_patch
         .hunks
         .iter()
-        .map(|hunk| translate_hunk(hunk, span_map, sanitized_content, &starts))
+        .map(|hunk| {
+            translate_hunk(
+                hunk,
+                span_map,
+                sanitized_content,
+                &starts,
+                &reverse,
+                &terms,
+                protected,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(FilePatch {
         old_path: file_patch.old_path.clone(),
@@ -1192,11 +1380,15 @@ fn translate_file_patch(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_hunk(
     hunk: &Hunk,
     span_map: &SpanMap,
     sanitized_content: &str,
     line_starts: &[usize],
+    reverse: &ReverseAliases,
+    terms: &[Term],
+    protected: &BTreeSet<String>,
 ) -> Result<Hunk> {
     let old_region_start = byte_for_line(line_starts, sanitized_content.len(), hunk.old_start);
     let old_region_end = byte_after_lines(
@@ -1229,6 +1421,10 @@ fn translate_hunk(
             }
             HunkLine::Add(text) => {
                 let translated = translate_known_alias_ranges(text, new_cursor, &new_alias_ranges)?;
+                // Newly added text may use aliases the agent saw in the mirror
+                // (whole words or inside identifiers); map them back to the
+                // real names so the real file stays semantically coherent.
+                let translated = reverse_map_new_text(&translated, reverse, terms, protected)?;
                 new_cursor += text.len() + 1;
                 lines.push(HunkLine::Add(translated));
             }

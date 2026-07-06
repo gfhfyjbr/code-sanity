@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod index;
 pub mod journal;
+pub mod lock;
 pub mod map;
 pub mod mcp;
 pub mod patch;
@@ -19,4 +20,4 @@ pub use patch::{
     recover_workspace, rename_alias, write_sanitized_content,
 };
 pub use search::{SearchMatch, read_sanitized_file, search_mirror};
-pub use verify::{VerifyReport, verify_workspace};
+pub use verify::{VerifyFailed, VerifyReport, verify_workspace};

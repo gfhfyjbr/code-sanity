@@ -50,12 +50,37 @@ pub fn new_journal_id() -> String {
     Utc::now().format("%Y-%m-%dT%H-%M-%S%.9fZ").to_string()
 }
 
+/// Durably persist a journal entry: temp file + fsync + rename + directory
+/// fsync. An `applying` entry is the crash-recovery record, so it must be on
+/// disk for real before any real file is touched.
 pub fn write_journal(layout: &Layout, entry: &JournalEntry) -> Result<PathBuf> {
+    use std::io::Write as _;
     fs::create_dir_all(&layout.journal_dir)
         .with_context(|| format!("create {}", layout.journal_dir.display()))?;
     let path = layout.journal_dir.join(format!("{}.patch.json", entry.id));
     let raw = serde_json::to_string_pretty(entry).context("serialize journal entry")?;
-    fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
+
+    let tmp = layout
+        .journal_dir
+        .join(format!(".{}.patch.json.tmp", entry.id));
+    let result = (|| -> Result<()> {
+        let mut file =
+            fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(raw.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("rename into {}", path.display()))?;
+        fs::File::open(&layout.journal_dir)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("fsync {}", layout.journal_dir.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result?;
     Ok(path)
 }
 

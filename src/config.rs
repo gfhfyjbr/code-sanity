@@ -213,6 +213,17 @@ impl Config {
     }
 }
 
+/// A per-workspace random salt so derived aliases are not guessable or
+/// comparable across repositories.
+pub fn random_salt() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let seed = format!("code-sanity-salt:{nanos}:{}", std::process::id());
+    crate::map::sha256_hex(seed.as_bytes())[..16].to_string()
+}
+
 pub fn rel_path(root: &Path, path: &Path) -> Result<PathBuf> {
     path.strip_prefix(root)
         .with_context(|| format!("{} is not under {}", path.display(), root.display()))

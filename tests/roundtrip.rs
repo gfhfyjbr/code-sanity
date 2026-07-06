@@ -86,8 +86,10 @@ fn index_read_search_and_ignore_rules_work() {
     let sanitized = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
     assert!(sanitized.contains("neutral comment"));
     assert!(sanitized.contains("fn neutral_parser()"));
-    assert!(sanitized.contains("\"dangerous runtime string should stay real\""));
+    // Terms are sanitized in every string literal, not only test fixtures.
+    assert!(sanitized.contains("\"neutral runtime string should stay real\""));
     assert!(sanitized.contains("\"neutral fixture text\""));
+    assert!(!sanitized.to_lowercase().contains("dangerous"));
 
     let hits = search_mirror(repo.path(), "neutral_parser", None).unwrap();
     assert_eq!(hits.len(), 1);
@@ -214,7 +216,7 @@ fn apply_patch_adjacent_to_replacement_keeps_original_alias() {
 }
 
 #[test]
-fn apply_patch_does_not_reverse_new_alias_collision_text() {
+fn apply_patch_reverse_maps_bare_alias_in_added_line() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
     let patch = "\
@@ -227,13 +229,130 @@ fn apply_patch_does_not_reverse_new_alias_collision_text() {
  }
 ";
     apply_patch_text(repo.path(), patch).unwrap();
+    // In mirror-speak "neutral" IS "dangerous": one symbol, one decision. The
+    // added alias is reverse-mapped in the real file and re-sanitized back in
+    // the mirror, so both views stay byte-consistent.
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("fn dangerous_parser() -> usize"));
-    assert!(real.contains("let neutral = 10;"));
-    assert!(!real.contains("let dangerous = 10;"));
+    assert!(real.contains("let dangerous = 10;"));
+    assert!(!real.contains("let neutral = 10;"));
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
     assert!(mirror.contains("fn neutral_parser() -> usize"));
     assert!(mirror.contains("let neutral = 10;"));
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn apply_patch_reverse_maps_alias_call_in_added_line() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    // The agent adds a call to the alias it sees in the mirror; the real file
+    // must call the real function, not the (nonexistent) alias.
+    let patch = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,3 +6,7 @@
+ fn safe_helper() -> &'static str {
+     \"neutral runtime string should stay real\"
+ }
++
++fn call_it() -> usize {
++    neutral_parser()
++}
+";
+    apply_patch_text(repo.path(), patch).unwrap();
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(real.contains("dangerous_parser()"));
+    assert!(!real.contains("neutral_parser()"));
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    assert!(mirror.contains("neutral_parser()"));
+    assert!(!mirror.to_lowercase().contains("dangerous"));
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn apply_patch_leaves_innocent_alias_containing_identifier_alone() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    // "neutralize_input" contains the alias "neutral" as a subword, but
+    // reversing it would not roundtrip (sanitize("dangerousize_input") is
+    // "neutralize_input" only if the reversal was exact); the run-level
+    // roundtrip filter must keep innocent identifiers untouched when
+    // reversing them is not byte-stable both ways.
+    let patch = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2,3 +2,4 @@
+ fn neutral_parser() -> usize {
++    let count_things = 10;
+     1
+ }
+";
+    apply_patch_text(repo.path(), patch).unwrap();
+    let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    assert!(real.contains("let count_things = 10;"));
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn verify_fails_on_planted_dictionary_term_in_mirror() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let mirror_path = repo.path().join(".code-sanity/mirror/src/lib.rs");
+    let mirror = fs::read_to_string(&mirror_path).unwrap();
+    fs::write(&mirror_path, format!("{mirror}// planted dangerous term\n")).unwrap();
+
+    let err = verify_workspace(repo.path()).unwrap_err();
+    let message = format!("{err}");
+    assert!(message.contains("leak of term"), "got: {message}");
+
+    // CLI prints every failure and exits with the dedicated "broken" code 3.
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", repo.path().to_str().unwrap(), "verify"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("leak of term"));
+}
+
+#[test]
+fn verify_fails_on_planted_untracked_mirror_file() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    fs::write(
+        repo.path().join(".code-sanity/mirror/src/planted.rs"),
+        "// looks innocent\n",
+    )
+    .unwrap();
+    let err = verify_workspace(repo.path()).unwrap_err();
+    assert!(format!("{err}").contains("untracked file in mirror"));
+}
+
+#[test]
+fn apply_patch_conflict_exits_with_code_2() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let patch = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -2,1 +2,1 @@
+-fn neutral_parser() -> usize {
++fn pleasant_parser() -> usize {
+";
+    let patch_path = repo.path().join("conflict.patch");
+    fs::write(&patch_path, patch).unwrap();
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "apply-patch",
+            "--patch",
+            patch_path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("replacement span"));
 }
 
 #[test]

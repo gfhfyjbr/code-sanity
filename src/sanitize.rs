@@ -1,136 +1,340 @@
+//! Deterministic lexical sanitizer.
+//!
+//! One matching primitive is shared by the sanitizer and the verify leak
+//! backstop: every dictionary / denylist / alias-registry term is matched
+//! case-insensitively and underscore-insensitively inside word runs
+//! (`[A-Za-z0-9_]+`), in comments, string literals, and identifiers alike.
+//! `AcmeClient` therefore also catches `ACME_CLIENT` and `acmeClientFactory`.
+//!
+//! The only sanctioned residues of a term in the mirror are word runs in the
+//! repo-wide protected identifier set (public declarations and import-position
+//! names, collected from the real files). That set is name-based: one symbol
+//! gets one decision across the whole mirror, and `verify` can independently
+//! recompute it to tell a sanctioned residue from a leak.
+
 use crate::config::Config;
 use crate::map::{PendingReplacement, RenderedSanitization, render_with_map, sha256_hex};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use chrono::Utc;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::path::Path;
 
-pub trait SanitizerProvider {
-    fn sanitize(
-        &self,
-        rel_path: &Path,
-        content: &str,
-        config: &Config,
-    ) -> Result<RenderedSanitization>;
+/// Bump when matching/rendering semantics change. Part of the logic
+/// fingerprint, so an upgrade re-renders every mirror file.
+pub const SANITIZER_BEHAVIOR_VERSION: u32 = 2;
+
+/// One term the sanitizer must remove, with its normalized matching form.
+#[derive(Debug, Clone)]
+pub struct Term {
+    /// Original configured spelling, for reports.
+    pub raw: String,
+    /// ASCII-lowercased with `_`/`-` removed; the matching form.
+    pub normalized: String,
+    pub replacement: String,
+    pub policy_source: &'static str,
 }
 
-#[derive(Debug, Default)]
-pub struct StubSanitizerProvider;
-
-#[derive(Debug, Default)]
-pub struct LlmSanitizerProviderStub;
-
-impl SanitizerProvider for StubSanitizerProvider {
-    fn sanitize(
-        &self,
-        rel_path: &Path,
-        content: &str,
-        config: &Config,
-    ) -> Result<RenderedSanitization> {
-        let language = detect_language(rel_path, content);
-        let mut candidates = Vec::new();
-        let string_ranges = string_ranges(&language, content);
-        let comment_ranges = comment_ranges(&language, content, &string_ranges);
-        let mut blocked_ranges = comment_ranges.clone();
-        blocked_ranges.extend(string_ranges.clone());
-
-        for range in &comment_ranges {
-            collect_dictionary_replacements(
-                rel_path,
-                content,
-                range.start,
-                range.end,
-                "comment",
-                config,
-                &mut candidates,
-            );
-            collect_registry_replacements(
-                rel_path,
-                content,
-                range.start,
-                range.end,
-                "comment",
-                config,
-                &mut candidates,
-            );
+/// Build the full term table from config: alias registry, dictionary, and
+/// denylist (denylist terms get a deterministic salted alias so they are
+/// removed even before a human approves a nicer name). Allowlisted terms are
+/// excluded.
+pub fn term_table(config: &Config) -> Vec<Term> {
+    let allow: BTreeSet<String> = config
+        .sanitizer
+        .allowlist
+        .iter()
+        .map(|item| normalize_term(item))
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut terms = Vec::new();
+    let mut push = |raw: &str, replacement: String, policy_source: &'static str| {
+        let normalized = normalize_term(raw);
+        if normalized.is_empty() || allow.contains(&normalized) || !seen.insert(normalized.clone())
+        {
+            return;
         }
+        terms.push(Term {
+            raw: raw.to_string(),
+            normalized,
+            replacement,
+            policy_source,
+        });
+    };
 
-        for range in &string_ranges {
-            if is_fixture_or_test(rel_path) || is_in_test_context(content, range.start) {
-                collect_dictionary_replacements(
-                    rel_path,
-                    content,
-                    range.start,
-                    range.end,
-                    "string_literal",
-                    config,
-                    &mut candidates,
-                );
-                collect_registry_replacements(
-                    rel_path,
-                    content,
-                    range.start,
-                    range.end,
-                    "string_literal",
-                    config,
-                    &mut candidates,
-                );
+    for (term, alias) in &config.sanitizer.alias_registry {
+        push(term, alias.clone(), "alias-registry");
+    }
+    for (term, replacement) in &config.sanitizer.dictionary {
+        push(term, replacement.clone(), "static-dictionary");
+    }
+    for term in &config.sanitizer.denylist {
+        push(term, derive_alias(&config.salt, term), "denylist-auto");
+    }
+    terms
+}
+
+pub(crate) fn normalize_term(term: &str) -> String {
+    term.chars()
+        .filter(|ch| *ch != '_' && *ch != '-')
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+/// Deterministic alias for a term with no human-chosen mapping yet.
+pub fn derive_alias(salt: &str, original: &str) -> String {
+    format!("sym_{}", &sha256_hex(format!("{salt}:{original}").as_bytes())[..8])
+}
+
+/// A term occurrence inside a word run.
+#[derive(Debug, Clone)]
+pub struct TermHit {
+    pub start: usize,
+    pub end: usize,
+    pub term_index: usize,
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+/// Byte ranges of maximal `[A-Za-z0-9_]+` runs. Word bytes are ASCII, so run
+/// boundaries always sit on UTF-8 character boundaries.
+pub fn word_runs(content: &str) -> Vec<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut runs = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if is_word_byte(bytes[cursor]) {
+            let start = cursor;
+            while cursor < bytes.len() && is_word_byte(bytes[cursor]) {
+                cursor += 1;
+            }
+            runs.push((start, cursor));
+        } else {
+            cursor += 1;
+        }
+    }
+    runs
+}
+
+/// Find every term occurrence in one word run, case- and underscore-
+/// insensitively. Hit offsets are absolute (based on `run_start`).
+pub fn hits_in_run(run: &str, run_start: usize, terms: &[Term], out: &mut Vec<TermHit>) {
+    let mut normalized = String::with_capacity(run.len());
+    let mut offsets = Vec::with_capacity(run.len());
+    for (idx, byte) in run.bytes().enumerate() {
+        if byte == b'_' {
+            continue;
+        }
+        normalized.push(byte.to_ascii_lowercase() as char);
+        offsets.push(idx);
+    }
+    for (term_index, term) in terms.iter().enumerate() {
+        let needle = term.normalized.as_str();
+        if needle.is_empty() || needle.len() > normalized.len() {
+            continue;
+        }
+        let mut from = 0usize;
+        while let Some(found) = normalized[from..].find(needle) {
+            let found = from + found;
+            let start = offsets[found];
+            let end = offsets[found + needle.len() - 1] + 1;
+            out.push(TermHit {
+                start: run_start + start,
+                end: run_start + end,
+                term_index,
+            });
+            from = found + needle.len();
+        }
+    }
+}
+
+/// Sanitize one word run exactly as `sanitize_content` would (same hit
+/// selection order and case adaptation), returning the replaced text. The
+/// patch bridge uses this to roundtrip-check reverse-mapped identifiers in
+/// newly added lines.
+pub fn sanitize_run_text(run: &str, terms: &[Term], protected: &BTreeSet<String>) -> String {
+    if is_keyword(run) || run.starts_with("__") || protected.contains(run) {
+        return run.to_string();
+    }
+    let mut hits = Vec::new();
+    hits_in_run(run, 0, terms, &mut hits);
+    hits.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| (b.end - b.start).cmp(&(a.end - a.start)))
+    });
+    let mut out = String::with_capacity(run.len());
+    let mut cursor = 0usize;
+    for hit in &hits {
+        if hit.start < cursor {
+            continue;
+        }
+        out.push_str(&run[cursor..hit.start]);
+        out.push_str(&adapt_replacement(
+            &run[hit.start..hit.end],
+            &terms[hit.term_index].replacement,
+        ));
+        cursor = hit.end;
+    }
+    out.push_str(&run[cursor..]);
+    out
+}
+
+/// Collect the identifiers this file protects from sanitization: public
+/// declarations, import-position names, and dunder names. Name-based on
+/// purpose: protecting the name everywhere is the only way "one symbol, one
+/// decision" and an independent verify backstop can both hold.
+pub fn collect_protected_identifiers(content: &str) -> BTreeSet<String> {
+    let mut protected = BTreeSet::new();
+
+    // Line rule: a line led by a declaration/import marker keeps every word
+    // run before any trailing comment. Covers `use a::b::c::d;`, `import x`,
+    // `pub fn name(args)` signatures, `export const x`.
+    let mut line_start = 0usize;
+    for line in content.split_inclusive('\n') {
+        let code_end = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
+        let code = &line[..code_end];
+        let runs = word_runs(code);
+        let lead: Vec<&str> = runs
+            .iter()
+            .take(2)
+            .map(|(start, end)| &code[*start..*end])
+            .collect();
+        let marker = |token: &str| {
+            matches!(
+                token,
+                "use" | "import" | "from" | "mod" | "package" | "require" | "pub" | "export"
+            )
+        };
+        if lead.iter().any(|token| marker(token)) {
+            for (start, end) in &runs {
+                let run = &code[*start..*end];
+                if !is_keyword(run) {
+                    protected.insert(run.to_string());
+                }
             }
         }
-
-        collect_identifier_replacements(
-            rel_path,
-            content,
-            config,
-            &blocked_ranges,
-            &mut candidates,
-        );
-
-        let replacements = select_non_overlapping(candidates);
-        render_with_map(
-            &crate::config::normalize_rel_path(rel_path),
-            content,
-            &language,
-            replacements,
-            Utc::now().to_rfc3339(),
-        )
+        line_start += line.len();
     }
+    let _ = line_start;
+
+    // Token rule: an identifier within four tokens after a visibility or
+    // import marker is protected (struct fields after `pub`, later path
+    // segments, `extern` items).
+    for (start, end) in word_runs(content) {
+        let run = &content[start..end];
+        if is_keyword(run) {
+            continue;
+        }
+        if run.starts_with("__") {
+            protected.insert(run.to_string());
+            continue;
+        }
+        let previous = previous_identifier_tokens(content, start, 4);
+        if previous.iter().any(|token| {
+            matches!(
+                *token,
+                "pub" | "export" | "import" | "from" | "use" | "mod" | "crate" | "extern"
+            )
+        }) {
+            protected.insert(run.to_string());
+        }
+    }
+
+    protected
 }
 
-impl SanitizerProvider for LlmSanitizerProviderStub {
-    fn sanitize(
-        &self,
-        _rel_path: &Path,
-        _content: &str,
-        _config: &Config,
-    ) -> Result<RenderedSanitization> {
-        bail!("LLM sanitizer provider is scaffolded only; use provider.kind = \"stub\"")
-    }
-}
-
+/// A residual term occurrence found by the leak backstop.
 #[derive(Debug, Clone)]
-struct ByteRange {
-    start: usize,
-    end: usize,
+pub struct Leak {
+    pub offset: usize,
+    pub term: String,
+    pub enclosing: String,
+}
+
+/// Scan text with the same primitive the sanitizer uses and report every term
+/// occurrence whose enclosing word run is not a sanctioned residue (protected
+/// identifier, keyword, or dunder). Used by `verify` as an independent
+/// backstop over the mirror and the span-map replacement outputs.
+pub fn find_leaks(content: &str, terms: &[Term], protected: &BTreeSet<String>) -> Vec<Leak> {
+    let mut leaks = Vec::new();
+    let mut hits = Vec::new();
+    for (run_start, run_end) in word_runs(content) {
+        let run = &content[run_start..run_end];
+        if is_keyword(run) || run.starts_with("__") || protected.contains(run) {
+            continue;
+        }
+        hits.clear();
+        hits_in_run(run, run_start, terms, &mut hits);
+        for hit in &hits {
+            leaks.push(Leak {
+                offset: hit.start,
+                term: terms[hit.term_index].raw.clone(),
+                enclosing: run.to_string(),
+            });
+        }
+    }
+    leaks
 }
 
 pub fn sanitize_content(
     rel_path: &Path,
     content: &str,
     config: &Config,
+    protected: &BTreeSet<String>,
 ) -> Result<RenderedSanitization> {
-    match &config.sanitizer.provider {
-        // The deterministic engine (dictionary + alias registry) always does the
-        // actual sanitization at index/verify time. The External model provider
-        // only produces proposals via `propose-sanitize`; approved proposals land
-        // in the alias registry, so the model never writes the mirror directly.
-        crate::config::ProviderConfig::Stub | crate::config::ProviderConfig::External { .. } => {
-            StubSanitizerProvider.sanitize(rel_path, content, config)
+    let language = detect_language(rel_path, content);
+    let string_ranges = string_ranges(&language, content);
+    let comment_ranges = comment_ranges(&language, content, &string_ranges);
+    let terms = term_table(config);
+
+    let mut candidates = Vec::new();
+    let mut hits = Vec::new();
+    for (run_start, run_end) in word_runs(content) {
+        let run = &content[run_start..run_end];
+        if is_keyword(run) || run.starts_with("__") || protected.contains(run) {
+            continue;
         }
-        crate::config::ProviderConfig::LlmStub { .. } => {
-            LlmSanitizerProviderStub.sanitize(rel_path, content, config)
+        hits.clear();
+        hits_in_run(run, run_start, &terms, &mut hits);
+        for hit in &hits {
+            let term = &terms[hit.term_index];
+            let slice = &content[hit.start..hit.end];
+            let category = if range_contains(&comment_ranges, hit.start) {
+                "comment"
+            } else if range_contains(&string_ranges, hit.start) {
+                "string_literal"
+            } else {
+                "identifier"
+            };
+            let (policy_source, confidence) =
+                if term.policy_source == "static-dictionary" && category == "identifier" {
+                    ("static-dictionary-private-identifier", 0.85)
+                } else {
+                    (term.policy_source, 1.0)
+                };
+            candidates.push(PendingReplacement {
+                category: category.to_string(),
+                sanitized_text: adapt_replacement(slice, &term.replacement),
+                stable_key: stable_key(rel_path, slice, category, hit.start),
+                original_text: slice.to_string(),
+                confidence,
+                policy_source: policy_source.to_string(),
+                original_start: hit.start,
+                original_end: hit.end,
+            });
         }
     }
+
+    let replacements = select_non_overlapping(candidates);
+    render_with_map(
+        &crate::config::normalize_rel_path(rel_path),
+        content,
+        &language,
+        replacements,
+        Utc::now().to_rfc3339(),
+    )
 }
 
 pub fn detect_language(rel_path: &Path, _content: &str) -> String {
@@ -146,197 +350,6 @@ pub fn detect_language(rel_path: &Path, _content: &str) -> String {
         _ => "text",
     }
     .to_string()
-}
-
-fn collect_dictionary_replacements(
-    rel_path: &Path,
-    content: &str,
-    start: usize,
-    end: usize,
-    category: &str,
-    config: &Config,
-    out: &mut Vec<PendingReplacement>,
-) {
-    let slice = &content[start..end];
-    let allowlist = config
-        .sanitizer
-        .allowlist
-        .iter()
-        .map(|item| item.to_lowercase())
-        .collect::<HashSet<_>>();
-
-    for (term, replacement) in &config.sanitizer.dictionary {
-        let term_lower = term.to_ascii_lowercase();
-        if allowlist.contains(&term_lower) {
-            continue;
-        }
-        let mut search_at = 0usize;
-        while let Some(local_start) = find_ascii_case_insensitive(slice, &term_lower, search_at) {
-            let local_end = local_start + term_lower.len();
-            if is_start_boundary(slice, local_start) && is_end_boundary(slice, local_end) {
-                let original_text = slice[local_start..local_end].to_string();
-                out.push(PendingReplacement {
-                    category: category.to_string(),
-                    sanitized_text: match_case(&original_text, replacement),
-                    stable_key: stable_key(rel_path, &original_text, category, start + local_start),
-                    original_text,
-                    confidence: 1.0,
-                    policy_source: "static-dictionary".to_string(),
-                    original_start: start + local_start,
-                    original_end: start + local_end,
-                });
-            }
-            search_at = local_end;
-        }
-    }
-}
-
-/// Apply deterministic alias-registry entries (exact, case-sensitive whole-word
-/// matches) within a range. Registry entries are human-approved model proposals;
-/// applying them here keeps the model out of the write path while making the
-/// substitution deterministic at index time.
-fn collect_registry_replacements(
-    rel_path: &Path,
-    content: &str,
-    start: usize,
-    end: usize,
-    category: &str,
-    config: &Config,
-    out: &mut Vec<PendingReplacement>,
-) {
-    let slice = &content[start..end];
-    for (term, alias) in &config.sanitizer.alias_registry {
-        if term.is_empty()
-            || config
-                .sanitizer
-                .allowlist
-                .iter()
-                .any(|item| item.eq_ignore_ascii_case(term))
-        {
-            continue;
-        }
-        let mut search_at = 0usize;
-        while let Some(found) = slice[search_at..].find(term.as_str()) {
-            let local_start = search_at + found;
-            let local_end = local_start + term.len();
-            if is_start_boundary(slice, local_start) && is_end_boundary(slice, local_end) {
-                out.push(PendingReplacement {
-                    category: category.to_string(),
-                    original_text: term.clone(),
-                    sanitized_text: alias.clone(),
-                    stable_key: stable_key(rel_path, term, category, start + local_start),
-                    confidence: 1.0,
-                    policy_source: "alias-registry".to_string(),
-                    original_start: start + local_start,
-                    original_end: start + local_end,
-                });
-            }
-            search_at = local_end;
-        }
-    }
-}
-
-fn collect_identifier_replacements(
-    rel_path: &Path,
-    content: &str,
-    config: &Config,
-    blocked_ranges: &[ByteRange],
-    out: &mut Vec<PendingReplacement>,
-) {
-    let protected_identifiers = public_declaration_identifiers(content);
-    let bytes = content.as_bytes();
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        let Some((start, ch)) = next_char_at(content, cursor) else {
-            break;
-        };
-        if !is_ident_start(ch) {
-            cursor = start + ch.len_utf8();
-            continue;
-        }
-
-        let mut end = start + ch.len_utf8();
-        while end < bytes.len() {
-            let Some((idx, next)) = next_char_at(content, end) else {
-                break;
-            };
-            if !is_ident_continue(next) {
-                end = idx;
-                break;
-            }
-            end = idx + next.len_utf8();
-        }
-
-        cursor = end;
-        if range_overlaps(blocked_ranges, start, end) {
-            continue;
-        }
-
-        let ident = &content[start..end];
-        if protected_identifiers.contains(ident) {
-            continue;
-        }
-        if !should_sanitize_identifier(content, start, ident) {
-            continue;
-        }
-
-        // A model-approved alias registered for the whole identifier wins over
-        // dictionary substring matching and is applied verbatim.
-        if let Some(alias) = config.sanitizer.alias_registry.get(ident)
-            && !config
-                .sanitizer
-                .allowlist
-                .iter()
-                .any(|item| item.eq_ignore_ascii_case(ident))
-        {
-            out.push(PendingReplacement {
-                category: "identifier".to_string(),
-                original_text: ident.to_string(),
-                sanitized_text: alias.clone(),
-                stable_key: stable_key(rel_path, ident, "identifier", start),
-                confidence: 1.0,
-                policy_source: "alias-registry".to_string(),
-                original_start: start,
-                original_end: end,
-            });
-            continue;
-        }
-
-        let lower_ident = ident.to_lowercase();
-        for (term, replacement) in &config.sanitizer.dictionary {
-            let term_lower = term.to_lowercase();
-            if config
-                .sanitizer
-                .allowlist
-                .iter()
-                .any(|item| item.eq_ignore_ascii_case(&term_lower))
-            {
-                continue;
-            }
-            let mut search_at = 0usize;
-            while let Some(local_start) = lower_ident[search_at..].find(&term_lower) {
-                let local_start = search_at + local_start;
-                let local_end = local_start + term_lower.len();
-                let original_text = ident[local_start..local_end].to_string();
-                out.push(PendingReplacement {
-                    category: "identifier".to_string(),
-                    sanitized_text: match_identifier_case(&original_text, replacement),
-                    stable_key: stable_key(
-                        rel_path,
-                        &original_text,
-                        "identifier",
-                        start + local_start,
-                    ),
-                    original_text,
-                    confidence: 0.85,
-                    policy_source: "static-dictionary-private-identifier".to_string(),
-                    original_start: start + local_start,
-                    original_end: start + local_end,
-                });
-                search_at = local_end;
-            }
-        }
-    }
 }
 
 fn select_non_overlapping(mut candidates: Vec<PendingReplacement>) -> Vec<PendingReplacement> {
@@ -356,92 +369,6 @@ fn select_non_overlapping(mut candidates: Vec<PendingReplacement>) -> Vec<Pendin
         }
     }
     selected
-}
-
-fn should_sanitize_identifier(content: &str, start: usize, ident: &str) -> bool {
-    if is_keyword(ident) || ident.starts_with("__") {
-        return false;
-    }
-    let prefix = &content[..start];
-    let previous = prefix
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .rev()
-        .filter(|token| !token.is_empty())
-        .take(3)
-        .collect::<Vec<_>>();
-
-    if previous.iter().any(|token| {
-        matches!(
-            *token,
-            "pub" | "export" | "import" | "from" | "use" | "mod" | "crate" | "extern"
-        )
-    }) {
-        return false;
-    }
-
-    true
-}
-
-pub(crate) fn public_declaration_identifiers(content: &str) -> HashSet<String> {
-    let bytes = content.as_bytes();
-    let mut protected = HashSet::new();
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        let Some((start, ch)) = next_char_at(content, cursor) else {
-            break;
-        };
-        if !is_ident_start(ch) {
-            cursor = start + ch.len_utf8();
-            continue;
-        }
-
-        let mut end = start + ch.len_utf8();
-        while end < bytes.len() {
-            let Some((idx, next)) = next_char_at(content, end) else {
-                break;
-            };
-            if !is_ident_continue(next) {
-                end = idx;
-                break;
-            }
-            end = idx + next.len_utf8();
-        }
-
-        let ident = &content[start..end];
-        if is_public_declaration_identifier(content, start, ident) {
-            protected.insert(ident.to_string());
-        }
-        cursor = end;
-    }
-    protected
-}
-
-fn is_public_declaration_identifier(content: &str, start: usize, ident: &str) -> bool {
-    if is_keyword(ident) {
-        return false;
-    }
-    let previous = previous_identifier_tokens(content, start, 6);
-    let Some(first) = previous.first() else {
-        return false;
-    };
-    let declaration_before_name = matches!(
-        *first,
-        "fn" | "struct"
-            | "enum"
-            | "trait"
-            | "type"
-            | "const"
-            | "static"
-            | "mod"
-            | "function"
-            | "class"
-            | "interface"
-    );
-    declaration_before_name
-        && previous
-            .iter()
-            .skip(1)
-            .any(|token| matches!(*token, "pub" | "export"))
 }
 
 fn previous_identifier_tokens(content: &str, start: usize, limit: usize) -> Vec<&str> {
@@ -552,6 +479,15 @@ fn comment_ranges(language: &str, content: &str, string_ranges: &[ByteRange]) ->
     ranges
 }
 
+#[derive(Debug, Clone)]
+struct ByteRange {
+    start: usize,
+    end: usize,
+}
+
+/// String literal ranges (for categorization only; sanitization no longer
+/// depends on zone detection). `'` is not a string delimiter in Rust or Go —
+/// lifetimes (`&'a str`) and runes would otherwise open phantom strings.
 fn string_ranges(language: &str, content: &str) -> Vec<ByteRange> {
     if matches!(language, "markdown" | "text") {
         return Vec::new();
@@ -562,9 +498,13 @@ fn string_ranges(language: &str, content: &str) -> Vec<ByteRange> {
     let mut cursor = 0usize;
     while cursor < bytes.len() {
         let quote = bytes[cursor];
-        let is_quote = quote == b'"'
-            || quote == b'\''
-            || (matches!(language, "typescript" | "javascript") && quote == b'`');
+        let is_quote = match language {
+            "rust" => quote == b'"',
+            "go" => quote == b'"' || quote == b'`',
+            "typescript" | "javascript" => quote == b'"' || quote == b'\'' || quote == b'`',
+            "json" => quote == b'"',
+            _ => quote == b'"' || quote == b'\'',
+        };
         if !is_quote {
             cursor += 1;
             continue;
@@ -595,6 +535,18 @@ fn string_ranges(language: &str, content: &str) -> Vec<ByteRange> {
                 });
                 break;
             }
+            continue;
+        }
+
+        // Go raw strings have no escapes and may span lines.
+        if language == "go" && quote == b'`' {
+            let content_start = cursor + 1;
+            let end = find_byte(bytes, content_start, b'`').unwrap_or(content.len());
+            ranges.push(ByteRange {
+                start: content_start,
+                end,
+            });
+            cursor = (end + 1).min(content.len());
             continue;
         }
 
@@ -629,34 +581,6 @@ fn string_ranges(language: &str, content: &str) -> Vec<ByteRange> {
     ranges
 }
 
-fn is_fixture_or_test(rel_path: &Path) -> bool {
-    let lowered = rel_path.to_string_lossy().to_lowercase();
-    lowered.contains("fixture")
-        || lowered.contains("/tests/")
-        || lowered.contains("\\tests\\")
-        || lowered.contains("_test.")
-        || lowered.contains(".test.")
-        || lowered.contains(".spec.")
-        || lowered.contains("/examples/")
-}
-
-fn is_in_test_context(content: &str, start: usize) -> bool {
-    let window_start = start.saturating_sub(4096);
-    let before = &content[window_start..start];
-    let marker = before
-        .rfind("#[cfg(test)]")
-        .into_iter()
-        .chain(before.rfind("mod tests"))
-        .max();
-    let Some(marker) = marker else {
-        return false;
-    };
-    let after_marker = &before[marker..];
-    let opens = after_marker.chars().filter(|ch| *ch == '{').count();
-    let closes = after_marker.chars().filter(|ch| *ch == '}').count();
-    opens > closes || after_marker.contains("#[test]")
-}
-
 fn stable_key(rel_path: &Path, original_text: &str, category: &str, offset: usize) -> String {
     sha256_hex(
         format!(
@@ -667,29 +591,33 @@ fn stable_key(rel_path: &Path, original_text: &str, category: &str, offset: usiz
     )
 }
 
-fn match_case(original: &str, replacement: &str) -> String {
-    if original.chars().all(|ch| !ch.is_ascii_lowercase()) {
-        replacement.to_ascii_uppercase()
-    } else if original
+/// Adapt a replacement to the casing of the matched slice: `ACME_CLIENT` gets
+/// an upper-cased alias, `Acme` a capitalized one, `acme` the plain form.
+/// Non-identifier characters in the replacement become `_` so identifiers
+/// stay valid.
+pub fn adapt_replacement(original: &str, replacement: &str) -> String {
+    let base = to_identifier_word(replacement);
+    let has_letters = original.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_lower = original.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_upper = original.chars().any(|ch| ch.is_ascii_uppercase());
+    if has_letters && !has_lower {
+        return base.to_ascii_uppercase();
+    }
+    if has_letters && !has_upper {
+        return base.to_ascii_lowercase();
+    }
+    if original
         .chars()
         .next()
         .is_some_and(|ch| ch.is_ascii_uppercase())
     {
-        let mut chars = replacement.chars();
-        match chars.next() {
+        let mut chars = base.chars();
+        return match chars.next() {
             Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
             None => String::new(),
-        }
-    } else {
-        replacement.to_string()
+        };
     }
-}
-
-fn match_identifier_case(original: &str, replacement: &str) -> String {
-    if original.contains('_') {
-        return replacement.replace('-', "_");
-    }
-    match_case(original, &to_identifier_word(replacement))
+    base
 }
 
 fn to_identifier_word(replacement: &str) -> String {
@@ -705,65 +633,10 @@ fn to_identifier_word(replacement: &str) -> String {
         .collect()
 }
 
-fn is_start_boundary(text: &str, idx: usize) -> bool {
-    let before = text[..idx].chars().next_back();
-    before.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
-}
-
-fn is_end_boundary(text: &str, idx: usize) -> bool {
-    let after = text[idx..].chars().next();
-    after.is_none_or(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
-}
-
-fn is_ident_start(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphabetic()
-}
-
-fn is_ident_continue(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
-}
-
-fn next_char_at(text: &str, start: usize) -> Option<(usize, char)> {
-    text[start..]
-        .char_indices()
-        .next()
-        .map(|(idx, ch)| (start + idx, ch))
-}
-
 fn range_contains(ranges: &[ByteRange], point: usize) -> bool {
     ranges
         .iter()
         .any(|range| point >= range.start && point < range.end)
-}
-
-fn range_overlaps(ranges: &[ByteRange], start: usize, end: usize) -> bool {
-    ranges
-        .iter()
-        .any(|range| start < range.end && end > range.start)
-}
-
-fn find_ascii_case_insensitive(haystack: &str, needle_lower: &str, from: usize) -> Option<usize> {
-    let hay = haystack.as_bytes();
-    let needle = needle_lower.as_bytes();
-    if needle.is_empty()
-        || needle.len() > hay.len()
-        || from > hay.len().saturating_sub(needle.len())
-    {
-        return None;
-    }
-    for idx in from..=hay.len() - needle.len() {
-        if !haystack.is_char_boundary(idx) || !haystack.is_char_boundary(idx + needle.len()) {
-            continue;
-        }
-        if hay[idx..idx + needle.len()]
-            .iter()
-            .map(|byte| byte.to_ascii_lowercase())
-            .eq(needle.iter().copied())
-        {
-            return Some(idx);
-        }
-    }
-    None
 }
 
 fn find_byte(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
@@ -786,26 +659,102 @@ mod tests {
     use crate::config::Config;
     use proptest::prelude::*;
 
+    fn sanitize(rel: &str, content: &str) -> RenderedSanitization {
+        let config = Config::default();
+        sanitize_content(Path::new(rel), content, &config, &BTreeSet::new()).unwrap()
+    }
+
     #[test]
     fn sanitizes_comments_and_private_identifiers() {
-        let config = Config::default();
-        let rendered = sanitize_content(
-            Path::new("src/lib.rs"),
+        let rendered = sanitize(
+            "src/lib.rs",
             "// dangerous comment\nfn dangerous_parser() {}\n",
-            &config,
-        )
-        .unwrap();
+        );
         assert!(rendered.sanitized.contains("neutral comment"));
         assert!(rendered.sanitized.contains("fn neutral_parser()"));
         assert!(!rendered.sanitized.contains("dangerous"));
     }
 
     #[test]
-    fn skips_strings_outside_fixtures() {
-        let config = Config::default();
+    fn sanitizes_all_string_literals() {
+        let rendered = sanitize("src/lib.rs", "let s = \"dangerous\";\n");
+        assert_eq!(rendered.sanitized, "let s = \"neutral\";\n");
+        assert_eq!(rendered.span_map.replacements[0].category, "string_literal");
+    }
+
+    #[test]
+    fn lifetimes_do_not_open_phantom_strings() {
+        let rendered = sanitize(
+            "src/lib.rs",
+            "fn f<'a>(acme_x: &'a str) -> &'a str {\n    acme_x\n}\n",
+        );
+        assert!(rendered.sanitized.contains("client_x"));
+        assert!(!rendered.sanitized.contains("acme_x"));
+    }
+
+    #[test]
+    fn registry_matches_case_and_subword_variants() {
+        let mut config = Config::default();
+        config
+            .sanitizer
+            .alias_registry
+            .insert("AcmeClient".to_string(), "GadgetSvc".to_string());
+        let content =
+            "fn a() { AcmeClient::new(); }\nconst ACME_CLIENT: u8 = 1;\nlet f = acmeClientFactory;\n";
         let rendered =
-            sanitize_content(Path::new("src/lib.rs"), "let s = \"dangerous\";\n", &config).unwrap();
-        assert_eq!(rendered.sanitized, "let s = \"dangerous\";\n");
+            sanitize_content(Path::new("src/lib.rs"), content, &config, &BTreeSet::new()).unwrap();
+        assert!(rendered.sanitized.contains("GadgetSvc::new()"));
+        assert!(rendered.sanitized.contains("const GADGETSVC: u8"));
+        assert!(rendered.sanitized.contains("gadgetSvcFactory") == false);
+        assert!(!rendered.sanitized.to_lowercase().contains("acme"));
+    }
+
+    #[test]
+    fn denylist_terms_get_derived_aliases_everywhere() {
+        let mut config = Config::default();
+        config.sanitizer.denylist = vec!["shadowfax".to_string()];
+        let content = "// shadowfax rollout\nlet shadowfax_kill = 1;\nlet s = \"shadowfax\";\n";
+        let rendered =
+            sanitize_content(Path::new("src/lib.rs"), content, &config, &BTreeSet::new()).unwrap();
+        assert!(!rendered.sanitized.to_lowercase().contains("shadowfax"));
+        assert!(rendered.sanitized.contains("sym_"));
+    }
+
+    #[test]
+    fn protected_identifiers_are_kept_repo_wide() {
+        let config = Config::default();
+        let mut protected = BTreeSet::new();
+        protected.insert("dangerous_parser".to_string());
+        let rendered = sanitize_content(
+            Path::new("src/lib.rs"),
+            "fn call() { dangerous_parser(); }\n",
+            &config,
+            &protected,
+        )
+        .unwrap();
+        assert!(rendered.sanitized.contains("dangerous_parser()"));
+    }
+
+    #[test]
+    fn public_declarations_and_imports_are_collected_as_protected() {
+        let protected = collect_protected_identifiers(
+            "pub fn dangerous_parser() {}\nuse dangerous_lib::helper::thing;\nfn private_one() {}\n",
+        );
+        assert!(protected.contains("dangerous_parser"));
+        assert!(protected.contains("dangerous_lib"));
+        assert!(protected.contains("thing"));
+        assert!(!protected.contains("private_one"));
+    }
+
+    #[test]
+    fn find_leaks_reports_unsanctioned_terms_only() {
+        let config = Config::default();
+        let terms = term_table(&config);
+        let mut protected = BTreeSet::new();
+        protected.insert("dangerous_parser".to_string());
+        let leaks = find_leaks("dangerous_parser and dangerous_thing", &terms, &protected);
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].enclosing, "dangerous_thing");
     }
 
     proptest! {
@@ -813,7 +762,12 @@ mod tests {
         fn rendered_replacements_are_monotonic(prefix in ".*", suffix in ".*") {
             let config = Config::default();
             let input = format!("// {prefix} dangerous {suffix}\n");
-            let rendered = sanitize_content(Path::new("src/lib.rs"), &input, &config).unwrap();
+            let rendered = sanitize_content(
+                Path::new("src/lib.rs"),
+                &input,
+                &config,
+                &BTreeSet::new(),
+            ).unwrap();
             let mut last_original = 0usize;
             let mut last_sanitized = 0usize;
             for span in rendered.span_map.spans {

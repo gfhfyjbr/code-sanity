@@ -12,7 +12,7 @@ use crate::config::{Config, Layout, ProviderConfig};
 use crate::db;
 use crate::index::index_single_file;
 use crate::map::load_span_map;
-use crate::sanitize::public_declaration_identifiers;
+use crate::sanitize::{collect_protected_identifiers, derive_alias};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -251,8 +251,8 @@ pub fn validate_proposal(
         return Err("alias still contains a denylisted term".to_string());
     }
 
-    if public_declaration_identifiers(content).contains(&proposal.original_text) {
-        return Ok("touches a public API name; needs review".to_string());
+    if collect_protected_identifiers(content).contains(&proposal.original_text) {
+        return Ok("touches a protected name (public API or import); needs review".to_string());
     }
     if proposal.confidence < config.sanitizer.confidence_threshold {
         return Ok(format!(
@@ -415,10 +415,6 @@ fn contains_whole_word(content: &str, word: &str) -> bool {
         from = end;
     }
     false
-}
-
-fn derive_alias(salt: &str, original: &str) -> String {
-    format!("sym_{}", short_hash(&format!("{salt}:{original}")))
 }
 
 fn short_hash(input: &str) -> String {
