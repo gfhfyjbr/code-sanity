@@ -1,0 +1,14 @@
+commit 1234
+Index: src/ctx.rs
+===
+--- a/src/ctx.rs	2026-01-01
++++ b/src/ctx.rs	2026-01-02
+@@ -2,3 +2,3 @@ fn context() {
+ one
+-two
++2
+ three
+@@ -10,2 +10,2 @@
+ ten
+-eleven
++11

@@ -1,0 +1,28 @@
+[package]
+name = "code-sanity-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+code-sanity = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "fuzz_parse_patch"
+path = "fuzz_targets/fuzz_parse_patch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_apply_patch"
+path = "fuzz_targets/fuzz_apply_patch.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

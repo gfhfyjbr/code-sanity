@@ -1,0 +1,5 @@
+--- a/src/short.rs
++++ b/src/short.rs
+@@ -1 +1 @@
+-x
++y

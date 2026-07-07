@@ -1,2 +1,4 @@
 /target
 .code-sanity/
+fuzz/target/
+fuzz/artifacts/

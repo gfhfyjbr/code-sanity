@@ -1,0 +1,30 @@
+name: Fuzz
+
+# Wall-clock fuzzing is scheduled, not per-push: every committed corpus seed
+# (including promoted crash artifacts) already replays on stable in cargo test.
+on:
+  schedule:
+    - cron: "14 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: Fuzz the patch parser
+        run: cargo +nightly fuzz run fuzz_parse_patch -- -max_total_time=300 -dict=fuzz/patch.dict
+      - name: Fuzz the pure applier
+        run: cargo +nightly fuzz run fuzz_apply_patch -- -max_total_time=300
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

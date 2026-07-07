@@ -1,0 +1,5 @@
+--- a/src/old.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-fn removed() {}
+-// end

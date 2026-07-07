@@ -33,6 +33,14 @@ predicates = "3"
 proptest = "1"
 tempfile = "3"
 
+[features]
+# Exposes patch::fuzz_api for the fuzz/ crate; never enabled in normal builds.
+fuzzing = []
+
+# Keep the nightly-only fuzz crate out of stable `cargo test` / clippy runs.
+[workspace]
+exclude = ["fuzz"]
+
 [profile.release]
 lto = "thin"
 strip = true

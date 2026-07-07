@@ -1184,10 +1184,16 @@ fn write_conflict_and_bail<T>(
     }))
 }
 
+// Hoisted: parse_unified_patch is called per patch and (via fuzzing) at very
+// high frequency; compiling the regex per call dominates the pure-parse cost.
+static HUNK_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").unwrap()
+});
+
 fn parse_unified_patch(input: &str) -> Result<UnifiedPatch> {
     let mut lines = input.lines().peekable();
     let mut files = Vec::new();
-    let hunk_re = Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").unwrap();
+    let hunk_re = &*HUNK_RE;
 
     while let Some(line) = lines.next() {
         if !line.starts_with("--- ") {
@@ -1251,29 +1257,33 @@ fn parse_unified_patch(input: &str) -> Result<UnifiedPatch> {
                     })?;
                     Ok(())
                 };
-                let Some(prefix) = hunk_line.as_bytes().first().copied() else {
+                // Split off the marker as a CHAR, not a byte: a line starting
+                // with a multi-byte character (agent output, stripped prefix)
+                // must be a parse error, not a slice panic (fuzz finding).
+                let mut chars = hunk_line.chars();
+                let Some(prefix) = chars.next() else {
                     // Some tools strip the trailing space from empty context lines.
                     take(&mut remaining_old)?;
                     take(&mut remaining_new)?;
                     hunk_lines.push(HunkLine::Context(String::new()));
                     continue;
                 };
-                let content = hunk_line[1..].to_string();
+                let content = chars.as_str().to_string();
                 match prefix {
-                    b' ' => {
+                    ' ' => {
                         take(&mut remaining_old)?;
                         take(&mut remaining_new)?;
                         hunk_lines.push(HunkLine::Context(content));
                     }
-                    b'+' => {
+                    '+' => {
                         take(&mut remaining_new)?;
                         hunk_lines.push(HunkLine::Add(content));
                     }
-                    b'-' => {
+                    '-' => {
                         take(&mut remaining_old)?;
                         hunk_lines.push(HunkLine::Remove(content));
                     }
-                    other => bail!("invalid hunk line prefix {}", other as char),
+                    other => bail!("invalid hunk line prefix {other:?}"),
                 }
             }
             // A trailing no-newline marker for the hunk's last line.
@@ -2107,9 +2117,115 @@ fn byte_after_lines(starts: &[usize], len: usize, one_based_line: usize, count: 
     starts.get(start_idx + count).copied().unwrap_or(len)
 }
 
+/// Fuzzing surface (`--features fuzzing`, used by the `fuzz/` crate and the
+/// corpus replay test): the private parser and the pure applier, with the
+/// invariants a fuzzer can falsify asserted inside. Not part of the public
+/// API.
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod fuzz_api {
+    /// Parse arbitrary input; only panics are findings. Accepted output must
+    /// be internally consistent (the counted-hunk contract: the parser
+    /// consumes exactly `old_count` old-side and `new_count` new-side lines)
+    /// and parsing must be deterministic.
+    pub fn parse(input: &str) {
+        let Ok(first) = super::parse_unified_patch(input) else {
+            return;
+        };
+        let second = super::parse_unified_patch(input)
+            .expect("parse is nondeterministic: accepted input rejected on the second run");
+        assert_eq!(
+            format!("{first:?}"),
+            format!("{second:?}"),
+            "parse is nondeterministic"
+        );
+        for file in &first.files {
+            for hunk in &file.hunks {
+                let old_side = hunk
+                    .lines
+                    .iter()
+                    .filter(|line| {
+                        matches!(
+                            line,
+                            super::HunkLine::Context(_) | super::HunkLine::Remove(_)
+                        )
+                    })
+                    .count();
+                let new_side = hunk
+                    .lines
+                    .iter()
+                    .filter(|line| {
+                        matches!(line, super::HunkLine::Context(_) | super::HunkLine::Add(_))
+                    })
+                    .count();
+                assert_eq!(
+                    old_side, hunk.old_count,
+                    "accepted hunk breaks the old-count contract ({})",
+                    file.old_path
+                );
+                assert_eq!(
+                    new_side, hunk.new_count,
+                    "accepted hunk breaks the new-count contract ({})",
+                    file.new_path
+                );
+            }
+        }
+    }
+
+    /// Parse `patch` and run the pure applier over `content` for every file
+    /// patch. Apply errors are expected outcomes; only panics are findings
+    /// (anchor math, CRLF handling, splice offsets).
+    pub fn parse_and_apply(content: &str, patch: &str) {
+        let Ok(parsed) = super::parse_unified_patch(patch) else {
+            return;
+        };
+        for file_patch in &parsed.files {
+            let _ = super::apply_file_patch_to_content(content, file_patch);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzz_corpus_replays_clean() {
+        // Every committed corpus seed (including any future crash artifacts
+        // promoted to seeds) must pass the fuzz invariants on stable, so a
+        // fuzz finding becomes a permanent regression test.
+        let corpus =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/fuzz_parse_patch");
+        let mut seeds = 0;
+        for entry in std::fs::read_dir(&corpus).expect("fuzz corpus directory is missing") {
+            let path = entry.unwrap().path();
+            let input = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+            fuzz_api::parse(&input);
+            fuzz_api::parse_and_apply("fn alpha() -> usize {\n    1\n}\n", &input);
+            seeds += 1;
+        }
+        assert!(seeds >= 8, "corpus seeds missing (found {seeds})");
+    }
+
+    #[test]
+    fn multibyte_hunk_line_prefix_is_an_error_not_a_panic() {
+        // Fuzz finding: `hunk_line[1..]` panicked when a hunk line began with
+        // a multi-byte UTF-8 character (not a valid ' '/'+'/'-' marker).
+        let err = parse_unified_patch(
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n\u{e9}fn x() {}\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid hunk line prefix"),
+            "{err:#}"
+        );
+        // A multi-byte character AFTER the marker is legitimate content.
+        let parsed = parse_unified_patch(
+            "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n-\u{e9}t\u{e9}\n+ete\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.files.len(), 1);
+    }
 
     #[test]
     fn parses_and_applies_patch() {
