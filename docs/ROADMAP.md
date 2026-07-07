@@ -1,12 +1,14 @@
 # Roadmap to production readiness
 
-Status as of 2026-07-07. The correctness core is done: crash-safe journaled
-applies, a single workspace-lock discipline covering every DB/mirror writer
-(including the embedding index), a redacted MCP error path, retrying HTTP
-client with connection reuse and API-key preflight, provider presets
-(`openrouter` / `kou-router` / generic `llm`), and a fully offline test suite
-(130 tests, clippy-clean). What remains is release engineering, real-world
-shakedown, and an on-demand performance backlog.
+Status as of 2026-07-07 (end of day): **P0 #1–6 and all of P1 are done.**
+v0.2.0 is released with binaries for linux/macos x86_64+aarch64; CI is green
+on both platforms with a cargo-deny gate; the patch parser is fuzzed (first
+run found and fixed a UTF-8 slice panic); ureq is on v3; the schema refuses
+newer-versioned databases; embed-index has an A3-style storm suite; recover
+sweeps crash-stranded temp files. The suite is 139 tests, clippy-clean.
+
+What remains is P0 #7 — dogfooding (see the checklist below) — and the
+on-demand P2 backlog.
 
 Effort: **S** — up to half a day, **M** — 0.5–2 days, **L** — more than 2 days.
 
@@ -61,3 +63,32 @@ The priority logic: P0 turns "production-quality code" into "a product you can
 install and trust"; P1 closes the reliability tails the first external users
 would hit; P2 items answer problems that do not exist yet — building them
 early is waste.
+
+## Dogfooding checklist (P0 #7, one week, started 2026-07-07)
+
+Setup per repository (2–3 real repos, at least one against live OpenRouter and
+one against a local kou-router):
+
+```bash
+cargo install --git https://github.com/gfhfyjbr/code-sanity --locked  # or a release binary
+cd <repo> && code-sanity init && code-sanity index
+# config.toml: [sanitizer.provider] kind = "openrouter" | "kou-router"
+# [embeddings] enabled = true; export the API key env var
+```
+
+Record every occurrence of:
+
+- [ ] malformed model replies (`propose-sanitize`): unfenced/prose JSON the
+      fence-stripper missed, schema violations, empty batches;
+- [ ] nonstandard HTTP error codes / bodies from either gateway (anything the
+      429/502/503/504 retry set misses — e.g. 520s, HTML error pages);
+- [ ] rate-limit behavior: does 3×exponential backoff survive real OpenRouter
+      limits during `embed-index` on a large repo?
+- [ ] `embed-index` wall time and `elapsed=` numbers on the biggest repo
+      (P2 #15 trigger data);
+- [ ] any `verify` failure, `recover` invocation, or stale-vector report in
+      normal use — each one is a bug report;
+- [ ] agent-adapter friction (hooks, MCP) worth an issue.
+
+Exit criterion: one week of daily use with zero unexplained failures; every
+recorded item either fixed or filed as an issue.
