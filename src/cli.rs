@@ -203,10 +203,16 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             println!("initialized {}", layout.state_dir.display());
         }
         Command::Index => {
+            let started = std::time::Instant::now();
             let report = index_workspace(&root)?;
             println!(
-                "indexed={} unchanged={} skipped={} removed={} pending={}",
-                report.indexed, report.unchanged, report.skipped, report.removed, report.pending
+                "indexed={} unchanged={} skipped={} removed={} pending={} elapsed={}",
+                report.indexed,
+                report.unchanged,
+                report.skipped,
+                report.removed,
+                report.pending,
+                format_elapsed(started.elapsed())
             );
         }
         Command::Read { path } => {
@@ -238,15 +244,17 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             session_id,
         } => {
             let patch_text = read_optional_file_or_stdin(patch.as_ref())?;
+            let started = std::time::Instant::now();
             let report = apply_patch_text_with_options(
                 &root,
                 &patch_text,
                 ApplyOptions { session_id, agent },
             )?;
             println!(
-                "applied files={} journal={}",
+                "applied files={} journal={} elapsed={}",
                 report.files.join(","),
-                report.journal_path.display()
+                report.journal_path.display(),
+                format_elapsed(started.elapsed())
             );
         }
         Command::Write {
@@ -396,6 +404,7 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             std::process::exit(code);
         }
         Command::Sync { path, force } => {
+            let started = std::time::Instant::now();
             let report = match (path, force) {
                 (Some(path), false) => crate::index::sync_single_file(&root, &path)?,
                 (Some(path), true) => {
@@ -409,32 +418,48 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                 (None, true) => crate::index::index_workspace_force(&root)?,
             };
             println!(
-                "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={}",
+                "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={} elapsed={}",
                 report.indexed,
                 report.unchanged,
                 report.skipped,
                 report.removed,
                 report.pending,
-                report.stashed.len()
+                report.stashed.len(),
+                format_elapsed(started.elapsed())
             );
             for stash in &report.stashed {
                 eprintln!("stashed pending mirror edit: {stash}");
             }
         }
         Command::EmbedIndex => {
+            let started = std::time::Instant::now();
             let report = crate::embed::embed_index(&root)?;
             println!(
-                "embedded={} unchanged={} removed={} stale={} chunks={}",
-                report.embedded, report.unchanged, report.removed, report.stale, report.chunks
+                "embedded={} unchanged={} removed={} stale={} chunks={} elapsed={}",
+                report.embedded,
+                report.unchanged,
+                report.removed,
+                report.stale,
+                report.chunks,
+                format_elapsed(started.elapsed())
             );
         }
         Command::SemanticSearch { query, k } => {
-            for hit in crate::embed::semantic_search(&root, &query, k)? {
+            let started = std::time::Instant::now();
+            let hits = crate::embed::semantic_search(&root, &query, k)?;
+            for hit in &hits {
                 println!(
                     "{}:{}-{}\t{:.3}\t{}",
                     hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
                 );
             }
+            // Stdout stays machine-parseable result lines; the summary goes to
+            // stderr (most of the latency is the query embedding HTTP call).
+            eprintln!(
+                "[{} hit(s) elapsed={}]",
+                hits.len(),
+                format_elapsed(started.elapsed())
+            );
         }
         Command::Verify => {
             let report = verify_workspace(&root)?;
@@ -461,6 +486,16 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Human-scale wall time for report lines: `840ms` below a second, `1.2s`
+/// above.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    if elapsed < std::time::Duration::from_secs(1) {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
 }
 
 fn read_optional_file_or_stdin(path: Option<&PathBuf>) -> Result<String> {
