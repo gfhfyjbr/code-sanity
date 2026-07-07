@@ -14,12 +14,16 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::io::Read;
 use std::time::Duration;
 
-/// Refuse to buffer more than this from a response body; an embeddings batch
-/// for a large file stays well under it, anything bigger is a broken server.
+/// Refuse to buffer more than this from a response body (ureq's own default is
+/// 10 MiB — too small for an embeddings batch of a large file); an oversized
+/// body fails the read instead of being silently truncated.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Error bodies only carry a diagnostic; cap the read well below the payload
+/// limit (the message itself is truncated to 500 chars anyway).
+const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
 /// Transient failures (rate limits, gateway hiccups, transport errors) are
 /// retried this many times in total, with exponential backoff between tries.
@@ -69,9 +73,14 @@ impl OpenAiClient {
         Ok(Self {
             base_url,
             api_key,
-            agent: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(timeout_secs.max(1)))
-                .build(),
+            // http_status_as_error(false): non-2xx arrives on the Ok path with
+            // its body intact, so the retry loop can inspect the status and
+            // the error report can quote the server's diagnostic.
+            agent: ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(timeout_secs.max(1))))
+                .http_status_as_error(false)
+                .build()
+                .new_agent(),
             extra_headers,
         })
     }
@@ -80,50 +89,67 @@ impl OpenAiClient {
         let url = format!("{}{path}", self.base_url);
         let payload = body.to_string();
         let mut backoff = INITIAL_BACKOFF;
-        let mut attempt = 1u32;
-        loop {
-            match self.send(&url, &payload) {
+        for attempt in 1..=MAX_ATTEMPTS {
+            let cause = match self.send(&url, &payload) {
                 Ok(response) => {
-                    let mut raw = String::new();
-                    response
-                        .into_reader()
-                        .take(MAX_RESPONSE_BYTES)
-                        .read_to_string(&mut raw)
-                        .with_context(|| format!("read response body from {url}"))?;
-                    return serde_json::from_str(&raw)
-                        .with_context(|| format!("parse JSON response from {url}"));
+                    let status = response.status();
+                    if status.is_success() {
+                        let raw = response
+                            .into_body()
+                            .with_config()
+                            .limit(MAX_RESPONSE_BYTES)
+                            .read_to_string()
+                            .with_context(|| format!("read response body from {url}"))?;
+                        return serde_json::from_str(&raw)
+                            .with_context(|| format!("parse JSON response from {url}"));
+                    }
+                    let code = status.as_u16();
+                    if !is_retryable_status(code) || attempt == MAX_ATTEMPTS {
+                        let detail = response
+                            .into_body()
+                            .with_config()
+                            .limit(MAX_ERROR_BODY_BYTES)
+                            .read_to_string()
+                            .unwrap_or_default();
+                        bail!("{url} returned HTTP {code}: {}", truncate(&detail, 500));
+                    }
+                    format!("HTTP {code}")
                 }
-                Err(err) if attempt < MAX_ATTEMPTS && is_transient(&err) => {
-                    log::warn!(
-                        "POST {url} failed (attempt {attempt}/{MAX_ATTEMPTS}), \
-                         retrying in {}s: {err}",
-                        backoff.as_secs()
-                    );
-                    std::thread::sleep(backoff);
-                    backoff *= 2;
-                    attempt += 1;
-                }
-                Err(ureq::Error::Status(code, response)) => {
-                    let detail = response.into_string().unwrap_or_default();
-                    bail!("{url} returned HTTP {code}: {}", truncate(&detail, 500));
-                }
+                // Any transport-level failure (timeout, refused connection,
+                // broken pipe) is worth the same retries rate limits get.
+                Err(err) if attempt < MAX_ATTEMPTS => err.to_string(),
                 Err(err) => return Err(err).with_context(|| format!("POST {url}")),
-            }
+            };
+            log::warn!(
+                "POST {url} failed (attempt {attempt}/{MAX_ATTEMPTS}), \
+                 retrying in {}s: {cause}",
+                backoff.as_secs()
+            );
+            std::thread::sleep(backoff);
+            backoff *= 2;
         }
+        unreachable!("retry loop exits via return or bail")
     }
 
     // ureq::Error is large by value; this private helper exists purely so the
     // retry loop can match on it, so boxing would only add noise.
     #[allow(clippy::result_large_err)]
-    fn send(&self, url: &str, payload: &str) -> Result<ureq::Response, ureq::Error> {
-        let mut request = self.agent.post(url).set("content-type", "application/json");
+    fn send(
+        &self,
+        url: &str,
+        payload: &str,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let mut request = self
+            .agent
+            .post(url)
+            .header("content-type", "application/json");
         for (name, value) in &self.extra_headers {
-            request = request.set(name, value);
+            request = request.header(*name, value.as_str());
         }
         if let Some(key) = &self.api_key {
-            request = request.set("authorization", &format!("Bearer {key}"));
+            request = request.header("authorization", format!("Bearer {key}"));
         }
-        request.send_string(payload)
+        request.send(payload)
     }
 
     /// One-shot chat completion; returns the first choice's message content.
@@ -195,13 +221,10 @@ impl OpenAiClient {
     }
 }
 
-/// Worth a retry: rate limits and gateway hiccups clear on their own, and so
-/// do most transport-level failures. Anything else (4xx, auth) is permanent.
-fn is_transient(err: &ureq::Error) -> bool {
-    match err {
-        ureq::Error::Status(code, _) => matches!(code, 429 | 502 | 503 | 504),
-        ureq::Error::Transport(_) => true,
-    }
+/// Worth a retry: rate limits and gateway hiccups clear on their own.
+/// Anything else (4xx, auth) is permanent.
+fn is_retryable_status(code: u16) -> bool {
+    matches!(code, 429 | 502 | 503 | 504)
 }
 
 /// Loopback endpoints (a local gateway) may legitimately run keyless; anything
