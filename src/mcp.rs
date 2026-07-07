@@ -181,6 +181,19 @@ fn tools_manifest() -> Value {
             }
         },
         {
+            "name": "semantic_search",
+            "description": "Semantic (embedding) search over the sanitized mirror. Requires embeddings enabled in config and a populated vector index (embed-index). Returns path:start-end score preview lines (sanitized).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural-language or code query" },
+                    "k": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Top chunks to return (default 10)" }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "apply_patch",
             "description": "Apply a unified diff written against sanitized mirror paths. Projected back onto the real repo through the span-aware bridge; edits inside replacement spans conflict.",
             "inputSchema": {
@@ -238,6 +251,25 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
         "list_files" => {
             let glob = optional_str(args, "glob");
             Ok(list_mirror_files(root, glob.as_deref())?.join("\n"))
+        }
+        "semantic_search" => {
+            let query = required_str(args, "query")?;
+            let k = args
+                .get("k")
+                .and_then(Value::as_u64)
+                .map(|value| (value as usize).clamp(1, 100))
+                .unwrap_or(10);
+            let hits = crate::embed::semantic_search(root, &query, k)?;
+            Ok(hits
+                .iter()
+                .map(|hit| {
+                    format!(
+                        "{}:{}-{}\t{:.3}\t{}",
+                        hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
         "apply_patch" => {
             let patch = required_str(args, "patch")?;
@@ -320,7 +352,14 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["read_file", "search", "list_files", "apply_patch", "verify"]
+            vec![
+                "read_file",
+                "search",
+                "list_files",
+                "semantic_search",
+                "apply_patch",
+                "verify"
+            ]
         );
     }
 

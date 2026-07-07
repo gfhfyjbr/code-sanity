@@ -1,0 +1,428 @@
+//! Integration tests for the OpenAI-compatible LLM proposal provider
+//! (kou-router-style chat endpoint) and the OpenRouter-style embedding index,
+//! against a local mock server speaking the OpenAI wire format.
+
+use code_sanity::config::{Config, Layout, ProviderConfig};
+use code_sanity::index_workspace;
+use code_sanity::proposal::{ProviderAllow, propose_sanitize};
+use code_sanity::read_sanitized_file;
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+type Handler = dyn Fn(&str, &Value) -> Value + Send + Sync;
+type StatusHandler = dyn Fn(&str, &Value) -> (u16, Value) + Send + Sync;
+
+/// Minimal HTTP/1.1 mock: one response per connection, JSON in/out. Returns
+/// the base URL to point clients at. The listener thread lives until the test
+/// process exits (it blocks on accept), which is fine for tests.
+fn spawn_mock_server(handler: Arc<Handler>) -> String {
+    spawn_mock_server_with_status(Arc::new(move |path: &str, request: &Value| {
+        (200, handler(path, request))
+    }))
+}
+
+fn spawn_mock_server_with_status(handler: Arc<StatusHandler>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let handler = Arc::clone(&handler);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    return;
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                if reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let (status, response) = handler(&path, &request);
+                let response = response.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {} MockStatus\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    status,
+                    response.len(),
+                    response
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+/// Deterministic fake embedding: one dimension per keyword, counting
+/// occurrences. Cosine ranking then follows vocabulary overlap exactly.
+const KEYWORDS: [&str; 6] = ["parser", "grammar", "token", "socket", "network", "stream"];
+
+fn keyword_embedding(text: &str) -> Vec<f64> {
+    let lower = text.to_lowercase();
+    KEYWORDS
+        .iter()
+        .map(|keyword| lower.matches(keyword).count() as f64)
+        .collect()
+}
+
+fn embeddings_response(request: &Value) -> Value {
+    let inputs: Vec<String> = match &request["input"] {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default().to_string())
+            .collect(),
+        Value::String(single) => vec![single.clone()],
+        _ => Vec::new(),
+    };
+    let data: Vec<Value> = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, text)| json!({ "index": index, "embedding": keyword_embedding(text) }))
+        .collect();
+    json!({ "data": data, "model": request["model"] })
+}
+
+fn chat_response(content: &str) -> Value {
+    json!({
+        "choices": [ { "message": { "role": "assistant", "content": content } } ]
+    })
+}
+
+#[test]
+fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "fn megacorp_client() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // The reply is fenced on purpose: providers often ignore "no markdown".
+    // One proposal is valid, one references a term absent from the file.
+    let reply = "```json\n{\"proposals\":[\
+        {\"category\":\"identifier\",\"original_text\":\"megacorp\",\"sanitized_text\":\"examplefirm\",\"confidence\":0.95},\
+        {\"category\":\"identifier\",\"original_text\":\"ghost_term\",\"sanitized_text\":\"nothing\",\"confidence\":0.9}\
+    ]}\n```";
+    let chat_requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&chat_requests);
+    let reply_owned = reply.to_string();
+    let base_url = spawn_mock_server(Arc::new(move |path: &str, request: &Value| {
+        assert!(
+            path.ends_with("/chat/completions"),
+            "unexpected path {path}"
+        );
+        // The provider must send the real file content to the model.
+        let user = request["messages"][1]["content"].as_str().unwrap();
+        assert!(user.contains("megacorp_client"));
+        counter.fetch_add(1, Ordering::SeqCst);
+        chat_response(&reply_owned)
+    }));
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(10),
+    };
+    config.save(&layout).unwrap();
+
+    // A repo-configured endpoint receiving real content requires confirmation.
+    let refused = propose_sanitize(
+        repo.path(),
+        Some(Path::new("src/lib.rs")),
+        ProviderAllow::default(),
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("--allow-provider-endpoint"));
+    assert_eq!(chat_requests.load(Ordering::SeqCst), 0);
+
+    let report = propose_sanitize(
+        repo.path(),
+        Some(Path::new("src/lib.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(chat_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(report.proposed, 2);
+    assert_eq!(report.queued, 1);
+    assert_eq!(report.rejected.len(), 1);
+
+    // The model never wrote the mirror; approval routes through the registry.
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    assert!(mirror.contains("megacorp_client"));
+
+    let items = code_sanity::proposal::list_review(repo.path(), false).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].proposal.original_text, "megacorp");
+    code_sanity::proposal::resolve_review(repo.path(), &items[0].id, true).unwrap();
+
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    assert!(mirror.contains("examplefirm_client"));
+    assert!(!mirror.contains("megacorp"));
+    assert!(code_sanity::verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn openrouter_preset_routes_through_the_same_gate_and_client() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("lib.rs"), "fn megacorp_helper() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let chat_requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&chat_requests);
+    let base_url = spawn_mock_server(Arc::new(move |path: &str, _request: &Value| {
+        assert!(path.ends_with("/chat/completions"));
+        counter.fetch_add(1, Ordering::SeqCst);
+        chat_response(
+            "{\"proposals\":[{\"category\":\"identifier\",\"original_text\":\"megacorp\",\
+             \"sanitized_text\":\"examplefirm\",\"confidence\":0.95}]}",
+        )
+    }));
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Openrouter {
+        model: "anthropic/claude-sonnet-4.5".to_string(),
+        // Point the preset at the mock; a loopback URL also exempts the
+        // unset-key preflight, mirroring a keyless local gateway.
+        base_url: Some(base_url.clone()),
+        api_key_env: Some("CODE_SANITY_TEST_KEY_UNSET".to_string()),
+        timeout_secs: Some(10),
+    };
+    config.save(&layout).unwrap();
+
+    // The preset is still a repo-configured endpoint receiving real content:
+    // the same confirmation gate applies.
+    let refused = propose_sanitize(
+        repo.path(),
+        Some(Path::new("lib.rs")),
+        ProviderAllow::default(),
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("--allow-provider-endpoint"));
+    assert!(refused.to_string().contains(&base_url));
+    assert_eq!(chat_requests.load(Ordering::SeqCst), 0);
+
+    let report = propose_sanitize(
+        repo.path(),
+        Some(Path::new("lib.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(chat_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(report.queued, 1);
+}
+
+#[test]
+fn embed_index_is_incremental_and_semantic_search_ranks_by_content() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    // "dangerous" is in the default dictionary -> the mirror (and therefore
+    // everything sent to the embedding endpoint) says "neutral_parser".
+    std::fs::write(
+        repo.path().join("src/parser.rs"),
+        "// the dangerous_parser turns token streams into a grammar tree\n\
+         fn dangerous_parser(input: &str) -> usize {\n    input.len()\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("src/net.rs"),
+        "// socket helpers for the network layer\n\
+         fn connect_socket(addr: &str) -> usize {\n    addr.len()\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let embed_requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&embed_requests);
+    let seen_real_term = Arc::new(AtomicUsize::new(0));
+    let leak_counter = Arc::clone(&seen_real_term);
+    let base_url = spawn_mock_server(Arc::new(move |path: &str, request: &Value| {
+        assert!(path.ends_with("/embeddings"), "unexpected path {path}");
+        counter.fetch_add(1, Ordering::SeqCst);
+        if request["input"].to_string().contains("dangerous") {
+            leak_counter.fetch_add(1, Ordering::SeqCst);
+        }
+        embeddings_response(request)
+    }));
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.embeddings.enabled = true;
+    config.embeddings.base_url = base_url;
+    config.embeddings.model = "test-embed".to_string();
+    config.save(&layout).unwrap();
+
+    // First run embeds every tracked file (init also tracks the generated
+    // .gitignore), one request per file batch.
+    let report = code_sanity::embed_index(repo.path()).unwrap();
+    assert_eq!(report.embedded, 3);
+    assert_eq!(report.unchanged, 0);
+    assert!(report.chunks >= 3);
+    assert_eq!(embed_requests.load(Ordering::SeqCst), 3);
+
+    // Second run is a no-op without any HTTP traffic.
+    let report = code_sanity::embed_index(repo.path()).unwrap();
+    assert_eq!(report.embedded, 0);
+    assert_eq!(report.unchanged, 3);
+    assert_eq!(embed_requests.load(Ordering::SeqCst), 3);
+
+    // Ranking follows content: a parser query lands on the parser file.
+    let hits = code_sanity::semantic_search(repo.path(), "parser grammar token", 2).unwrap();
+    assert_eq!(hits[0].rel_path, "src/parser.rs");
+    assert!(hits[0].score > 0.0);
+    let hits = code_sanity::semantic_search(repo.path(), "network socket", 2).unwrap();
+    assert_eq!(hits[0].rel_path, "src/net.rs");
+
+    // Only sanitized mirror content was embedded and stored: the endpoint
+    // never saw the real term, and neither did the vector index.
+    assert_eq!(seen_real_term.load(Ordering::SeqCst), 0);
+    let conn = code_sanity::db::connect(&layout).unwrap();
+    for (_, _, _, text, _) in code_sanity::db::all_embedding_chunks(&conn).unwrap() {
+        assert!(!text.contains("dangerous"));
+    }
+    drop(conn);
+
+    // Editing one file re-embeds exactly that file.
+    std::fs::write(
+        repo.path().join("src/net.rs"),
+        "// socket helpers for the network layer, now with retries\n\
+         fn connect_socket(addr: &str) -> usize {\n    addr.len() + 1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+    let report = code_sanity::embed_index(repo.path()).unwrap();
+    assert_eq!(report.embedded, 1);
+    assert_eq!(report.unchanged, 2);
+
+    // A deleted file takes its vectors with it.
+    std::fs::remove_file(repo.path().join("src/net.rs")).unwrap();
+    index_workspace(repo.path()).unwrap();
+    let report = code_sanity::embed_index(repo.path()).unwrap();
+    // index_workspace already dropped the db rows (including embeddings via
+    // remove_file); a stale embedding_state row would also be swept here.
+    assert_eq!(report.embedded, 0);
+    let conn = code_sanity::db::connect(&layout).unwrap();
+    let remaining: Vec<String> = code_sanity::db::embedded_files(&conn).unwrap();
+    assert_eq!(
+        remaining,
+        vec![".gitignore".to_string(), "src/parser.rs".to_string()]
+    );
+}
+
+#[test]
+fn transient_http_errors_are_retried_and_hard_errors_are_not() {
+    use code_sanity::llm::OpenAiClient;
+
+    // 429 then 200: the call succeeds on the retry.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let base_url = spawn_mock_server_with_status(Arc::new(move |_path: &str, request: &Value| {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            (429, json!({ "error": "rate limited" }))
+        } else {
+            (200, embeddings_response(request))
+        }
+    }));
+    let client = OpenAiClient::new(&base_url, "CODE_SANITY_TEST_KEY_UNSET", 5).unwrap();
+    let vectors = client.embed("test-embed", &["hello".to_string()]).unwrap();
+    assert_eq!(vectors.len(), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    // A hard 400 fails immediately, without retries.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let base_url = spawn_mock_server_with_status(Arc::new(move |_path: &str, _request: &Value| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        (400, json!({ "error": "bad request" }))
+    }));
+    let client = OpenAiClient::new(&base_url, "CODE_SANITY_TEST_KEY_UNSET", 5).unwrap();
+    let err = client
+        .embed("test-embed", &["hello".to_string()])
+        .unwrap_err();
+    assert!(err.to_string().contains("HTTP 400"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn embed_index_sweeps_untracked_embedding_rows() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let base_url = spawn_mock_server(Arc::new(|_path: &str, request: &Value| {
+        embeddings_response(request)
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.embeddings.enabled = true;
+    config.embeddings.base_url = base_url;
+    config.save(&layout).unwrap();
+
+    // Plant vectors for a path nothing tracks (e.g. leftovers from an
+    // interrupted run whose file was deleted before its rows were swept).
+    let mut conn = code_sanity::db::connect(&layout).unwrap();
+    code_sanity::db::init_schema(&conn).unwrap();
+    code_sanity::db::replace_embeddings(
+        &mut conn,
+        "ghost.txt",
+        "sha-of-nothing",
+        "fp",
+        &[(1, 1, "ghost", code_sanity::embed::vector_to_blob(&[1.0]))],
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = code_sanity::embed_index(repo.path()).unwrap();
+    assert_eq!(report.removed, 1);
+    let conn = code_sanity::db::connect(&layout).unwrap();
+    assert!(
+        !code_sanity::db::embedded_files(&conn)
+            .unwrap()
+            .contains(&"ghost.txt".to_string())
+    );
+}
+
+#[test]
+fn embed_index_refuses_when_disabled() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+    let err = code_sanity::embed_index(repo.path()).unwrap_err();
+    assert!(err.to_string().contains("embeddings are disabled"));
+    let err = code_sanity::semantic_search(repo.path(), "anything", 5).unwrap_err();
+    assert!(err.to_string().contains("embeddings are disabled"));
+}

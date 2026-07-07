@@ -69,6 +69,9 @@ pub struct Config {
     pub salt: String,
     pub sanitizer: SanitizerConfig,
     pub ignore: IgnoreConfig,
+    /// Optional semantic index over the sanitized mirror (disabled by default).
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +125,184 @@ pub enum ProviderConfig {
     LlmStub {
         endpoint: Option<String>,
     },
+    /// OpenAI-compatible chat endpoint (e.g. a local kou-router gateway on
+    /// `http://127.0.0.1:20128/v1`). `propose-sanitize` sends REAL file content
+    /// to it, and the endpoint comes from repo-local config, so running it
+    /// requires explicit confirmation (`--allow-provider-endpoint`). The API
+    /// key is read from the env var named by `api_key_env`, never from config.
+    Llm {
+        base_url: String,
+        model: String,
+        #[serde(default = "default_llm_api_key_env")]
+        api_key_env: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// OpenRouter preset: the same wire protocol as `llm`, with `base_url`
+    /// defaulting to the OpenRouter API and `api_key_env` to
+    /// OPENROUTER_API_KEY. A remote endpoint receiving REAL file content, so
+    /// the `--allow-provider-endpoint` confirmation applies here too.
+    Openrouter {
+        model: String,
+        #[serde(default)]
+        base_url: Option<String>,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// Local kou-router gateway preset: `base_url` defaults to
+    /// `http://127.0.0.1:20128/v1` and `api_key_env` to KOU_ROUTER_API_KEY.
+    /// Loopback is only a default — the URL is repo-configurable, so the
+    /// same confirmation gate applies.
+    KouRouter {
+        model: String,
+        #[serde(default)]
+        base_url: Option<String>,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+}
+
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub const KOU_ROUTER_BASE_URL: &str = "http://127.0.0.1:20128/v1";
+
+const DEFAULT_LLM_TIMEOUT_SECS: u64 = 120;
+
+/// A resolved OpenAI-compatible chat endpoint with preset defaults applied.
+#[derive(Debug, Clone)]
+pub struct LlmEndpoint {
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: String,
+    pub timeout_secs: u64,
+}
+
+impl ProviderConfig {
+    /// Resolve any OpenAI-compatible chat kind (`llm`, `openrouter`,
+    /// `kou-router`) into one endpoint description; other kinds return None.
+    pub fn llm_endpoint(&self) -> Option<LlmEndpoint> {
+        match self {
+            ProviderConfig::Llm {
+                base_url,
+                model,
+                api_key_env,
+                timeout_secs,
+            } => Some(LlmEndpoint {
+                base_url: base_url.clone(),
+                model: model.clone(),
+                api_key_env: api_key_env.clone(),
+                timeout_secs: timeout_secs.unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
+            }),
+            ProviderConfig::Openrouter {
+                model,
+                base_url,
+                api_key_env,
+                timeout_secs,
+            } => Some(LlmEndpoint {
+                base_url: base_url
+                    .clone()
+                    .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string()),
+                model: model.clone(),
+                api_key_env: api_key_env
+                    .clone()
+                    .unwrap_or_else(default_embeddings_api_key_env),
+                timeout_secs: timeout_secs.unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
+            }),
+            ProviderConfig::KouRouter {
+                model,
+                base_url,
+                api_key_env,
+                timeout_secs,
+            } => Some(LlmEndpoint {
+                base_url: base_url
+                    .clone()
+                    .unwrap_or_else(|| KOU_ROUTER_BASE_URL.to_string()),
+                model: model.clone(),
+                api_key_env: api_key_env.clone().unwrap_or_else(default_llm_api_key_env),
+                timeout_secs: timeout_secs.unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
+            }),
+            ProviderConfig::Stub
+            | ProviderConfig::External { .. }
+            | ProviderConfig::LlmStub { .. } => None,
+        }
+    }
+}
+
+fn default_llm_api_key_env() -> String {
+    "KOU_ROUTER_API_KEY".to_string()
+}
+
+/// Semantic index configuration. Vectors are always computed from the
+/// **sanitized mirror** — the same text agents already read — so enabling this
+/// sends no real names to the embedding endpoint. Defaults target OpenRouter's
+/// OpenAI-compatible `/embeddings`; any compatible endpoint (including a local
+/// kou-router route) works via `base_url`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_embeddings_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_embeddings_model")]
+    pub model: String,
+    /// Env var holding the API key; the key itself never lives in the repo.
+    #[serde(default = "default_embeddings_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_chunk_lines")]
+    pub chunk_lines: usize,
+    #[serde(default = "default_chunk_overlap")]
+    pub chunk_overlap: usize,
+    /// Chunks per embeddings request.
+    #[serde(default = "default_embed_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_embed_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_embeddings_base_url(),
+            model: default_embeddings_model(),
+            api_key_env: default_embeddings_api_key_env(),
+            chunk_lines: default_chunk_lines(),
+            chunk_overlap: default_chunk_overlap(),
+            batch_size: default_embed_batch_size(),
+            timeout_secs: default_embed_timeout_secs(),
+        }
+    }
+}
+
+fn default_embeddings_base_url() -> String {
+    OPENROUTER_BASE_URL.to_string()
+}
+
+fn default_embeddings_model() -> String {
+    "openai/text-embedding-3-small".to_string()
+}
+
+fn default_embeddings_api_key_env() -> String {
+    "OPENROUTER_API_KEY".to_string()
+}
+
+fn default_chunk_lines() -> usize {
+    60
+}
+
+fn default_chunk_overlap() -> usize {
+    10
+}
+
+fn default_embed_batch_size() -> usize {
+    32
+}
+
+fn default_embed_timeout_secs() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +370,7 @@ impl Default for Config {
                 ],
                 max_file_bytes: 1024 * 1024,
             },
+            embeddings: EmbeddingsConfig::default(),
         }
     }
 }
@@ -259,4 +441,125 @@ pub fn normalize_safe_rel_path(path: &Path, boundary: &str) -> Result<PathBuf> {
         bail!("empty path for {boundary}");
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_provider_toml_stays_backward_compatible() {
+        let provider: ProviderConfig = toml::from_str(
+            "kind = \"llm\"\n\
+             base_url = \"http://127.0.0.1:20128/v1\"\n\
+             model = \"claude-sonnet-5\"\n",
+        )
+        .unwrap();
+        let endpoint = provider.llm_endpoint().unwrap();
+        assert_eq!(endpoint.base_url, "http://127.0.0.1:20128/v1");
+        assert_eq!(endpoint.model, "claude-sonnet-5");
+        assert_eq!(endpoint.api_key_env, "KOU_ROUTER_API_KEY");
+        assert_eq!(endpoint.timeout_secs, 120);
+    }
+
+    #[test]
+    fn openrouter_and_kou_router_presets_fill_defaults() {
+        let provider: ProviderConfig =
+            toml::from_str("kind = \"openrouter\"\nmodel = \"anthropic/claude-sonnet-4.5\"\n")
+                .unwrap();
+        let endpoint = provider.llm_endpoint().unwrap();
+        assert_eq!(endpoint.base_url, OPENROUTER_BASE_URL);
+        assert_eq!(endpoint.api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(endpoint.model, "anthropic/claude-sonnet-4.5");
+
+        let provider: ProviderConfig = toml::from_str(
+            "kind = \"kou-router\"\nmodel = \"claude-sonnet-5\"\ntimeout_secs = 30\n",
+        )
+        .unwrap();
+        let endpoint = provider.llm_endpoint().unwrap();
+        assert_eq!(endpoint.base_url, KOU_ROUTER_BASE_URL);
+        assert_eq!(endpoint.api_key_env, "KOU_ROUTER_API_KEY");
+        assert_eq!(endpoint.timeout_secs, 30);
+    }
+
+    #[test]
+    fn preset_overrides_beat_defaults() {
+        let provider: ProviderConfig = toml::from_str(
+            "kind = \"openrouter\"\n\
+             model = \"m\"\n\
+             base_url = \"http://127.0.0.1:9999/v1\"\n\
+             api_key_env = \"MY_KEY\"\n",
+        )
+        .unwrap();
+        let endpoint = provider.llm_endpoint().unwrap();
+        assert_eq!(endpoint.base_url, "http://127.0.0.1:9999/v1");
+        assert_eq!(endpoint.api_key_env, "MY_KEY");
+    }
+
+    #[test]
+    fn non_llm_kinds_have_no_endpoint() {
+        assert!(ProviderConfig::Stub.llm_endpoint().is_none());
+        assert!(
+            ProviderConfig::External {
+                command: vec!["true".to_string()],
+                timeout_secs: None,
+            }
+            .llm_endpoint()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn load_or_default_falls_back_and_surfaces_parse_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        // Missing file: defaults, no error.
+        let config = Config::load_or_default(&layout).unwrap();
+        assert!(!config.embeddings.enabled);
+        // Malformed TOML: a named parse error, not silent defaults.
+        layout.ensure_dirs().unwrap();
+        std::fs::write(&layout.config_path, "version = [not toml").unwrap();
+        let err = Config::load_or_default(&layout).unwrap_err();
+        assert!(err.to_string().contains("config.toml"));
+    }
+
+    #[test]
+    fn unknown_provider_kind_is_a_parse_error() {
+        let err = toml::from_str::<ProviderConfig>("kind = \"open-router\"\nmodel = \"m\"\n")
+            .unwrap_err();
+        // The kebab-case tag for the preset is exactly "openrouter".
+        assert!(err.to_string().contains("open-router"));
+        assert!(toml::from_str::<ProviderConfig>("kind = \"openrouter\"\nmodel = \"m\"\n").is_ok());
+    }
+
+    #[test]
+    fn normalize_safe_rel_path_blocks_escapes() {
+        use std::path::Path;
+        assert_eq!(
+            normalize_safe_rel_path(Path::new("./src/lib.rs"), "mirror").unwrap(),
+            PathBuf::from("src/lib.rs")
+        );
+        assert!(normalize_safe_rel_path(Path::new("../evil"), "mirror").is_err());
+        assert!(normalize_safe_rel_path(Path::new("/abs/path"), "mirror").is_err());
+        assert!(normalize_safe_rel_path(Path::new(""), "mirror").is_err());
+    }
+
+    #[test]
+    fn preset_config_survives_save_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.ensure_dirs().unwrap();
+        let mut config = Config::default();
+        config.sanitizer.provider = ProviderConfig::Openrouter {
+            model: "anthropic/claude-sonnet-4.5".to_string(),
+            base_url: None,
+            api_key_env: None,
+            timeout_secs: None,
+        };
+        config.save(&layout).unwrap();
+        let reloaded = Config::load_or_default(&layout).unwrap();
+        let endpoint = reloaded.sanitizer.provider.llm_endpoint().unwrap();
+        assert_eq!(endpoint.base_url, OPENROUTER_BASE_URL);
+        assert_eq!(endpoint.model, "anthropic/claude-sonnet-4.5");
+    }
 }

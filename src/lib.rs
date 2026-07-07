@@ -6,9 +6,11 @@ compile_error!("code-sanity supports Linux and macOS only (flock-based locking a
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod embed;
 pub mod fsutil;
 pub mod index;
 pub mod journal;
+pub mod llm;
 pub mod lock;
 pub mod logging;
 pub mod map;
@@ -22,6 +24,7 @@ pub mod strict;
 pub mod verify;
 
 pub use config::{Config, Layout};
+pub use embed::{EmbedReport, SemanticMatch, embed_index, semantic_search};
 pub use index::{IndexReport, index_workspace, init_workspace};
 pub use patch::{
     ApplyReport, RecoverReport, RenameReport, apply_patch_text, project_mirror_edit,

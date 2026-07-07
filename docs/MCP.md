@@ -1,12 +1,13 @@
 # Connecting agents to the code-sanity MCP server
 
-`code-sanity serve` speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio (JSON-RPC 2.0, one message per line). It exposes five tools, all backed by the same bridge the CLI uses:
+`code-sanity serve` speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio (JSON-RPC 2.0, one message per line). It exposes six tools, all backed by the same bridge the CLI uses:
 
 | Tool | Input | Returns |
 | --- | --- | --- |
 | `read_file` | `{ "path": "src/lib.rs" }` | sanitized file content |
-| `search` | `{ "query": "...", "glob": "*.rs"? }` | `path:line:column:text` lines (sanitized) |
+| `search` | `{ "query": "...", "glob": "*.rs"?, "max_results"? }` | `path:line:column:text` lines (sanitized, capped) |
 | `list_files` | `{ "glob": "src/**"? }` | repo-relative mirror paths |
+| `semantic_search` | `{ "query": "...", "k"? }` | `path:start-end score preview` lines (sanitized); requires embeddings enabled + `embed-index` |
 | `apply_patch` | `{ "patch": "<unified diff>", "agent"?, "session_id"? }` | applied files + journal path |
 | `verify` | `{}` | tracked-file consistency check |
 
@@ -30,7 +31,7 @@ command = "code-sanity"
 args = ["--root", ".", "serve"]
 ```
 
-Codex then offers `read_file`, `search`, `list_files`, `apply_patch`, and `verify`. Pair this with `code-sanity install-hooks --agent codex` to deny raw real-repo edits in strict mode and steer reads toward these tools.
+Codex then offers `read_file`, `search`, `list_files`, `semantic_search`, `apply_patch`, and `verify`. Pair this with `code-sanity install-hooks --agent codex` to deny raw real-repo edits in strict mode and steer reads toward these tools.
 
 ## Claude Code
 

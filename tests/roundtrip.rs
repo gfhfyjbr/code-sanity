@@ -1190,14 +1190,23 @@ fn external_model_proposals_validated_queued_and_applied_on_approval() {
     config.save(&layout).unwrap();
 
     // Repo-supplied provider commands require explicit confirmation.
-    let refused =
-        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")), false)
-            .unwrap_err();
+    let refused = code_sanity::proposal::propose_sanitize(
+        repo.path(),
+        Some(Path::new("src/lib.rs")),
+        code_sanity::proposal::ProviderAllow::default(),
+    )
+    .unwrap_err();
     assert!(refused.to_string().contains("--allow-provider-command"));
 
-    let report =
-        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")), true)
-            .unwrap();
+    let report = code_sanity::proposal::propose_sanitize(
+        repo.path(),
+        Some(Path::new("src/lib.rs")),
+        code_sanity::proposal::ProviderAllow {
+            command: true,
+            endpoint: false,
+        },
+    )
+    .unwrap();
     assert_eq!(report.proposed, 3);
     assert_eq!(report.queued, 1);
     assert_eq!(report.rejected.len(), 2);
@@ -1265,9 +1274,12 @@ fn heuristic_provider_queues_denylist_terms() {
     config.sanitizer.denylist = vec!["safe_helper".to_string()];
     config.save(&layout).unwrap();
 
-    let report =
-        code_sanity::proposal::propose_sanitize(repo.path(), Some(Path::new("src/lib.rs")), false)
-            .unwrap();
+    let report = code_sanity::proposal::propose_sanitize(
+        repo.path(),
+        Some(Path::new("src/lib.rs")),
+        code_sanity::proposal::ProviderAllow::default(),
+    )
+    .unwrap();
     assert_eq!(report.queued, 1);
     let items = code_sanity::proposal::list_review(repo.path(), false).unwrap();
     assert_eq!(items.len(), 1);

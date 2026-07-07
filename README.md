@@ -109,12 +109,55 @@ mirror files back to `sanitize(real)`.
 
 The model never writes the mirror. It runs only in an offline *propose* step and its output is validated, queued, and applied deterministically:
 
-1. `code-sanity propose-sanitize [--path <path>]` runs the configured proposal provider. The default is a deterministic `HeuristicProposalProvider` (proposes neutral aliases for denylisted terms). Set `provider.kind = "external"` with a `command` (and optional `timeout_secs`) to plug in a local model; it receives `{rel, content}` JSON on stdin and returns a `ProposalBatch`. Because the command comes from repo-local config, executing it requires explicit confirmation with `--allow-provider-command`; stdin/stdout are pumped concurrently (no pipe deadlock on large files) and the child is killed on timeout.
+1. `code-sanity propose-sanitize [--path <path>]` runs the configured proposal provider. The default is a deterministic `HeuristicProposalProvider` (proposes neutral aliases for denylisted terms). Set `provider.kind = "external"` with a `command` (and optional `timeout_secs`) to plug in a local model; it receives `{rel, content}` JSON on stdin and returns a `ProposalBatch`. Because the command comes from repo-local config, executing it requires explicit confirmation with `--allow-provider-command`; stdin/stdout are pumped concurrently (no pipe deadlock on large files) and the child is killed on timeout. Set `provider.kind = "llm"` to use any OpenAI-compatible chat endpoint instead — e.g. a local [kou-router](https://github.com/gfhfyjbr/kou-router) gateway that fans out to OpenAI/Anthropic/Ollama accounts:
+
+   ```toml
+   [sanitizer.provider]
+   kind = "llm"
+   base_url = "http://127.0.0.1:20128/v1"
+   model = "claude-sonnet-5"          # any model the gateway routes
+   api_key_env = "KOU_ROUTER_API_KEY" # key read from env, never from config
+   timeout_secs = 120
+   ```
+
+   Two presets skip the boilerplate — `kind = "kou-router"` (defaults: `base_url = "http://127.0.0.1:20128/v1"`, `api_key_env = "KOU_ROUTER_API_KEY"`) and `kind = "openrouter"` (defaults: `base_url = "https://openrouter.ai/api/v1"`, `api_key_env = "OPENROUTER_API_KEY"`); each accepts the same optional `base_url`/`api_key_env`/`timeout_secs` overrides, and `kind = "llm"` remains for any other OpenAI-compatible endpoint:
+
+   ```toml
+   [sanitizer.provider]
+   kind = "openrouter"                    # or "kou-router"
+   model = "anthropic/claude-sonnet-4.5"  # export OPENROUTER_API_KEY=sk-or-...
+   ```
+
+   The model receives the real file plus the current policy (deny/allow lists, already-mapped terms) and must answer with a strict-JSON `ProposalBatch`. Because the endpoint comes from repo-local config **and receives real file content**, running it requires explicit confirmation with `--allow-provider-endpoint` — for all three kinds, including the loopback kou-router preset. Point `base_url` at a local gateway/Ollama to keep real code on the machine; a remote endpoint (OpenRouter included) sees exactly the content you are trying to sanitize. A remote endpoint with no API key in the environment fails fast with the variable name instead of an HTTP 401 mid-run.
 2. Each proposal is validated: the original must appear in the file, allowlisted terms are refused, identifier aliases must be valid identifiers, aliases may not introduce newlines or contain a denylisted term. Survivors are queued under `.code-sanity/review/`; anything touching a public API name or below `confidence_threshold` is flagged for review.
 3. `code-sanity review [--all]` lists the queue. `review --approve <id>` records the alias in the deterministic registry (`sanitizer.alias_registry` in `config.toml`) and reindexes the file; `review --reject <id>` drops it. Approval re-validates so a stale queue can't apply an unsafe alias.
 4. `index`/`verify` use only the deterministic engine (dictionary + alias registry), so they stay reproducible and the model stays out of the write path.
 
 `code-sanity review-sanitize [--path <path>]` prints an audit of every applied replacement (category, original → sanitized, policy source, confidence, line) read from the span maps.
+
+## Semantic index (embeddings)
+
+An optional vector index over the **sanitized mirror** gives agents semantic search next to the literal `search`/`grep`. It follows the same incremental component model as the file index: every mirror file owns its chunk/vector rows and is re-embedded only when its mirror content hash or the embed fingerprint (model + chunker version + chunk parameters) changes; a deleted file takes its vectors with it. Vectors and chunk texts live in the existing `db.sqlite`.
+
+```toml
+[embeddings]
+enabled = true
+base_url = "https://openrouter.ai/api/v1"     # any OpenAI-compatible /embeddings
+model = "openai/text-embedding-3-small"
+api_key_env = "OPENROUTER_API_KEY"            # key read from env, never from config
+chunk_lines = 60
+chunk_overlap = 10
+batch_size = 32
+timeout_secs = 120
+```
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+code-sanity embed-index                  # incremental; unchanged files cost no HTTP
+code-sanity semantic-search "where is retry logic for the parser" --k 10
+```
+
+Only sanitized mirror content is ever sent to the embedding endpoint — the same text agents already read — so enabling OpenRouter leaks no real names. The default endpoint is OpenRouter's OpenAI-compatible `/embeddings`; a local [kou-router](https://github.com/gfhfyjbr/kou-router) gateway or any other OpenAI-compatible endpoint works via `base_url`. Mirror files are snapshotted under short-lived shared locks and embedding requests run unlocked, so a slow endpoint never starves writers; each file's chunk rows then commit in one SQLite transaction under a brief exclusive workspace lock that re-verifies the mirror still matches the embedded snapshot (files that changed mid-run are reported as `stale` and reconciled by the next run). Run `embed-index` after `index`/`sync` to pick up re-rendered files (stale vectors are self-healing on the next run). The MCP server exposes the same search as a `semantic_search` tool.
 
 ## Patch Bridge
 
@@ -179,12 +222,14 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `project-edit --path <path> [--agent <name>] [--session-id <id>]`
 - `recover [--rollback] [--force]` (`--force` overwrites files whose content changed after the crash)
 - `mode`
-- `propose-sanitize [--path <path>] [--allow-provider-command]`
+- `propose-sanitize [--path <path>] [--allow-provider-command] [--allow-provider-endpoint]`
 - `review [--approve <id>] [--reject <id>] [--all]`
 - `review-sanitize [--path <path>]`
 - `sh -- <cmd> [args...]`
 - `strict-run -- <cmd> [args...]`
 - `sync [--path <rel>] [--force]`
+- `embed-index`
+- `semantic-search <query> [--k <n>]`
 - `verify`
 - `doctor [--agent codex|claude|opencode]`
 - `install-hooks --agent codex|claude|opencode [--force]`
@@ -195,7 +240,7 @@ Search results are capped (default 200, hard max 1000) with an explicit truncati
 
 ## MCP Server
 
-`code-sanity serve` runs a Model Context Protocol server over stdio with tools `read_file`, `search`, `list_files`, `apply_patch`, and `verify`. Reads and search return sanitized content only; `apply_patch` projects a sanitized diff back onto the real repo through the bridge. Inspect the manifest with `code-sanity serve --once`. See [docs/MCP.md](docs/MCP.md) for Codex, Claude Code, and opencode connection config.
+`code-sanity serve` runs a Model Context Protocol server over stdio with tools `read_file`, `search`, `list_files`, `semantic_search`, `apply_patch`, and `verify`. Reads and search return sanitized content only; `apply_patch` projects a sanitized diff back onto the real repo through the bridge. Inspect the manifest with `code-sanity serve --once`. See [docs/MCP.md](docs/MCP.md) for Codex, Claude Code, and opencode connection config.
 
 ## Agent Adapters
 
@@ -281,7 +326,9 @@ printed one per line and the process exits with code `3`.
 - `.gitignore` support is delegated to the `ignore` crate (full gitignore language, `require_git(false)`); the walker does not follow parent-directory or global gitignores, for determinism.
 - The opencode plugin, MCP server, and Codex/Claude hooks are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
 - Codex/Claude hooks require `python3` on the host.
-- The model-based sanitizer is proposal-only: an external provider must be supplied as a `command` and confirmed with `--allow-provider-command`; there is no bundled LLM. The deterministic engine (dictionary + alias registry + denylist) always does the actual sanitization.
+- The model-based sanitizer is proposal-only: an external provider (a `command` confirmed with `--allow-provider-command`, or an OpenAI-compatible endpoint confirmed with `--allow-provider-endpoint`) must be supplied; there is no bundled LLM. The deterministic engine (dictionary + alias registry + denylist) always does the actual sanitization.
+- The `llm`/`openrouter`/`kou-router` proposal providers post real file content to the configured endpoint; keep it local (kou-router/Ollama) unless you accept that exposure. Embedding requests carry sanitized mirror content only.
+- Semantic search is brute-force cosine over all stored vectors (no ANN index); fine for tens of thousands of chunks, not millions. Vectors go stale between `index` and the next `embed-index` run (self-healing, hash-keyed).
 - Strict mode (`sh`/`strict-run`) is a guardrail, not a hard sandbox; FUSE/overlay isolation is not implemented. Output sanitization covers terms present in the span maps/dictionary/registry/denylist; novel real names in output are not hidden.
 
 ## Development

@@ -97,6 +97,23 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
           status text not null,
           created_at text not null
         );
+
+        create table if not exists embedding_state(
+          rel_path text primary key,
+          file_sha256 text not null,
+          fingerprint text not null
+        );
+
+        create table if not exists embedding_chunks(
+          id integer primary key,
+          rel_path text not null,
+          chunk_index integer not null,
+          start_line integer not null,
+          end_line integer not null,
+          text text not null,
+          vector blob not null
+        );
+        create index if not exists embedding_chunks_rel on embedding_chunks(rel_path);
         "#,
     )
     .context("initialize sqlite schema")?;
@@ -323,7 +340,164 @@ pub fn remove_file(conn: &Connection, rel_path: &str) -> Result<()> {
         params![rel_path],
     )
     .with_context(|| format!("remove stale index_state row for {rel_path}"))?;
+    remove_embeddings(conn, rel_path)?;
     Ok(())
+}
+
+/// The last embedded state of one mirror file: (mirror content sha256, embed
+/// fingerprint — model + chunker version + chunk params).
+pub fn embedding_state(conn: &Connection, rel_path: &str) -> Result<Option<(String, String)>> {
+    conn.query_row(
+        "select file_sha256, fingerprint from embedding_state where rel_path = ?1",
+        params![rel_path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .context("load embedding state")
+}
+
+pub fn embedded_files(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("select rel_path from embedding_state order by rel_path")
+        .context("prepare embedded files query")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("query embedded files")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect embedded files")
+}
+
+/// Replace one file's chunks + state atomically (delete-then-insert keyed by
+/// rel_path, mirroring how span rows are refreshed).
+pub fn replace_embeddings(
+    conn: &mut Connection,
+    rel_path: &str,
+    file_sha256: &str,
+    fingerprint: &str,
+    chunks: &[(usize, usize, &str, Vec<u8>)],
+) -> Result<()> {
+    let tx = conn.transaction().context("begin embeddings transaction")?;
+    tx.execute(
+        "delete from embedding_chunks where rel_path = ?1",
+        params![rel_path],
+    )
+    .context("clear embedding chunks")?;
+    for (index, (start_line, end_line, text, vector)) in chunks.iter().enumerate() {
+        tx.execute(
+            r#"
+            insert into embedding_chunks(rel_path, chunk_index, start_line, end_line, text, vector)
+            values(?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                rel_path,
+                index as i64,
+                *start_line as i64,
+                *end_line as i64,
+                text,
+                vector,
+            ],
+        )
+        .context("insert embedding chunk")?;
+    }
+    tx.execute(
+        r#"
+        insert into embedding_state(rel_path, file_sha256, fingerprint)
+        values(?1, ?2, ?3)
+        on conflict(rel_path) do update set
+          file_sha256=excluded.file_sha256,
+          fingerprint=excluded.fingerprint
+        "#,
+        params![rel_path, file_sha256, fingerprint],
+    )
+    .context("upsert embedding state")?;
+    tx.commit().context("commit embeddings transaction")
+}
+
+pub fn remove_embeddings(conn: &Connection, rel_path: &str) -> Result<()> {
+    conn.execute(
+        "delete from embedding_chunks where rel_path = ?1",
+        params![rel_path],
+    )
+    .with_context(|| format!("remove embedding chunks for {rel_path}"))?;
+    conn.execute(
+        "delete from embedding_state where rel_path = ?1",
+        params![rel_path],
+    )
+    .with_context(|| format!("remove embedding state for {rel_path}"))?;
+    Ok(())
+}
+
+/// One stored chunk: (rel_path, start_line, end_line, text, vector blob).
+pub type EmbeddedChunk = (String, usize, usize, String, Vec<u8>);
+
+pub fn all_embedding_chunks(conn: &Connection) -> Result<Vec<EmbeddedChunk>> {
+    let mut stmt = conn
+        .prepare(
+            "select rel_path, start_line, end_line, text, vector
+             from embedding_chunks order by rel_path, chunk_index",
+        )
+        .context("prepare embedding chunks query")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })
+        .context("query embedding chunks")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect embedding chunks")
+}
+
+/// Stream `(rowid, vector)` for every stored chunk without materializing
+/// chunk texts; semantic search's top-k selection scores rows as they pass,
+/// so memory stays O(1) rows instead of O(index).
+pub fn for_each_embedding_vector(
+    conn: &Connection,
+    mut visit: impl FnMut(i64, &[u8]),
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select rowid, vector from embedding_chunks")
+        .context("prepare embedding vectors query")?;
+    let mut rows = stmt.query([]).context("query embedding vectors")?;
+    while let Some(row) = rows.next().context("read embedding vector row")? {
+        let rowid: i64 = row.get(0).context("read embedding rowid")?;
+        let value = row.get_ref(1).context("read embedding vector")?;
+        let vector = value.as_blob().context("embedding vector is not a blob")?;
+        visit(rowid, vector);
+    }
+    Ok(())
+}
+
+/// Fetch the display fields for chosen chunks, in the given rowid order.
+pub fn embedding_chunks_by_rowid(
+    conn: &Connection,
+    rowids: &[i64],
+) -> Result<Vec<(String, usize, usize, String)>> {
+    let mut stmt = conn
+        .prepare(
+            "select rel_path, start_line, end_line, text
+             from embedding_chunks where rowid = ?1",
+        )
+        .context("prepare embedding chunk lookup")?;
+    let mut out = Vec::with_capacity(rowids.len());
+    for rowid in rowids {
+        let row = stmt
+            .query_row(params![rowid], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .with_context(|| format!("load embedding chunk rowid {rowid}"))?;
+        out.push(row);
+    }
+    Ok(out)
 }
 
 pub fn insert_journal_row(

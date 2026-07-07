@@ -208,6 +208,77 @@ impl ProposalProvider for HeuristicProposalProvider {
     }
 }
 
+/// OpenAI-compatible chat provider (e.g. a local kou-router gateway). The model
+/// receives the real file plus the current policy (deny/allow lists, terms that
+/// already have mappings) and must answer with a strict-JSON [`ProposalBatch`].
+/// Its output goes through the same validation and review queue as any other
+/// provider — it never touches the mirror.
+pub struct LlmProposalProvider {
+    pub client: crate::llm::OpenAiClient,
+    pub model: String,
+}
+
+const LLM_SYSTEM_PROMPT: &str = "You review source code for terms that could \
+trigger false-positive safety refusals in coding agents (e.g. words that sound \
+like malware, attacks, or exfiltration but are benign here) or that leak \
+private naming (internal company, product, or customer names). Propose neutral \
+replacement aliases.\n\
+Rules:\n\
+- only propose terms that literally appear in the file;\n\
+- never propose terms from `allowlist`, and never re-propose keys from `already_mapped`;\n\
+- an alias for category \"identifier\" must be a valid ASCII identifier;\n\
+- aliases must not contain newlines and must not contain any `denylist` term;\n\
+- do not propose renames that change behavior-bearing text (imports, protocol \
+strings, SQL, shell commands, public API names).\n\
+Respond with strict JSON only, no prose and no markdown fences:\n\
+{\"proposals\":[{\"category\":\"identifier|comment|string\",\
+\"original_text\":\"...\",\"sanitized_text\":\"...\",\"confidence\":0.0,\
+\"rationale\":\"...\"}]}\n\
+If nothing needs sanitizing, respond {\"proposals\":[]}.";
+
+impl ProposalProvider for LlmProposalProvider {
+    fn propose(&self, rel: &Path, content: &str, config: &Config) -> Result<Vec<Proposal>> {
+        let already_mapped: Vec<&String> = config
+            .sanitizer
+            .dictionary
+            .keys()
+            .chain(config.sanitizer.alias_registry.keys())
+            .collect();
+        let user = serde_json::to_string(&serde_json::json!({
+            "rel": crate::config::normalize_rel_path(rel),
+            "content": content,
+            "denylist": config.sanitizer.denylist,
+            "allowlist": config.sanitizer.allowlist,
+            "already_mapped": already_mapped,
+        }))?;
+        let reply = self.client.chat(&self.model, LLM_SYSTEM_PROMPT, &user)?;
+        parse_proposals(strip_code_fences(&reply))
+    }
+}
+
+/// Models often wrap JSON in ```json fences despite instructions — sometimes
+/// with prose around the fence ("Here is the JSON: ... Hope this helps").
+/// Extract the first fenced block wherever it sits; without a closed fence,
+/// fall back to the trimmed reply.
+fn strip_code_fences(reply: &str) -> &str {
+    let trimmed = reply.trim();
+    let Some(open) = trimmed.find("```") else {
+        return trimmed;
+    };
+    let after_open = &trimmed[open + 3..];
+    // Drop an optional language tag on the opening fence line, unless the
+    // payload starts right on it.
+    let body_start = match after_open.find('\n') {
+        Some(newline) if !after_open[..newline].trim_start().starts_with(['{', '[']) => newline + 1,
+        _ => 0,
+    };
+    let body = &after_open[body_start..];
+    let Some(close) = body.find("```") else {
+        return trimmed;
+    };
+    body[..close].trim()
+}
+
 fn parse_proposals(raw: &str) -> Result<Vec<Proposal>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -220,13 +291,42 @@ fn parse_proposals(raw: &str) -> Result<Vec<Proposal>> {
         .context("parse proposals (expected a ProposalBatch or a proposal array)")
 }
 
-fn provider_for(config: &Config, allow_external: bool) -> Result<Box<dyn ProposalProvider>> {
+/// Explicit human confirmations for providers that leave the process: External
+/// executes a repo-supplied command, Llm posts real file content to a
+/// repo-configured endpoint. Both default to refused.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProviderAllow {
+    pub command: bool,
+    pub endpoint: bool,
+}
+
+fn provider_for(config: &Config, allow: ProviderAllow) -> Result<Box<dyn ProposalProvider>> {
+    // All OpenAI-compatible chat kinds (llm / openrouter / kou-router) share
+    // one path and one confirmation gate: the endpoint is repo-configured
+    // (loopback is only a preset default) and receives real file content.
+    if let Some(endpoint) = config.sanitizer.provider.llm_endpoint() {
+        if !allow.endpoint {
+            bail!(
+                "the configured provider sends real file content to {}; \
+                 re-run with --allow-provider-endpoint after reviewing it",
+                endpoint.base_url
+            );
+        }
+        return Ok(Box::new(LlmProposalProvider {
+            client: crate::llm::OpenAiClient::new(
+                &endpoint.base_url,
+                &endpoint.api_key_env,
+                endpoint.timeout_secs,
+            )?,
+            model: endpoint.model,
+        }));
+    }
     match &config.sanitizer.provider {
         ProviderConfig::External {
             command,
             timeout_secs,
         } => {
-            if !allow_external {
+            if !allow.command {
                 bail!(
                     "the configured provider runs a repo-supplied command ({:?}); \
                      re-run with --allow-provider-command after reviewing it",
@@ -244,16 +344,16 @@ fn provider_for(config: &Config, allow_external: bool) -> Result<Box<dyn Proposa
 
 /// Run the configured provider over one file (or all tracked files) and enqueue
 /// surviving, validated proposals for review. Nothing is applied here.
-/// `allow_external` is the explicit human confirmation required to execute a
-/// repo-supplied provider command.
+/// `allow` carries the explicit human confirmations required to execute a
+/// repo-supplied provider command or post to a repo-configured endpoint.
 pub fn propose_sanitize(
     root: &Path,
     rel: Option<&Path>,
-    allow_external: bool,
+    allow: ProviderAllow,
 ) -> Result<ProposeReport> {
     let layout = crate::index::init_workspace(root)?;
     let config = Config::load_or_default(&layout)?;
-    let provider = provider_for(&config, allow_external)?;
+    let provider = provider_for(&config, allow)?;
 
     let files = match rel {
         Some(rel) => vec![crate::config::normalize_rel_path(rel)],
@@ -515,6 +615,30 @@ mod tests {
         let mut config = Config::default();
         config.sanitizer.denylist = terms.iter().map(|term| term.to_string()).collect();
         config
+    }
+
+    #[test]
+    fn strip_code_fences_unwraps_fenced_json() {
+        let fenced = "```json\n{\"proposals\":[]}\n```";
+        assert_eq!(strip_code_fences(fenced), "{\"proposals\":[]}");
+        let bare = "{\"proposals\":[]}";
+        assert_eq!(strip_code_fences(bare), bare);
+        let no_tag = "```\n{\"proposals\":[]}\n```";
+        assert_eq!(strip_code_fences(no_tag), "{\"proposals\":[]}");
+    }
+
+    #[test]
+    fn strip_code_fences_extracts_block_from_surrounding_prose() {
+        let prose =
+            "Here is the JSON you asked for:\n```json\n{\"proposals\":[]}\n```\nHope this helps!";
+        assert_eq!(strip_code_fences(prose), "{\"proposals\":[]}");
+        let inline = "Sure! ```{\"proposals\":[]}``` — done.";
+        assert_eq!(strip_code_fences(inline), "{\"proposals\":[]}");
+        let array = "```json\n[{\"category\":\"identifier\"}]\n```";
+        assert_eq!(strip_code_fences(array), "[{\"category\":\"identifier\"}]");
+        // An unterminated fence falls back to the trimmed reply.
+        let unterminated = "```json\n{\"proposals\":[]}";
+        assert_eq!(strip_code_fences(unterminated), unterminated);
     }
 
     #[test]

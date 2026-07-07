@@ -96,6 +96,10 @@ enum Command {
         /// Confirm executing the provider command from repo-local config.
         #[arg(long)]
         allow_provider_command: bool,
+        /// Confirm posting real file content to the LLM endpoint from
+        /// repo-local config (e.g. a local kou-router gateway).
+        #[arg(long)]
+        allow_provider_endpoint: bool,
     },
     /// List or resolve queued sanitization proposals.
     Review {
@@ -128,6 +132,15 @@ enum Command {
         /// Reset mirror files with pending (or tampered) edits to sanitize(real).
         #[arg(long)]
         force: bool,
+    },
+    /// Embed the sanitized mirror into the local vector index (incremental).
+    EmbedIndex,
+    /// Semantic (embedding) search over the sanitized mirror.
+    SemanticSearch {
+        query: String,
+        /// Number of top-scoring chunks to return.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
     },
     Verify,
     Doctor {
@@ -304,9 +317,16 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         Command::ProposeSanitize {
             path,
             allow_provider_command,
+            allow_provider_endpoint,
         } => {
-            let report =
-                crate::proposal::propose_sanitize(&root, path.as_deref(), allow_provider_command)?;
+            let report = crate::proposal::propose_sanitize(
+                &root,
+                path.as_deref(),
+                crate::proposal::ProviderAllow {
+                    command: allow_provider_command,
+                    endpoint: allow_provider_endpoint,
+                },
+            )?;
             println!(
                 "proposed={} queued={} rejected={}",
                 report.proposed,
@@ -398,6 +418,21 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             );
             for stash in &report.stashed {
                 eprintln!("stashed pending mirror edit: {stash}");
+            }
+        }
+        Command::EmbedIndex => {
+            let report = crate::embed::embed_index(&root)?;
+            println!(
+                "embedded={} unchanged={} removed={} stale={} chunks={}",
+                report.embedded, report.unchanged, report.removed, report.stale, report.chunks
+            );
+        }
+        Command::SemanticSearch { query, k } => {
+            for hit in crate::embed::semantic_search(&root, &query, k)? {
+                println!(
+                    "{}:{}-{}\t{:.3}\t{}",
+                    hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
+                );
             }
         }
         Command::Verify => {
