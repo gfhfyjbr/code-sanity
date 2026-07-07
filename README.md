@@ -296,6 +296,7 @@ These are guardrails, not a hard sandbox: absolute paths, network, or escaping t
 - [docs/MCP.md](docs/MCP.md) — connect Codex, Claude Code, and opencode to the MCP server.
 - [docs/HOOKS_MATRIX.md](docs/HOOKS_MATRIX.md) — per-adapter capability matrix and why hooks are guardrails.
 - [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — assets, enforcement tiers, known bypasses, and guarantees.
+- [docs/ROADMAP.md](docs/ROADMAP.md) — prioritized tasks to production readiness (release engineering, hardening, performance backlog).
 
 ## Safety Notes
 
