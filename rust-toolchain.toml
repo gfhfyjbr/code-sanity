@@ -1,0 +1,4 @@
+# Edition 2024 needs Rust >= 1.85 (also pinned via rust-version in Cargo.toml).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

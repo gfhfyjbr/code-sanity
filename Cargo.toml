@@ -6,6 +6,7 @@ rust-version = "1.85"
 description = "Sanitized mirror and patch bridge for agent code workflows"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/gfhfyjbr/code-sanity"
 keywords = ["sanitizer", "mcp", "agents", "privacy", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
