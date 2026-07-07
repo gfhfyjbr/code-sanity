@@ -106,9 +106,10 @@ The real file changes outside the bridge, so the mirror is stale.
 The process dies after real files start changing.
 - **Mitigation:** the full before/after intent is journaled as `applying` and
   fsync'd (temp + rename + directory fsync) before any real write; `recover`
-  replays (roll-forward) or `--rollback` undoes it. All writers serialize on a
-  blocking `flock` that the kernel releases when the process dies, so a crash
-  never wedges the workspace.
+  replays (roll-forward) or `--rollback` undoes it, and sweeps temp files
+  stranded by a kill mid-atomic-write. All writers serialize on a blocking
+  `flock` that the kernel releases when the process dies, so a crash never
+  wedges the workspace.
 - **Residual risk:** not a cross-crash transactional FS/DB; the sqlite state is
   derived and rebuilt by `index`.
 
@@ -125,14 +126,40 @@ A model proposes an unsafe or wrong alias.
   makes every applied replacement inspectable, and the verify backstop rejects
   aliases that still contain a term.
 
+### 7a. Repo-local config exfiltrates real content via the LLM provider
+The `llm`/`openrouter`/`kou-router` proposal providers POST **real file
+content** to the endpoint named in repo-local `config.toml` — a malicious or
+tampered config could point that at an attacker's server.
+- **Mitigation:** running any endpoint provider requires the explicit
+  `--allow-provider-endpoint` confirmation naming the URL (for every kind,
+  including loopback presets); API keys are read only from the environment,
+  never from config; a remote endpoint with no key fails preflight before any
+  content is sent. The embedding path (`embed-index`, `semantic-search`) sends
+  **sanitized mirror content only** — the same text any agent already reads —
+  so a redirected embeddings endpoint gains nothing beyond agent-visible text.
+- **Residual risk:** a user who confirms without reading the URL sends real
+  content wherever the config points; embedding chunk texts stored in
+  `db.sqlite` (local only) can lag the mirror until the next `embed-index`
+  run after a policy change.
+
 ### 8. Compiler/test output leaks real names
 `cargo`/`rustc`/`pytest` print real identifiers and paths.
 - **Mitigation:** `code-sanity sh -- <cmd>` streams stdout/stderr through a
   leftmost-longest Aho-Corasick rewrite built from the span maps, dictionary,
   registry, and denylist; `strict-run` additionally executes in a unique
-  owner-only (0700) sanitized worktree.
+  owner-only (0700) sanitized worktree. If the output sanitizer cannot be
+  built, output is withheld (fail closed), not passed through raw.
 - **Residual risk:** covers only known terms; novel real names in output are
   not hidden.
+
+### 8a. Error text leaks real names through the MCP server
+Tool successes serve sanitized mirror content, but tool **errors** interpolate
+whatever the failure touched — real paths, io error text, hunk context.
+- **Mitigation:** every MCP tool error passes through the workspace redactor
+  before leaving the server; if the redactor itself cannot be built, a generic
+  message is returned instead (fail closed).
+- **Residual risk:** the redactor covers known terms only, like `sh` output
+  sanitization (bypass 8).
 
 ### 9. Sanitization breaks the code
 A replacement produces invalid code or renames a public symbol.
