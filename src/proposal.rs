@@ -356,7 +356,9 @@ fn enqueue_review(layout: &Layout, file: &str, proposal: &Proposal, flag: &str) 
     };
     let path = layout.review_dir.join(format!("{id}.json"));
     let raw = serde_json::to_string_pretty(&item).context("serialize review item")?;
-    std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))
+    // Atomic: a crash mid-write must not leave a truncated item that breaks
+    // `list_review` for the whole queue.
+    crate::fsutil::atomic_write(&path, &raw).with_context(|| format!("write {}", path.display()))
 }
 
 pub fn list_review(root: &Path, include_resolved: bool) -> Result<Vec<ReviewItem>> {
@@ -426,7 +428,8 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
         item.status = ReviewStatus::Rejected;
     }
     let updated = serde_json::to_string_pretty(&item).context("serialize review item")?;
-    std::fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
+    crate::fsutil::atomic_write(&path, &updated)
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(item)
 }
 

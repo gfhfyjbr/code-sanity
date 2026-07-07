@@ -177,7 +177,7 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `write --path <path> [--sanitized-content <file>]`
 - `rename --path <path> --from <alias> --to <name> [--agent <name>] [--session-id <id>]`
 - `project-edit --path <path> [--agent <name>] [--session-id <id>]`
-- `recover [--rollback]`
+- `recover [--rollback] [--force]` (`--force` overwrites files whose content changed after the crash)
 - `mode`
 - `propose-sanitize [--path <path>] [--allow-provider-command]`
 - `review [--approve <id>] [--reject <id>] [--all]`

@@ -187,11 +187,11 @@ pub fn build_reverse_pairs(root: &Path) -> Result<Vec<(String, String)>> {
 }
 
 /// Substring replacement of real originals with aliases (kept for tests and
-/// small one-shot texts; the streaming path uses the same automaton).
-pub fn sanitize_output(text: &str, pairs: &[(String, String)]) -> String {
-    OutputSanitizer::new(pairs)
-        .map(|sanitizer| sanitizer.sanitize(text))
-        .unwrap_or_else(|_| text.to_string())
+/// small one-shot texts; the streaming path uses the same automaton). Fails
+/// closed: a sanitizer that cannot be built is an error, never unsanitized
+/// pass-through.
+pub fn sanitize_output(text: &str, pairs: &[(String, String)]) -> Result<String> {
+    Ok(OutputSanitizer::new(pairs)?.sanitize(text))
 }
 
 /// A per-run sanitized worktree in a private (0700) unique directory, removed
@@ -267,12 +267,12 @@ mod tests {
             ("dangerous".to_string(), "neutral".to_string()),
             ("evil".to_string(), "sample".to_string()),
         ];
-        let out = sanitize_output("fn dangerous_parser() // evil dangerous", &pairs);
+        let out = sanitize_output("fn dangerous_parser() // evil dangerous", &pairs).unwrap();
         assert_eq!(out, "fn special() // sample neutral");
     }
 
     #[test]
     fn empty_pairs_pass_text_through() {
-        assert_eq!(sanitize_output("hello", &[]), "hello");
+        assert_eq!(sanitize_output("hello", &[]).unwrap(), "hello");
     }
 }

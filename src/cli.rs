@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "code-sanity")]
+#[command(version)]
 #[command(about = "Sanitized mirror and patch bridge for agent code workflows")]
 pub struct Cli {
     #[arg(long, global = true, default_value = ".")]

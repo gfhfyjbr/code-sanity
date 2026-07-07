@@ -1,9 +1,8 @@
-//! Outbound-text sanitization boundary.
-//!
-//! Every string that leaves the process toward an agent (CLI stdout/stderr of
-//! agent-facing commands, MCP tool results and errors, `sh`/`strict-run`
-//! output streams) passes through one `Redactor` so a real term can never ride
-//! out inside an error message or a child process's output.
+//! Outbound-text sanitization boundary for agent-facing strings that are not
+//! already derived from the sanitized mirror — today the MCP tool error path
+//! (tool successes return mirror content; `sh`/`strict-run` streams go
+//! through `strict::OutputSanitizer`). A real term must never ride out
+//! inside an error message.
 //!
 //! Matching reuses the sanitizer's own primitive (`word_runs` +
 //! case/underscore-insensitive term hits + casing-adaptive replacement), so

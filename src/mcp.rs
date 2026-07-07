@@ -89,7 +89,7 @@ fn handle_message(root: &Path, raw: &str) -> Option<Value> {
                     "isError": false,
                 }),
                 Err(err) => json!({
-                    "content": [{ "type": "text", "text": format!("error: {err:#}") }],
+                    "content": [{ "type": "text", "text": redact_error(root, &format!("error: {err:#}")) }],
                     "isError": true,
                 }),
             };
@@ -101,6 +101,24 @@ fn handle_message(root: &Path, raw: &str) -> Option<Value> {
             -32601,
             &format!("method not found: {method}"),
         )),
+    }
+}
+
+/// Tool successes return sanitized-mirror content, but errors interpolate
+/// whatever the failure touched (paths, io text, hunk context) — pass them
+/// through the workspace redactor before they leave toward the agent. Fails
+/// closed: if the redactor cannot be built, a generic message goes out
+/// instead of an unredacted one.
+fn redact_error(root: &Path, message: &str) -> String {
+    const GENERIC: &str = "error: tool failed and the output redactor is unavailable; \
+                           details withheld — run `code-sanity verify` on the host for diagnostics";
+    let layout = crate::config::Layout::new(root);
+    let Ok(_lock) = crate::lock::WorkspaceLock::acquire_shared(&layout) else {
+        return GENERIC.to_string();
+    };
+    match crate::redact::Redactor::for_workspace(root) {
+        Ok(redactor) => redactor.redact(message),
+        Err(_) => GENERIC.to_string(),
     }
 }
 
@@ -314,5 +332,48 @@ mod tests {
             &[r#"{"jsonrpc":"2.0","id":9,"method":"does/not/exist"}"#],
         );
         assert_eq!(responses[0]["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn tool_errors_are_redacted_and_flagged() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("real.rs"), "fn acme_helper() {}\n").unwrap();
+        let layout = crate::config::Layout::new(repo.path());
+        crate::index::init_workspace(repo.path()).unwrap();
+        let mut config = crate::config::Config::load_or_default(&layout).unwrap();
+        config
+            .sanitizer
+            .dictionary
+            .insert("acme".to_string(), "client".to_string());
+        config.save(&layout).unwrap();
+        crate::index::index_workspace(repo.path()).unwrap();
+
+        let responses = call(
+            repo.path(),
+            &[
+                // A failing read whose requested path carries a real term:
+                // the error text must leave redacted.
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"missing_acme_file.rs"}}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{}}}"#,
+            ],
+        );
+        assert_eq!(responses[0]["result"]["isError"], true);
+        let text = responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !text.to_lowercase().contains("acme"),
+            "real term leaked: {text}"
+        );
+        assert!(
+            text.contains("client"),
+            "expected redacted alias in: {text}"
+        );
+
+        // Unknown tool and missing required argument surface as tool errors,
+        // not transport errors.
+        assert_eq!(responses[1]["result"]["isError"], true);
+        assert_eq!(responses[2]["result"]["isError"], true);
     }
 }
