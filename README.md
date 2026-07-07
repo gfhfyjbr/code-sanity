@@ -4,6 +4,34 @@
 
 Sanitization is deterministic and local (dictionary + human-approved alias registry + denylist). A model can *propose* aliases through a provider interface, but it never writes the mirror.
 
+## Installation
+
+Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
+[GitHub Release](https://github.com/gfhfyjbr/code-sanity/releases):
+
+```bash
+# pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
+#                     x86_64-apple-darwin, aarch64-apple-darwin
+version=v0.2.0
+target=aarch64-apple-darwin
+curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz"
+curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz.sha256"
+shasum -a 256 -c "code-sanity-${version}-${target}.tar.gz.sha256"
+tar xzf "code-sanity-${version}-${target}.tar.gz"
+install -m 755 "code-sanity-${version}-${target}/code-sanity" ~/.local/bin/
+```
+
+Or build from source (Rust ≥ 1.85):
+
+```bash
+cargo install --git https://github.com/gfhfyjbr/code-sanity --locked
+# or from a checkout:
+cargo install --path . --locked
+```
+
+Linux and macOS only — workspace locking is `flock`-based and the build refuses
+other platforms.
+
 ## Quick Start
 
 ```bash
