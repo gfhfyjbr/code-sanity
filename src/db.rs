@@ -1,6 +1,6 @@
 use crate::config::{Layout, normalize_rel_path};
 use crate::map::SpanMap;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -29,7 +29,20 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read sqlite user_version")?;
+    if version > SCHEMA_VERSION {
+        // Never silently downgrade: `create table if not exists` would no-op
+        // against unknown newer shapes and then stamp the old version over it.
+        bail!(
+            "db.sqlite has schema version {version}, newer than this build's \
+             {SCHEMA_VERSION}; upgrade code-sanity or delete .code-sanity/db.sqlite \
+             (the database is derived state, `index` rebuilds it)"
+        );
+    }
     if version != 0 && version < SCHEMA_VERSION {
+        // NOTE for the next SCHEMA_VERSION bump: every derived table that has
+        // existed in ANY released version must be in this drop list —
+        // embedding_state/embedding_chunks (added in v2) are absent only
+        // because no pre-v2 database can contain them.
         conn.execute_batch(
             r#"
             drop table if exists spans;
