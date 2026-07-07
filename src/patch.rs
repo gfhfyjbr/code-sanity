@@ -802,6 +802,9 @@ pub struct RecoverReport {
     /// Files whose current content matched neither the recorded snapshot nor
     /// the target; left untouched, journal entry kept in `applying`.
     pub conflicts: Vec<String>,
+    /// Stranded atomic-write temp files deleted from the workspace and from
+    /// directories the interrupted apply was writing into.
+    pub temp_files_removed: usize,
 }
 
 /// Finish or undo any apply that was interrupted after its `applying` journal
@@ -825,6 +828,13 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
         rolled_back: rollback,
         ..RecoverReport::default()
     };
+    // The crashed process may have died inside an atomic write, stranding a
+    // temp file next to its target (verify reports those in the mirror as
+    // untracked). Every writer runs under the exclusive lock we now hold, so
+    // any temp file is dead and safe to sweep: the whole state dir plus the
+    // real directories the interrupted applies were writing into.
+    report.temp_files_removed += crate::fsutil::remove_stale_temp_files(&layout.state_dir)?;
+    let mut swept_real_dirs = std::collections::BTreeSet::new();
     let mut protected_drift = false;
     for (path, mut entry) in list_journal_entries(&layout)? {
         if entry.status != JournalStatus::Applying {
@@ -833,6 +843,17 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
         let Some(pending) = entry.pending.clone() else {
             continue;
         };
+        for pending_file in &pending {
+            let real_dir = root
+                .join(&pending_file.rel)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.to_path_buf());
+            if swept_real_dirs.insert(real_dir.clone()) {
+                report.temp_files_removed +=
+                    crate::fsutil::remove_stale_temp_files_shallow(&real_dir)?;
+            }
+        }
         let mut entry_conflicts = Vec::new();
         for pending_file in &pending {
             let rel = PathBuf::from(&pending_file.rel);

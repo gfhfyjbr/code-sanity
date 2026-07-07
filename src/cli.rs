@@ -295,10 +295,11 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         Command::Recover { rollback, force } => {
             let report = recover_workspace(&root, rollback, force)?;
             println!(
-                "recovered entries={} rolled_back={} conflicts={}",
+                "recovered entries={} rolled_back={} conflicts={} temp_files_removed={}",
                 report.recovered.len(),
                 report.rolled_back,
-                report.conflicts.len()
+                report.conflicts.len(),
+                report.temp_files_removed
             );
             for conflict in &report.conflicts {
                 eprintln!("conflict: {conflict}");

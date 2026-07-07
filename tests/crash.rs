@@ -124,6 +124,39 @@ fn killed_apply_rolls_back_cleanly() {
     assert!(code_sanity::verify_workspace(repo.path()).is_ok());
 }
 
+/// A SIGKILL can land inside an atomic write — after the temp file is created,
+/// before the rename. The stranded temp then shows up in `verify`'s mirror
+/// sweep as an untracked file (observed as a flaky CI failure of
+/// `killed_apply_rolls_back_cleanly` on loaded runners). Recover must sweep
+/// such garbage from the state dir and from the real directories the
+/// interrupted apply touched.
+#[test]
+fn recover_sweeps_temp_files_stranded_by_the_crash() {
+    let repo = crash_mid_apply();
+
+    // Simulate the kill landing mid-atomic-write in the mirror, the maps dir,
+    // and the real repo (same naming as fsutil's temp_path_for).
+    let mirror_temp = repo
+        .path()
+        .join(".code-sanity/mirror/src/.a.rs.code-sanity-tmp-12345-7");
+    let maps_temp = repo
+        .path()
+        .join(".code-sanity/maps/src/.a.rs.map.json.code-sanity-tmp-12345-8");
+    let real_temp = repo.path().join("src/.b.rs.code-sanity-tmp-12345-9");
+    for temp in [&mirror_temp, &maps_temp, &real_temp] {
+        fs::write(temp, "torn half-write").unwrap();
+    }
+
+    let report = code_sanity::recover_workspace(repo.path(), true, false).unwrap();
+    assert_eq!(report.recovered.len(), 1);
+    assert!(report.conflicts.is_empty());
+    assert_eq!(report.temp_files_removed, 3);
+    for temp in [&mirror_temp, &maps_temp, &real_temp] {
+        assert!(!temp.exists(), "stale temp survived: {}", temp.display());
+    }
+    assert!(code_sanity::verify_workspace(repo.path()).is_ok());
+}
+
 #[test]
 fn recover_refuses_to_clobber_content_changed_after_the_crash() {
     let repo = crash_mid_apply();

@@ -98,6 +98,56 @@ pub fn write_with_backup_sync(path: &Path, content: &str) -> Result<()> {
     atomic_write_sync(path, content)
 }
 
+/// Whether `file_name` matches the temp naming of [`atomic_write_impl`]. A
+/// SIGKILL or power loss between temp creation and rename strands such a file;
+/// since every writer runs under the exclusive workspace lock, any temp file
+/// observed by a lock holder is garbage from a dead process.
+pub fn is_stale_temp_file(file_name: &str) -> bool {
+    file_name.starts_with('.') && file_name.contains(".code-sanity-tmp-")
+}
+
+/// Recursively delete stranded atomic-write temp files under `dir`. Only call
+/// while holding the exclusive workspace lock. Returns how many were removed.
+pub fn remove_stale_temp_files(dir: &Path) -> Result<usize> {
+    remove_stale_temp_files_impl(dir, true)
+}
+
+/// Non-recursive variant for directories in the real repository, where a deep
+/// walk could be arbitrarily large.
+pub fn remove_stale_temp_files_shallow(dir: &Path) -> Result<usize> {
+    remove_stale_temp_files_impl(dir, false)
+}
+
+fn remove_stale_temp_files_impl(dir: &Path, recurse: bool) -> Result<usize> {
+    let mut removed = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err).with_context(|| format!("read {}", current.display())),
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read entry in {}", current.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("stat {}", entry.path().display()))?;
+            if file_type.is_dir() {
+                if recurse {
+                    stack.push(entry.path());
+                }
+            } else if file_type.is_file()
+                && entry.file_name().to_str().is_some_and(is_stale_temp_file)
+            {
+                fs::remove_file(entry.path())
+                    .with_context(|| format!("remove {}", entry.path().display()))?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn backup_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
