@@ -243,6 +243,29 @@ pub fn semantic_search(root: &Path, query: &str, k: usize) -> Result<Vec<Semanti
     layout.require_initialized()?;
     let config = Config::load_or_default(&layout)?;
     ensure_enabled(&config)?;
+
+    // Fingerprint gate BEFORE the query-embedding HTTP call: a query embedded
+    // with the current model scored against vectors from a different model
+    // (or chunking) is silently garbage — same-dimension spaces produce
+    // plausible-looking nonsense. A stale index costs zero HTTP this way.
+    let fingerprint = embed_fingerprint(&config);
+    {
+        let _lock = WorkspaceLock::acquire_shared(&layout)?;
+        let conn = db::connect(&layout)?;
+        db::check_schema(&conn)?;
+        let stored = db::embedding_fingerprints(&conn)?;
+        if stored.is_empty() {
+            bail!("vector index is empty; run `code-sanity embed-index` first");
+        }
+        if stored.iter().any(|stored| stored != &fingerprint) {
+            bail!(
+                "stored vectors were embedded with a different embeddings \
+                 configuration (model/chunker/params changed); run \
+                 `code-sanity embed-index` to re-embed before searching"
+            );
+        }
+    }
+
     let client = client_for(&config)?;
     let query_vector = client
         .embed(&config.embeddings.model, &[query.to_string()])?

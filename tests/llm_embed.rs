@@ -426,3 +426,191 @@ fn embed_index_refuses_when_disabled() {
     let err = code_sanity::semantic_search(repo.path(), "anything", 5).unwrap_err();
     assert!(err.to_string().contains("embeddings are disabled"));
 }
+
+#[test]
+fn semantic_search_refuses_stale_fingerprints_before_any_http() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("main.rs"), "fn parser() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let embed_requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&embed_requests);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        embeddings_response(request)
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.embeddings.enabled = true;
+    config.embeddings.base_url = base_url;
+    config.embeddings.model = "test-embed".to_string();
+    config.save(&layout).unwrap();
+    code_sanity::embed_index(repo.path()).unwrap();
+    let after_index = embed_requests.load(Ordering::SeqCst);
+    code_sanity::semantic_search(repo.path(), "parser", 3).unwrap();
+    assert_eq!(embed_requests.load(Ordering::SeqCst), after_index + 1);
+
+    // The embeddings model changes but embed-index was not re-run: the query
+    // would be scored against a different vector space. Must refuse BEFORE
+    // paying for a query embedding.
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.embeddings.model = "other-model".to_string();
+    config.save(&layout).unwrap();
+    let before = embed_requests.load(Ordering::SeqCst);
+    let err = code_sanity::semantic_search(repo.path(), "parser", 3).unwrap_err();
+    assert!(err.to_string().contains("embed-index"), "{err:#}");
+    assert_eq!(
+        embed_requests.load(Ordering::SeqCst),
+        before,
+        "stale-fingerprint refusal must not cost an HTTP request"
+    );
+
+    // Re-embedding under the new model reconciles everything.
+    let report = code_sanity::embed_index(repo.path()).unwrap();
+    assert!(report.embedded > 0);
+    assert_eq!(report.unchanged, 0, "all vectors must be recomputed");
+    code_sanity::semantic_search(repo.path(), "parser", 3).unwrap();
+}
+
+#[test]
+fn provider_error_on_one_file_does_not_abort_the_run() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(repo.path().join("src/bad.rs"), "fn megacorp_a() {}\n").unwrap();
+    std::fs::write(repo.path().join("src/good.rs"), "fn megacorp_b() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // The mock rejects the request that carries bad.rs and answers good.rs.
+    let base_url = spawn_mock_server_with_status(Arc::new(|_path: &str, request: &Value| {
+        let user = request["messages"][1]["content"].as_str().unwrap_or("");
+        if user.contains("bad.rs") {
+            (400, json!({ "error": "context overflow" }))
+        } else {
+            (
+                200,
+                chat_response(
+                    "{\"proposals\":[{\"category\":\"identifier\",\"original_text\":\"megacorp\",\
+                     \"sanitized_text\":\"examplefirm\",\"confidence\":0.95}]}",
+                ),
+            )
+        }
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize(
+        repo.path(),
+        None,
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(report.errors[0].contains("bad.rs"), "{:?}", report.errors);
+    assert!(report.queued >= 1, "good file's proposals must be queued");
+}
+
+#[test]
+fn oversized_files_are_skipped_with_a_note() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(repo.path().join("src/small.rs"), "fn megacorp_small() {}\n").unwrap();
+    std::fs::write(
+        repo.path().join("src/large.rs"),
+        format!(
+            "// filler\n{}fn megacorp_large() {{}}\n",
+            "// x\n".repeat(40)
+        ),
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let chat_requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&chat_requests);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, _request: &Value| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        chat_response("{\"proposals\":[]}")
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.propose_max_file_bytes = 64;
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize(
+        repo.path(),
+        None,
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.skipped.len(), 1, "{:?}", report.skipped);
+    assert!(
+        report.skipped[0].contains("large.rs"),
+        "{:?}",
+        report.skipped
+    );
+    assert!(
+        report.skipped[0].contains("propose_max_file_bytes"),
+        "{:?}",
+        report.skipped
+    );
+    // Only the files under the cap were sent (small.rs + the generated
+    // .gitignore tracked by init).
+    assert_eq!(chat_requests.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn truncated_chat_reply_is_a_clear_error_not_a_parse_failure() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("main.rs"), "fn megacorp_entry() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let base_url = spawn_mock_server(Arc::new(|_path: &str, _request: &Value| {
+        json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": { "role": "assistant", "content": "{\"proposals\":[{\"cat" }
+            }]
+        })
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+    };
+    config.save(&layout).unwrap();
+
+    let err = propose_sanitize(
+        repo.path(),
+        Some(Path::new("main.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap_err();
+    let chain = format!("{err:#}");
+    assert!(chain.contains("finish_reason"), "{chain}");
+    assert!(chain.contains("cut off"), "{chain}");
+    assert!(!chain.contains("expected a ProposalBatch"), "{chain}");
+}

@@ -90,6 +90,7 @@ impl OpenAiClient {
         let payload = body.to_string();
         let mut backoff = INITIAL_BACKOFF;
         for attempt in 1..=MAX_ATTEMPTS {
+            let mut server_wait: Option<Duration> = None;
             let cause = match self.send(&url, &payload) {
                 Ok(response) => {
                     let status = response.status();
@@ -113,6 +114,15 @@ impl OpenAiClient {
                             .unwrap_or_default();
                         bail!("{url} returned HTTP {code}: {}", truncate(&detail, 500));
                     }
+                    // A rate-limited server often says exactly how long to
+                    // wait; honoring it beats guessing (capped — a hostile
+                    // header must not stall the CLI for minutes).
+                    server_wait = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(parse_retry_after_secs)
+                        .map(|wait| wait.min(MAX_RETRY_AFTER));
                     format!("HTTP {code}")
                 }
                 // Any transport-level failure (timeout, refused connection,
@@ -120,12 +130,13 @@ impl OpenAiClient {
                 Err(err) if attempt < MAX_ATTEMPTS => err.to_string(),
                 Err(err) => return Err(err).with_context(|| format!("POST {url}")),
             };
+            let wait = server_wait.unwrap_or(backoff) + retry_jitter();
             log::warn!(
                 "POST {url} failed (attempt {attempt}/{MAX_ATTEMPTS}), \
-                 retrying in {}s: {cause}",
-                backoff.as_secs()
+                 retrying in {}ms: {cause}",
+                wait.as_millis()
             );
-            std::thread::sleep(backoff);
+            std::thread::sleep(wait);
             backoff *= 2;
         }
         unreachable!("retry loop exits via return or bail")
@@ -163,6 +174,16 @@ impl OpenAiClient {
             "temperature": 0,
         });
         let value = self.post("/chat/completions", &body)?;
+        // A length-truncated reply would otherwise surface as a baffling
+        // JSON-parse error on a half-emitted proposal batch.
+        if value["choices"][0]["finish_reason"].as_str() == Some("length") {
+            bail!(
+                "chat reply was cut off by the model's output limit \
+                 (finish_reason=\"length\") for model {model}; reduce the input \
+                 (see sanitizer.propose_max_file_bytes) or use a model with a \
+                 larger output limit"
+            );
+        }
         value["choices"][0]["message"]["content"]
             .as_str()
             .map(ToOwned::to_owned)
@@ -227,8 +248,32 @@ fn is_retryable_status(code: u16) -> bool {
     matches!(code, 429 | 502 | 503 | 504)
 }
 
+/// Cap on a server-supplied Retry-After: a misconfigured (or hostile) header
+/// must not stall the CLI for minutes.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Seconds form of Retry-After only; the HTTP-date form is rare on the
+/// OpenAI-compatible endpoints this client talks to and falls back to the
+/// exponential backoff.
+fn parse_retry_after_secs(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// 0-250ms of jitter so retry storms from concurrent workspaces do not
+/// synchronize; derived from the clock's subsecond nanos (no rand dep).
+fn retry_jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(u64::from(nanos % 250))
+}
+
 /// Loopback endpoints (a local gateway) may legitimately run keyless; anything
-/// else without a key would only fail later with a confusing 401.
+/// else without a key would only fail later with a confusing 401. The host
+/// must PARSE as a loopback IP (or be exactly "localhost"): a prefix check
+/// would accept DNS names like `127.evil.com`. Unparseable hosts are not
+/// loopback — fail safe, require the key.
 fn is_loopback(base_url: &str) -> bool {
     let rest = base_url.split("://").nth(1).unwrap_or(base_url);
     let authority = rest.split('/').next().unwrap_or(rest);
@@ -238,7 +283,10 @@ fn is_loopback(base_url: &str) -> bool {
     } else {
         host.split(':').next().unwrap_or(host)
     };
-    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -269,8 +317,31 @@ mod tests {
         assert!(is_loopback("http://127.0.0.1:20128/v1"));
         assert!(is_loopback("http://localhost:8080"));
         assert!(is_loopback("http://[::1]:11434/v1"));
+        assert!(is_loopback("http://127.0.0.53:9/v1"));
+        assert!(is_loopback("http://user@127.0.0.1:8080/v1"));
         assert!(!is_loopback("https://openrouter.ai/api/v1"));
         assert!(!is_loopback("http://192.168.1.10:8080/v1"));
+        // DNS names that merely LOOK like loopback addresses are remote.
+        assert!(!is_loopback("http://127.evil.com/v1"));
+        assert!(!is_loopback("https://127.0.0.1.evil.com:443/v1"));
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_only() {
+        use std::time::Duration;
+        assert_eq!(
+            super::parse_retry_after_secs("7"),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            super::parse_retry_after_secs(" 12 "),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            super::parse_retry_after_secs("Wed, 21 Oct 2026 07:28:00 GMT"),
+            None
+        );
+        assert_eq!(super::parse_retry_after_secs("-1"), None);
     }
 
     #[test]

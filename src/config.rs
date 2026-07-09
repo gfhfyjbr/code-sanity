@@ -111,6 +111,12 @@ pub struct SanitizerConfig {
     /// being eligible for approval-free handling.
     #[serde(default = "default_confidence_threshold")]
     pub confidence_threshold: f64,
+    /// Max real-file size (bytes) sent to a proposal provider in one request;
+    /// larger files are skipped and reported. Guards the model's context
+    /// window: a max_file_bytes-sized file in one chat message overflows most
+    /// models and used to abort the whole run with an HTTP 400.
+    #[serde(default = "default_propose_max_file_bytes")]
+    pub propose_max_file_bytes: u64,
     /// Deterministic alias registry: exact original term -> approved alias.
     /// Populated by approving model proposals; consulted by the deterministic
     /// engine during index so the model never writes the mirror directly.
@@ -120,6 +126,10 @@ pub struct SanitizerConfig {
 
 fn default_confidence_threshold() -> f64 {
     0.8
+}
+
+fn default_propose_max_file_bytes() -> u64 {
+    192 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +388,7 @@ impl Default for Config {
                 ],
                 denylist: Vec::new(),
                 confidence_threshold: default_confidence_threshold(),
+                propose_max_file_bytes: default_propose_max_file_bytes(),
                 alias_registry: BTreeMap::new(),
             },
             ignore: IgnoreConfig {
@@ -453,8 +464,22 @@ impl Config {
 }
 
 /// A per-workspace random salt so derived aliases are not guessable or
-/// comparable across repositories.
+/// comparable across repositories. 16 bytes from /dev/urandom (the project is
+/// Unix-only), 32 hex chars. Fallback: a time+pid hash — LOW ENTROPY (an
+/// offline attacker with a candidate term list could confirm guesses against
+/// sym_/stemmed aliases), kept only so init cannot fail on salt generation in
+/// a broken chroot; it warns loudly.
 pub fn random_salt() -> String {
+    if let Ok(mut file) = fs::File::open("/dev/urandom") {
+        let mut bytes = [0u8; 16];
+        if std::io::Read::read_exact(&mut file, &mut bytes).is_ok() {
+            return bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        }
+    }
+    log::warn!(
+        "/dev/urandom unavailable; falling back to a LOW-ENTROPY time-based \
+         workspace salt — derived aliases may be guessable"
+    );
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -580,6 +605,16 @@ mod tests {
         // The kebab-case tag for the preset is exactly "openrouter".
         assert!(err.to_string().contains("open-router"));
         assert!(toml::from_str::<ProviderConfig>("kind = \"openrouter\"\nmodel = \"m\"\n").is_ok());
+    }
+
+    #[test]
+    fn random_salt_is_hex_and_distinct() {
+        let first = random_salt();
+        let second = random_salt();
+        assert_ne!(first, second, "salt must not be constant");
+        // /dev/urandom path: 16 bytes -> 32 lowercase hex chars.
+        assert_eq!(first.len(), 32);
+        assert!(first.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]

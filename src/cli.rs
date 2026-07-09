@@ -341,14 +341,22 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                     endpoint: allow_provider_endpoint,
                 },
             )?;
+            for error in &report.errors {
+                eprintln!("error: {error}");
+            }
             println!(
-                "proposed={} queued={} rejected={}",
+                "proposed={} queued={} rejected={} skipped={} errors={}",
                 report.proposed,
                 report.queued,
-                report.rejected.len()
+                report.rejected.len(),
+                report.skipped.len(),
+                report.errors.len()
             );
             for rejected in &report.rejected {
                 println!("rejected: {rejected}");
+            }
+            for skipped in &report.skipped {
+                println!("skipped: {skipped}");
             }
         }
         Command::Review {

@@ -68,6 +68,11 @@ pub struct ProposeReport {
     pub proposed: usize,
     pub queued: usize,
     pub rejected: Vec<String>,
+    /// Per-file failures (read error, provider error): the run continues past
+    /// them; only an all-files-failed run is a hard error.
+    pub errors: Vec<String>,
+    /// Files larger than `sanitizer.propose_max_file_bytes`, never sent.
+    pub skipped: Vec<String>,
 }
 
 /// A provider of sanitization proposals (the model interface).
@@ -373,10 +378,33 @@ pub fn propose_sanitize(
     };
 
     let mut report = ProposeReport::default();
+    let total = files.len();
     for file in files {
-        let real =
-            std::fs::read_to_string(root.join(&file)).with_context(|| format!("read {file}"))?;
-        let proposals = provider.propose(Path::new(&file), &real, &config)?;
+        // One unreadable or provider-rejected file must not abort the whole
+        // multi-file run; skip-and-report, hard-fail only when nothing at all
+        // succeeded (a misconfigured provider fails every file identically).
+        let real = match std::fs::read_to_string(root.join(&file)) {
+            Ok(real) => real,
+            Err(err) => {
+                report.errors.push(format!("{file}: read failed: {err}"));
+                continue;
+            }
+        };
+        if real.len() as u64 > config.sanitizer.propose_max_file_bytes {
+            report.skipped.push(format!(
+                "{file}: {} bytes exceeds sanitizer.propose_max_file_bytes ({})",
+                real.len(),
+                config.sanitizer.propose_max_file_bytes
+            ));
+            continue;
+        }
+        let proposals = match provider.propose(Path::new(&file), &real, &config) {
+            Ok(proposals) => proposals,
+            Err(err) => {
+                report.errors.push(format!("{file}: {err:#}"));
+                continue;
+            }
+        };
         for proposal in proposals {
             report.proposed += 1;
             match validate_proposal(&proposal, &real, &config) {
@@ -389,6 +417,12 @@ pub fn propose_sanitize(
                     .push(format!("{}: {reason}", proposal.original_text)),
             }
         }
+    }
+    if total > 0 && report.errors.len() == total {
+        bail!(
+            "provider failed for all {total} file(s); first: {}",
+            report.errors[0]
+        );
     }
     Ok(report)
 }

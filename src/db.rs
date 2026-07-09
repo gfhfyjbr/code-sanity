@@ -417,6 +417,20 @@ pub fn embedding_state(conn: &Connection, rel_path: &str) -> Result<Option<(Stri
     .context("load embedding state")
 }
 
+/// Distinct embed fingerprints currently stored (empty when nothing is
+/// embedded). Semantic search compares these against the current config
+/// fingerprint before paying for a query embedding.
+pub fn embedding_fingerprints(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("select distinct fingerprint from embedding_state order by fingerprint")
+        .context("prepare embedding fingerprints query")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("query embedding fingerprints")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect embedding fingerprints")
+}
+
 pub fn embedded_files(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn
         .prepare("select rel_path from embedding_state order by rel_path")
