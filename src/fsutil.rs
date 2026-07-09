@@ -10,6 +10,12 @@
 //!   without the fsyncs. For derived state (mirror, span maps) where a lost
 //!   rename after power loss is repaired by `sync`/`verify`, and per-file
 //!   fsyncs would dominate full-index time (macOS fsync is ~tens of ms).
+//!
+//! macOS caveat: `sync_all` maps to `fsync(2)`, which on macOS does not flush
+//! the drive's own write cache (`F_FULLFSYNC` would, at ~10-100x the cost).
+//! The write ORDERING the recovery protocol relies on (journal entry durable
+//! before real files change) still holds; a full power loss can lose the
+//! newest few writes as a unit — a documented trade-off, not a torn state.
 
 use anyhow::{Context, Result, anyhow};
 use std::fs;
@@ -35,7 +41,15 @@ fn atomic_write_impl(path: &Path, content: &str, durable: bool) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    if durable {
+        // Syncing only the immediate parent is not enough for a fresh subtree:
+        // if the directories themselves were just created, their entries in
+        // the grandparent are volatile and power loss drops the whole subtree
+        // — journal entry included.
+        create_dir_all_synced(parent)?;
+    } else {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
     let tmp = temp_path_for(path, parent);
     let result = (|| -> Result<()> {
         let mut file =
@@ -96,6 +110,56 @@ pub fn write_with_backup_sync(path: &Path, content: &str) -> Result<()> {
             .with_context(|| format!("back up {}", path.display()))?;
     }
     atomic_write_sync(path, content)
+}
+
+/// `create_dir_all`, then fsync every directory that was just created plus
+/// the deepest pre-existing ancestor (whose entry list changed). Durable-tier
+/// only. A racing concurrent creator merely causes an extra fsync.
+pub(crate) fn create_dir_all_synced(dir: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut probe = dir;
+    let existing_ancestor = loop {
+        if probe.as_os_str().is_empty() || probe.exists() {
+            break probe;
+        }
+        missing.push(probe.to_path_buf());
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => break probe,
+        }
+    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut to_sync: Vec<&Path> = vec![existing_ancestor];
+    to_sync.extend(missing.iter().rev().map(PathBuf::as_path));
+    for created in to_sync {
+        if created.as_os_str().is_empty() {
+            continue;
+        }
+        fs::File::open(created)
+            .and_then(|handle| handle.sync_all())
+            .with_context(|| format!("fsync {}", created.display()))?;
+    }
+    Ok(())
+}
+
+/// Durably remove a file: unlink + parent-dir fsync. `Ok(false)` when it was
+/// already gone. For records whose absence carries meaning (in-flight journal
+/// markers): a marker resurrected by power loss would block the workspace.
+pub(crate) fn remove_file_sync(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("fsync {}", parent.display()))?;
+    }
+    Ok(true)
 }
 
 /// Whether `file_name` matches the temp naming of [`atomic_write_impl`]. A
@@ -193,6 +257,27 @@ mod tests {
             fs::read_to_string(path.with_file_name("config.toml.bak")).unwrap(),
             "v1"
         );
+    }
+
+    #[test]
+    fn create_dir_all_synced_handles_deep_and_existing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a/b/c");
+        create_dir_all_synced(&deep).unwrap();
+        assert!(deep.is_dir());
+        // Idempotent on an existing path.
+        create_dir_all_synced(&deep).unwrap();
+        create_dir_all_synced(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn remove_file_sync_reports_whether_the_file_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker");
+        fs::write(&path, "").unwrap();
+        assert!(remove_file_sync(&path).unwrap());
+        assert!(!path.exists());
+        assert!(!remove_file_sync(&path).unwrap());
     }
 
     #[test]

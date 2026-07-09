@@ -402,10 +402,14 @@ fn apply_patch_inside_replacement_conflicts_and_leaves_real_file() {
     assert!(err.to_string().contains("replacement span"));
     let after = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert_eq!(before, after);
+    // Count entry files only (the journal dir also holds the inflight/ marker
+    // dir): exactly one conflict record.
     let journal_entries = fs::read_dir(repo.path().join(".code-sanity/journal"))
         .unwrap()
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect::<Vec<_>>();
-    assert_eq!(journal_entries.len(), 1);
+    assert_eq!(journal_entries.len(), 1, "{journal_entries:?}");
 }
 
 #[test]

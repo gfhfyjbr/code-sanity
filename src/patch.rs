@@ -832,7 +832,18 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
     report.temp_files_removed += crate::fsutil::remove_stale_temp_files(&layout.state_dir)?;
     let mut swept_real_dirs = std::collections::BTreeSet::new();
     let mut protected_drift = false;
-    for (path, mut entry) in list_journal_entries(&layout)? {
+    let listing = list_journal_entries(&layout)?;
+    // Corrupt entries are reported and left in place: one might be the sole
+    // record of an interrupted apply, and only a human can decide whether the
+    // workspace is actually consistent (`verify` still runs while blocked).
+    for (corrupt_path, reason) in &listing.corrupt {
+        report.conflicts.push(format!(
+            "{}: journal entry cannot be parsed ({reason}); run `code-sanity verify`, \
+             then move the entry (and its journal/inflight marker, if any) aside manually",
+            corrupt_path.display()
+        ));
+    }
+    for (path, mut entry) in listing.entries {
         if entry.status != JournalStatus::Applying {
             continue;
         }
@@ -1100,6 +1111,9 @@ fn commit_planned_apply(
             })();
             rollback.with_context(|| format!("apply failed ({err}); rollback failed"))?;
             entry.status = JournalStatus::RolledBack;
+            // Files are restored: the before/after snapshots are dead weight,
+            // and keeping them stored full real-file contents forever.
+            entry.pending = None;
             entry.error = Some(err.to_string());
             write_journal(layout, &entry)?;
             db::insert_journal_row(
@@ -2486,5 +2500,24 @@ mod tests {
             before_b
         );
         assert!(crate::verify::verify_workspace(repo.path()).is_ok());
+
+        // The rolled-back entry must not keep full file snapshots forever:
+        // `pending` is cleared once the files are restored, and its in-flight
+        // marker is gone.
+        let layout = Layout::new(repo.path());
+        let listing = crate::journal::list_journal_entries(&layout).unwrap();
+        let (_, rolled_back) = listing
+            .entries
+            .iter()
+            .find(|(_, entry)| entry.status == crate::journal::JournalStatus::RolledBack)
+            .expect("rolled-back journal entry");
+        assert!(
+            rolled_back.pending.is_none(),
+            "rollback kept before/after snapshots"
+        );
+        let markers = std::fs::read_dir(layout.journal_dir.join("inflight"))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(markers, 0, "rollback left an in-flight marker");
     }
 }
