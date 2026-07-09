@@ -367,12 +367,25 @@ fn plan_modify(
     }
     // Bidirectional invariant: reverse-projecting the patched mirror through
     // the fresh span map must reproduce the patched real file byte-for-byte.
-    let reverse_projected = reverse_sanitized_region(
+    let reverse_projected = match reverse_sanitized_region(
         &rendered_after.span_map,
         &rendered_after.sanitized,
         0,
         rendered_after.sanitized.len(),
-    );
+    ) {
+        Ok(projected) => projected,
+        Err(err) => {
+            return write_conflict_and_bail(
+                layout,
+                conn,
+                options,
+                patch_text,
+                &render_file_patch(&original_file_patch),
+                files,
+                format!("{rel_string}: corrupt span map during reverse projection: {err:#}"),
+            );
+        }
+    };
     if reverse_projected != patched_original {
         return write_conflict_and_bail(
             layout,
@@ -790,6 +803,7 @@ pub fn rename_alias(
                     anyhow!("alias {from:?} not found as a whole word in {rel_string}")
                 })?;
             reverse_sanitized_region(&span_map, &mirror_content, from_start, from_end)
+                .with_context(|| format!("reverse-map {from:?} in {rel_string}"))?
         }
         1 => {
             let original = alias_originals.iter().next().expect("one original");
@@ -1392,19 +1406,34 @@ fn parse_unified_patch(input: &str) -> Result<UnifiedPatch> {
     Ok(UnifiedPatch { files })
 }
 
+/// Extract the path from a `---`/`+++` header line. POSIX diff separates an
+/// optional timestamp with a TAB, so split there — splitting on any
+/// whitespace silently truncated `dir with space/f.rs` to `dir`, misrouting
+/// the patch. Paths with embedded whitespace or git-style quoting are refused
+/// loudly instead of guessed at.
 fn parse_patch_path(line: &str, prefix: &str) -> Result<String> {
-    let path = line
-        .strip_prefix(prefix)
-        .unwrap_or(line)
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow!("empty patch path line: {line}"))?;
+    let rest = line.strip_prefix(prefix).unwrap_or(line);
+    let path = rest.split('\t').next().unwrap_or(rest).trim_end();
+    if path.is_empty() {
+        bail!("empty patch path line: {line}");
+    }
+    if path.starts_with('"') {
+        bail!("quoted patch paths are not supported: {line}");
+    }
+    if path.chars().any(char::is_whitespace) {
+        bail!(
+            "patch path contains whitespace: {path:?} (paths with spaces are \
+             unsupported; timestamps must be tab-separated)"
+        );
+    }
     Ok(path.to_string())
 }
 
 fn normalize_patch_file_path(path: &str, root: &Path, layout: &Layout) -> Result<PathBuf> {
     if path == "/dev/null" {
-        bail!("create/delete patches are not supported in MVP");
+        // Reachable only when BOTH sides of a header are /dev/null (classify
+        // maps a one-sided /dev/null to create/delete before this runs).
+        bail!("/dev/null is not a patch target (malformed patch header)");
     }
     let mut candidate = PathBuf::from(path);
     if candidate.is_absolute() {
@@ -1458,13 +1487,14 @@ fn hunk_new_anchor_line(hunk: &Hunk) -> usize {
     }
 }
 
-/// The dominant line terminator of `content`: "\r\n" when at least half of
-/// the newlines are CRLF, else "\n". Added lines adopt it so a patch does not
-/// mix endings into a CRLF file.
+/// The dominant line terminator of `content`: "\r\n" when MORE than half of
+/// the newlines are CRLF, else "\n" (an exact tie prefers LF — the native
+/// ending on the supported platforms). Added lines adopt it so a patch does
+/// not mix endings into a CRLF file.
 fn dominant_eol(content: &str) -> &'static str {
     let total = content.matches('\n').count();
     let crlf = content.matches("\r\n").count();
-    if total > 0 && crlf * 2 >= total {
+    if total > 0 && crlf * 2 > total {
         "\r\n"
     } else {
         "\n"
@@ -1572,7 +1602,18 @@ fn apply_file_patch_to_content(content: &str, file_patch: &FilePatch) -> Result<
                     }
                     cursor += 1;
                 }
-                HunkLine::Add(content) => out.push(format!("{}{eol}", line_body_text(content))),
+                HunkLine::Add(content) => {
+                    // A context/remove line at EOF may lack a trailing newline
+                    // (kept verbatim above); appending after it must not merge
+                    // the two lines. The parser drops `\ No newline` markers,
+                    // so bridge output is newline-normalized by design.
+                    if let Some(last) = out.last_mut()
+                        && !last.ends_with('\n')
+                    {
+                        last.push_str(eol);
+                    }
+                    out.push(format!("{}{eol}", line_body_text(content)));
+                }
             }
         }
     }
@@ -2154,7 +2195,16 @@ fn replace_whole_word(content: &str, target: &str, replacement: &str) -> (String
 /// Reconstruct the original text of a sanitized byte range by splicing each
 /// fully-contained replacement's original text back in; unchanged regions in a
 /// span map already hold identical bytes in both views.
-fn reverse_sanitized_region(span_map: &SpanMap, mirror: &str, start: usize, end: usize) -> String {
+///
+/// Span maps are read from disk (`.code-sanity/maps/*.json`) and may be
+/// hand-edited or corrupt: every offset is validated (bounds, ordering,
+/// UTF-8 boundaries) so a broken map is an error, never a slice panic.
+fn reverse_sanitized_region(
+    span_map: &SpanMap,
+    mirror: &str,
+    start: usize,
+    end: usize,
+) -> Result<String> {
     let mut replacements: Vec<_> = span_map
         .replacements
         .iter()
@@ -2167,12 +2217,34 @@ fn reverse_sanitized_region(span_map: &SpanMap, mirror: &str, start: usize, end:
     let mut out = String::new();
     let mut cursor = start;
     for replacement in replacements {
+        if replacement.sanitized_end < replacement.sanitized_start {
+            bail!(
+                "span map replacement {:?} has an inverted range",
+                replacement.sanitized_text
+            );
+        }
+        if replacement.sanitized_start < cursor {
+            bail!(
+                "span map replacement {:?} overlaps a previous span",
+                replacement.sanitized_text
+            );
+        }
+        if replacement.sanitized_end > mirror.len()
+            || !mirror.is_char_boundary(replacement.sanitized_start)
+            || !mirror.is_char_boundary(replacement.sanitized_end)
+        {
+            bail!(
+                "span map replacement {:?} is outside content bounds or off a \
+                 UTF-8 boundary",
+                replacement.sanitized_text
+            );
+        }
         out.push_str(&mirror[cursor..replacement.sanitized_start]);
         out.push_str(&replacement.original_text);
         cursor = replacement.sanitized_end;
     }
     out.push_str(&mirror[cursor..end]);
-    out
+    Ok(out)
 }
 
 fn line_starts(content: &str) -> Vec<usize> {
@@ -2394,6 +2466,117 @@ mod tests {
         .unwrap();
         let next = apply_file_patch_to_content("alpha\r\nbeta\r\n", &patch.files[0]).unwrap();
         assert_eq!(next, "alpha\r\ngamma\r\ndelta\r\n");
+    }
+
+    #[test]
+    fn dominant_eol_tie_prefers_lf() {
+        assert_eq!(dominant_eol("a\r\nb\n"), "\n"); // exact 50/50 tie
+        assert_eq!(dominant_eol("a\r\nb\r\nc\n"), "\r\n");
+        assert_eq!(dominant_eol("a\nb\n"), "\n");
+        assert_eq!(dominant_eol(""), "\n");
+    }
+
+    #[test]
+    fn append_after_file_without_trailing_newline_keeps_lines_separate() {
+        // Context line is the final unterminated line: the added line must
+        // not merge into it.
+        let patch =
+            parse_unified_patch("--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n b\n+c\n").unwrap();
+        let next = apply_file_patch_to_content("a\nb", &patch.files[0]).unwrap();
+        assert_eq!(next, "a\nb\nc\n");
+
+        // Same shape via remove+add at EOF.
+        let patch = parse_unified_patch("--- a/f.txt\n+++ b/f.txt\n@@ -2,1 +2,2 @@\n-b\n+b2\n+c\n")
+            .unwrap();
+        let next = apply_file_patch_to_content("a\nb", &patch.files[0]).unwrap();
+        assert_eq!(next, "a\nb2\nc\n");
+    }
+
+    #[test]
+    fn parse_patch_path_handles_tabs_spaces_and_quotes() {
+        // POSIX timestamp after a TAB is dropped.
+        assert_eq!(
+            parse_patch_path("--- a/src/f.rs\t2026-01-01 00:00:00", "--- ").unwrap(),
+            "a/src/f.rs"
+        );
+        // Spaces inside the path are refused, not truncated to the wrong file.
+        let err = parse_patch_path("--- a/dir with space/f.rs", "--- ").unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "{err:#}");
+        let err = parse_patch_path("--- \"a/quoted path\"", "--- ").unwrap_err();
+        assert!(err.to_string().contains("quoted"), "{err:#}");
+    }
+
+    #[test]
+    fn dev_null_on_both_sides_is_a_clear_error() {
+        // Parsing tolerates it (classify handles one-sided /dev/null); the
+        // path normalizer is where a both-sides /dev/null target surfaces.
+        let repo = tempfile::tempdir().unwrap();
+        let layout = Layout::new(repo.path());
+        let err = normalize_patch_file_path("/dev/null", repo.path(), &layout).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("malformed patch header"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn reverse_sanitized_region_bails_on_corrupt_span_maps() {
+        use crate::map::{Replacement, SpanMap};
+        let base = SpanMap {
+            rel_path: "f.rs".into(),
+            original_hash: String::new(),
+            sanitized_hash: String::new(),
+            original_size: 0,
+            sanitized_size: 0,
+            language: "rust".into(),
+            replacements: vec![Replacement {
+                id: 0,
+                category: "identifier".into(),
+                original_text: "real".into(),
+                sanitized_text: "alias".into(),
+                confidence: 1.0,
+                policy_source: "static-dictionary".into(),
+                stable_key: "k".into(),
+                original_start: 0,
+                original_end: 4,
+                original_line_start: 1,
+                sanitized_start: 0,
+                sanitized_end: 5,
+                sanitized_line_start: 1,
+            }],
+            spans: Vec::new(),
+            updated_at: String::new(),
+        };
+        let mirror = "alias here";
+        assert_eq!(
+            reverse_sanitized_region(&base, mirror, 0, mirror.len()).unwrap(),
+            "real here"
+        );
+
+        // Inverted range (end < start).
+        let mut inverted = base.clone();
+        inverted.replacements[0].sanitized_start = 5;
+        inverted.replacements[0].sanitized_end = 2;
+        let err = reverse_sanitized_region(&inverted, mirror, 0, mirror.len()).unwrap_err();
+        assert!(format!("{err:#}").contains("inverted"), "{err:#}");
+
+        // Overlapping spans.
+        let mut overlapping = base.clone();
+        overlapping.replacements.push(Replacement {
+            sanitized_start: 3,
+            sanitized_end: 7,
+            ..overlapping.replacements[0].clone()
+        });
+        let err = reverse_sanitized_region(&overlapping, mirror, 0, mirror.len()).unwrap_err();
+        assert!(format!("{err:#}").contains("overlaps"), "{err:#}");
+
+        // Off a UTF-8 boundary.
+        let mut off_boundary = base.clone();
+        off_boundary.replacements[0].sanitized_start = 1;
+        off_boundary.replacements[0].sanitized_end = 3;
+        let unicode = "жalias";
+        let err = reverse_sanitized_region(&off_boundary, unicode, 0, unicode.len());
+        assert!(err.is_err(), "non-boundary span must error, not panic");
     }
 
     #[test]
