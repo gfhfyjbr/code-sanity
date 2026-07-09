@@ -21,7 +21,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexReport {
     pub indexed: usize,
     pub skipped: usize,
@@ -36,10 +36,29 @@ pub struct IndexReport {
     /// probe, metadata/walk errors). Their previous index state, mirror, and
     /// map are preserved until they become indexable again; `verify` is the
     /// strict gate that keeps reporting them.
+    /// Serialized as `[{"path", "reason"}]` objects, not bare 2-tuples: the
+    /// `--json` contract must stay self-describing.
+    #[serde(serialize_with = "serialize_path_reason_pairs")]
     pub errors: Vec<(String, String)>,
     /// Symlinked entries encountered; never followed (following could escape
     /// the repo boundary), never indexed.
     pub skipped_symlinks: usize,
+}
+
+fn serialize_path_reason_pairs<S: serde::Serializer>(
+    pairs: &[(String, String)],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    #[derive(serde::Serialize)]
+    struct PathReason<'a> {
+        path: &'a str,
+        reason: &'a str,
+    }
+    serializer.collect_seq(
+        pairs
+            .iter()
+            .map(|(path, reason)| PathReason { path, reason }),
+    )
 }
 
 /// Ensure dirs, acquire the exclusive lock, then — under it — write the

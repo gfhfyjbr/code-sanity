@@ -63,7 +63,7 @@ pub enum ReviewStatus {
     Rejected,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ProposeReport {
     pub proposed: usize,
     pub queued: usize,

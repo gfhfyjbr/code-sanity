@@ -93,7 +93,7 @@ fn client_for(config: &Config) -> Result<OpenAiClient> {
     )
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct EmbedReport {
     pub embedded: usize,
     pub unchanged: usize,
@@ -223,7 +223,7 @@ fn commit_file_embeddings(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SemanticMatch {
     pub rel_path: String,
     pub start_line: usize,

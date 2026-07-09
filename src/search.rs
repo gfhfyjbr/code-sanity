@@ -5,7 +5,7 @@ use ignore::WalkBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SearchMatch {
     pub rel_path: String,
     pub line: usize,

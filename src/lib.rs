@@ -15,6 +15,7 @@ pub mod lock;
 pub mod logging;
 pub mod map;
 pub mod mcp;
+pub mod output;
 pub mod patch;
 pub mod proposal;
 pub mod redact;

@@ -40,7 +40,7 @@ impl std::fmt::Display for ConflictError {
 
 impl std::error::Error for ConflictError {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ApplyReport {
     pub files: Vec<String>,
     /// `None` for a dry run: nothing was journaled as an apply.
@@ -734,7 +734,7 @@ pub fn project_mirror_edit(
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RenameReport {
     pub apply: ApplyReport,
     pub real_from: String,
@@ -878,7 +878,7 @@ pub fn rename_alias(
     })
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RecoverReport {
     pub recovered: Vec<String>,
     pub rolled_back: bool,

@@ -238,6 +238,32 @@ Conflicts write `.code-sanity/journal/*.patch.json` and leave the real file unch
 - `64` — command-line usage error (unknown flags/subcommand);
 - `1` — any other error.
 
+**Exception:** `sh` and `strict-run` propagate the wrapped command's exit code
+verbatim, so a child that exits 2/3/64 produces those codes with none of the
+meanings above. The contract applies only to code-sanity's own commands.
+
+### Machine-readable output (`--json`)
+
+Every command except `sh`/`strict-run`/`serve` accepts a global `--json` flag
+and then writes **exactly one compact JSON document to stdout** — success or
+failure — while stderr stays free-form human diagnostics outside the contract.
+Exit codes are unchanged.
+
+```json
+{"ok":true,"command":"index","data":{"indexed":42,"unchanged":0,"...":"..."},"elapsed_ms":840}
+{"ok":false,"command":"apply-patch","error":{"kind":"conflict","message":"...","journal_path":"..."}}
+```
+
+- `error.kind` is `conflict` (exit 2, with `journal_path`), `verify_failed`
+  (exit 3, with `checked` and `failures`), or `error` (exit 1).
+- Consumers must ignore unknown fields: fields are added over time, never
+  renamed or retyped.
+- A clap usage error (exit 64) is reported before `--json` is parsed and is
+  never JSON.
+- `read --json` wraps the file as `{"path","content"}` (byte-faithful inside
+  the JSON string); `sh`/`strict-run` refuse the flag (exit 64) because their
+  stdout and exit code belong to the wrapped command.
+
 ### Crash safety and recover
 
 Because the intent is journaled (fsync'd) before any real write, a process killed mid-apply leaves an `applying` entry on disk. `code-sanity recover` replays it to the recorded `after` state (roll-forward); `code-sanity recover --rollback` restores every touched file to its `before` state. The crashed process's lock is released by the kernel, so recover just takes the lock normally.

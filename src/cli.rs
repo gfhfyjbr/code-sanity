@@ -24,8 +24,42 @@ pub struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Emit exactly one machine-readable JSON object on stdout (stderr and
+    /// exit codes are unchanged). Not supported for sh/strict-run/serve.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// The kebab-case clap name of a command, for the `--json` envelope.
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Init => "init",
+        Command::Index => "index",
+        Command::Read { .. } => "read",
+        Command::Search { .. } => "search",
+        Command::ApplyPatch { .. } => "apply-patch",
+        Command::Write { .. } => "write",
+        Command::Rename { .. } => "rename",
+        Command::ProjectEdit { .. } => "project-edit",
+        Command::Recover { .. } => "recover",
+        Command::Mode => "mode",
+        Command::ProposeSanitize { .. } => "propose-sanitize",
+        Command::Review { .. } => "review",
+        Command::ReviewSanitize { .. } => "review-sanitize",
+        Command::Sh { .. } => "sh",
+        Command::StrictRun { .. } => "strict-run",
+        Command::Sync { .. } => "sync",
+        Command::EmbedIndex => "embed-index",
+        Command::SemanticSearch { .. } => "semantic-search",
+        Command::Verify => "verify",
+        Command::Doctor { .. } => "doctor",
+        Command::InstallHooks { .. } => "install-hooks",
+        Command::UninstallHooks { .. } => "uninstall-hooks",
+        Command::Serve { .. } => "serve",
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -239,30 +273,90 @@ pub fn run() -> Result<()> {
         stderr_logging,
     );
 
-    match dispatch(cli.command, &root) {
+    let out = if cli.json {
+        crate::output::Output::Json
+    } else {
+        crate::output::Output::Human
+    };
+    let name = command_name(&cli.command);
+    // sh/strict-run hand stdout and the exit code to the wrapped command;
+    // wrapping either would corrupt the child stream, so a harness that sets
+    // --json globally must hear a loud refusal, not trust garbage.
+    if out.is_json() && matches!(cli.command, Command::Sh { .. } | Command::StrictRun { .. }) {
+        eprintln!(
+            "--json is not supported for {name}: stdout and the exit code \
+             belong to the wrapped command"
+        );
+        std::process::exit(64);
+    }
+
+    match dispatch(cli.command, &root, out) {
         Ok(()) => Ok(()),
         Err(err) => {
             // Dedicated exit codes: 2 = patch conflict (real files untouched),
             // 3 = workspace broken (verify failed). Everything else is 1.
-            if err.downcast_ref::<crate::patch::ConflictError>().is_some() {
+            // In JSON mode the error envelope goes to stdout (the machine
+            // contract) while the human rendering stays on stderr.
+            if let Some(conflict) = err.downcast_ref::<crate::patch::ConflictError>() {
+                if out.is_json() {
+                    crate::output::emit_error(
+                        name,
+                        "conflict",
+                        &conflict.message,
+                        serde_json::json!({
+                            "journal_path": conflict.journal_path.display().to_string(),
+                        }),
+                    );
+                }
                 eprintln!("{err:#}");
                 std::process::exit(2);
             }
             if let Some(failed) = err.downcast_ref::<crate::verify::VerifyFailed>() {
+                if out.is_json() {
+                    crate::output::emit_error(
+                        name,
+                        "verify_failed",
+                        &format!(
+                            "verify failed with {} issue(s)",
+                            failed.report.failures.len()
+                        ),
+                        serde_json::json!({
+                            "checked": failed.report.checked,
+                            "failures": failed.report.failures,
+                        }),
+                    );
+                }
                 eprint!("{failed}");
                 std::process::exit(3);
+            }
+            if out.is_json() {
+                crate::output::emit_error(
+                    name,
+                    "error",
+                    &format!("{err:#}"),
+                    serde_json::json!({}),
+                );
             }
             Err(err)
         }
     }
 }
 
-fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
+fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output) -> Result<()> {
+    use serde_json::json;
     let root = root.to_path_buf();
     match command {
         Command::Init => {
             let layout = init_workspace(&root)?;
-            println!("initialized {}", layout.state_dir.display());
+            if out.is_json() {
+                out.emit(
+                    "init",
+                    json!({ "state_dir": layout.state_dir.display().to_string() }),
+                    None,
+                );
+            } else {
+                println!("initialized {}", layout.state_dir.display());
+            }
         }
         Command::Index => {
             let started = std::time::Instant::now();
@@ -270,20 +364,37 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             for (path, reason) in &report.errors {
                 eprintln!("error: {path}: {reason}");
             }
-            println!(
-                "indexed={} unchanged={} skipped={} removed={} pending={} symlinks={} errors={} elapsed={}",
-                report.indexed,
-                report.unchanged,
-                report.skipped,
-                report.removed,
-                report.pending,
-                report.skipped_symlinks,
-                report.errors.len(),
-                format_elapsed(started.elapsed())
-            );
+            if out.is_json() {
+                out.emit(
+                    "index",
+                    serde_json::to_value(&report)?,
+                    Some(started.elapsed().as_millis()),
+                );
+            } else {
+                println!(
+                    "indexed={} unchanged={} skipped={} removed={} pending={} symlinks={} errors={} elapsed={}",
+                    report.indexed,
+                    report.unchanged,
+                    report.skipped,
+                    report.removed,
+                    report.pending,
+                    report.skipped_symlinks,
+                    report.errors.len(),
+                    format_elapsed(started.elapsed())
+                );
+            }
         }
         Command::Read { path } => {
-            print!("{}", read_sanitized_file(&root, &path)?);
+            let content = read_sanitized_file(&root, &path)?;
+            if out.is_json() {
+                out.emit(
+                    "read",
+                    json!({ "path": path.display().to_string(), "content": content }),
+                    None,
+                );
+            } else {
+                print!("{content}");
+            }
         }
         Command::Search {
             query,
@@ -292,11 +403,19 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         } => {
             let (hits, truncated) =
                 crate::search::search_mirror_limited(&root, &query, glob.as_deref(), max_results)?;
-            for hit in &hits {
-                println!(
-                    "{}:{}:{}:{}",
-                    hit.rel_path, hit.line, hit.column, hit.line_text
+            if out.is_json() {
+                out.emit(
+                    "search",
+                    json!({ "hits": hits, "truncated": truncated }),
+                    None,
                 );
+            } else {
+                for hit in &hits {
+                    println!(
+                        "{}:{}:{}:{}",
+                        hit.rel_path, hit.line, hit.column, hit.line_text
+                    );
+                }
             }
             if truncated {
                 eprintln!(
@@ -322,18 +441,24 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                     dry_run,
                 },
             )?;
-            match &report.journal_path {
-                Some(journal) => println!(
-                    "applied files={} journal={} elapsed={}",
-                    report.files.join(","),
-                    journal.display(),
-                    format_elapsed(started.elapsed())
-                ),
-                None => println!(
-                    "dry-run ok files={} (no changes written) elapsed={}",
-                    report.files.join(","),
-                    format_elapsed(started.elapsed())
-                ),
+            if out.is_json() {
+                let mut data = serde_json::to_value(&report)?;
+                data["dry_run"] = json!(dry_run);
+                out.emit("apply-patch", data, Some(started.elapsed().as_millis()));
+            } else {
+                match &report.journal_path {
+                    Some(journal) => println!(
+                        "applied files={} journal={} elapsed={}",
+                        report.files.join(","),
+                        journal.display(),
+                        format_elapsed(started.elapsed())
+                    ),
+                    None => println!(
+                        "dry-run ok files={} (no changes written) elapsed={}",
+                        report.files.join(","),
+                        format_elapsed(started.elapsed())
+                    ),
+                }
             }
         }
         Command::Write {
@@ -342,11 +467,15 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         } => {
             let content = read_optional_file_or_stdin(sanitized_content.as_ref())?;
             let report = write_sanitized_content(&root, &path, &content)?;
-            println!(
-                "wrote files={} journal={}",
-                report.files.join(","),
-                display_journal(&report.journal_path)
-            );
+            if out.is_json() {
+                out.emit("write", serde_json::to_value(&report)?, None);
+            } else {
+                println!(
+                    "wrote files={} journal={}",
+                    report.files.join(","),
+                    display_journal(&report.journal_path)
+                );
+            }
         }
         Command::Rename {
             path,
@@ -366,15 +495,19 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                     dry_run: false,
                 },
             )?;
-            println!(
-                "renamed real={} -> {} occurrences={} sanitized_now={} files={} journal={}",
-                report.real_from,
-                to,
-                report.occurrences,
-                report.sanitized_to,
-                report.apply.files.join(","),
-                display_journal(&report.apply.journal_path)
-            );
+            if out.is_json() {
+                out.emit("rename", serde_json::to_value(&report)?, None);
+            } else {
+                println!(
+                    "renamed real={} -> {} occurrences={} sanitized_now={} files={} journal={}",
+                    report.real_from,
+                    to,
+                    report.occurrences,
+                    report.sanitized_to,
+                    report.apply.files.join(","),
+                    display_journal(&report.apply.journal_path)
+                );
+            }
         }
         Command::ProjectEdit {
             path,
@@ -390,21 +523,29 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                     dry_run: false,
                 },
             )?;
-            println!(
-                "projected files={} journal={}",
-                report.files.join(","),
-                display_journal(&report.journal_path)
-            );
+            if out.is_json() {
+                out.emit("project-edit", serde_json::to_value(&report)?, None);
+            } else {
+                println!(
+                    "projected files={} journal={}",
+                    report.files.join(","),
+                    display_journal(&report.journal_path)
+                );
+            }
         }
         Command::Recover { rollback, force } => {
             let report = recover_workspace(&root, rollback, force)?;
-            println!(
-                "recovered entries={} rolled_back={} conflicts={} temp_files_removed={}",
-                report.recovered.len(),
-                report.rolled_back,
-                report.conflicts.len(),
-                report.temp_files_removed
-            );
+            if out.is_json() {
+                out.emit("recover", serde_json::to_value(&report)?, None);
+            } else {
+                println!(
+                    "recovered entries={} rolled_back={} conflicts={} temp_files_removed={}",
+                    report.recovered.len(),
+                    report.rolled_back,
+                    report.conflicts.len(),
+                    report.temp_files_removed
+                );
+            }
             for conflict in &report.conflicts {
                 eprintln!("conflict: {conflict}");
             }
@@ -417,7 +558,11 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                 crate::config::Mode::Guided => "guided",
                 crate::config::Mode::Strict => "strict",
             };
-            println!("{mode}");
+            if out.is_json() {
+                out.emit("mode", json!({ "mode": mode }), None);
+            } else {
+                println!("{mode}");
+            }
         }
         Command::ProposeSanitize {
             path,
@@ -435,19 +580,23 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             for error in &report.errors {
                 eprintln!("error: {error}");
             }
-            println!(
-                "proposed={} queued={} rejected={} skipped={} errors={}",
-                report.proposed,
-                report.queued,
-                report.rejected.len(),
-                report.skipped.len(),
-                report.errors.len()
-            );
-            for rejected in &report.rejected {
-                println!("rejected: {rejected}");
-            }
-            for skipped in &report.skipped {
-                println!("skipped: {skipped}");
+            if out.is_json() {
+                out.emit("propose-sanitize", serde_json::to_value(&report)?, None);
+            } else {
+                println!(
+                    "proposed={} queued={} rejected={} skipped={} errors={}",
+                    report.proposed,
+                    report.queued,
+                    report.rejected.len(),
+                    report.skipped.len(),
+                    report.errors.len()
+                );
+                for rejected in &report.rejected {
+                    println!("rejected: {rejected}");
+                }
+                for skipped in &report.skipped {
+                    println!("skipped: {skipped}");
+                }
             }
         }
         Command::Review {
@@ -457,46 +606,73 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         } => {
             if let Some(id) = approve {
                 let item = crate::proposal::resolve_review(&root, &id, true)?;
-                println!(
-                    "approved {} {} -> {} (file {})",
-                    item.id, item.proposal.original_text, item.proposal.sanitized_text, item.file
-                );
-            } else if let Some(id) = reject {
-                let item = crate::proposal::resolve_review(&root, &id, false)?;
-                println!("rejected {}", item.id);
-            } else {
-                let items = crate::proposal::list_review(&root, all)?;
-                if items.is_empty() {
-                    println!("review queue is empty");
-                }
-                for item in items {
+                if out.is_json() {
+                    out.emit(
+                        "review",
+                        json!({ "action": "approved", "item": item }),
+                        None,
+                    );
+                } else {
                     println!(
-                        "{}\t{:?}\t{}\t{} -> {}\t[{}]\t{}",
+                        "approved {} {} -> {} (file {})",
                         item.id,
-                        item.status,
-                        item.file,
                         item.proposal.original_text,
                         item.proposal.sanitized_text,
-                        item.flag,
-                        item.proposal.category
+                        item.file
                     );
+                }
+            } else if let Some(id) = reject {
+                let item = crate::proposal::resolve_review(&root, &id, false)?;
+                if out.is_json() {
+                    out.emit(
+                        "review",
+                        json!({ "action": "rejected", "item": item }),
+                        None,
+                    );
+                } else {
+                    println!("rejected {}", item.id);
+                }
+            } else {
+                let items = crate::proposal::list_review(&root, all)?;
+                if out.is_json() {
+                    out.emit("review", json!({ "items": items }), None);
+                } else {
+                    if items.is_empty() {
+                        println!("review queue is empty");
+                    }
+                    for item in items {
+                        println!(
+                            "{}\t{:?}\t{}\t{} -> {}\t[{}]\t{}",
+                            item.id,
+                            item.status,
+                            item.file,
+                            item.proposal.original_text,
+                            item.proposal.sanitized_text,
+                            item.flag,
+                            item.proposal.category
+                        );
+                    }
                 }
             }
         }
         Command::ReviewSanitize { path } => {
             let rows = crate::proposal::audit_replacements(&root, path.as_deref())?;
-            println!("replacements={}", rows.len());
-            for row in rows {
-                println!(
-                    "{}:{}\t{}\t{} -> {}\t[{}]\tconf={:.2}",
-                    row.file,
-                    row.original_line,
-                    row.category,
-                    row.original_text,
-                    row.sanitized_text,
-                    row.policy_source,
-                    row.confidence
-                );
+            if out.is_json() {
+                out.emit("review-sanitize", json!({ "replacements": rows }), None);
+            } else {
+                println!("replacements={}", rows.len());
+                for row in rows {
+                    println!(
+                        "{}:{}\t{}\t{} -> {}\t[{}]\tconf={:.2}",
+                        row.file,
+                        row.original_line,
+                        row.category,
+                        row.original_text,
+                        row.sanitized_text,
+                        row.policy_source,
+                        row.confidence
+                    );
+                }
             }
         }
         Command::Sh { command } => {
@@ -524,18 +700,26 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             for (path, reason) in &report.errors {
                 eprintln!("error: {path}: {reason}");
             }
-            println!(
-                "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={} symlinks={} errors={} elapsed={}",
-                report.indexed,
-                report.unchanged,
-                report.skipped,
-                report.removed,
-                report.pending,
-                report.stashed.len(),
-                report.skipped_symlinks,
-                report.errors.len(),
-                format_elapsed(started.elapsed())
-            );
+            if out.is_json() {
+                out.emit(
+                    "sync",
+                    serde_json::to_value(&report)?,
+                    Some(started.elapsed().as_millis()),
+                );
+            } else {
+                println!(
+                    "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={} symlinks={} errors={} elapsed={}",
+                    report.indexed,
+                    report.unchanged,
+                    report.skipped,
+                    report.removed,
+                    report.pending,
+                    report.stashed.len(),
+                    report.skipped_symlinks,
+                    report.errors.len(),
+                    format_elapsed(started.elapsed())
+                );
+            }
             for stash in &report.stashed {
                 eprintln!("stashed pending mirror edit: {stash}");
             }
@@ -543,24 +727,40 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         Command::EmbedIndex => {
             let started = std::time::Instant::now();
             let report = crate::embed::embed_index(&root)?;
-            println!(
-                "embedded={} unchanged={} removed={} stale={} chunks={} elapsed={}",
-                report.embedded,
-                report.unchanged,
-                report.removed,
-                report.stale,
-                report.chunks,
-                format_elapsed(started.elapsed())
-            );
+            if out.is_json() {
+                out.emit(
+                    "embed-index",
+                    serde_json::to_value(&report)?,
+                    Some(started.elapsed().as_millis()),
+                );
+            } else {
+                println!(
+                    "embedded={} unchanged={} removed={} stale={} chunks={} elapsed={}",
+                    report.embedded,
+                    report.unchanged,
+                    report.removed,
+                    report.stale,
+                    report.chunks,
+                    format_elapsed(started.elapsed())
+                );
+            }
         }
         Command::SemanticSearch { query, k } => {
             let started = std::time::Instant::now();
             let hits = crate::embed::semantic_search(&root, &query, k)?;
-            for hit in &hits {
-                println!(
-                    "{}:{}-{}\t{:.3}\t{}",
-                    hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
+            if out.is_json() {
+                out.emit(
+                    "semantic-search",
+                    json!({ "hits": hits }),
+                    Some(started.elapsed().as_millis()),
                 );
+            } else {
+                for hit in &hits {
+                    println!(
+                        "{}:{}-{}\t{:.3}\t{}",
+                        hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
+                    );
+                }
             }
             // Stdout stays machine-parseable result lines; the summary goes to
             // stderr (most of the latency is the query embedding HTTP call).
@@ -572,16 +772,20 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         }
         Command::Verify => {
             let report = verify_workspace(&root)?;
-            println!("verified tracked_files={}", report.checked);
+            if out.is_json() {
+                out.emit("verify", serde_json::to_value(&report)?, None);
+            } else {
+                println!("verified tracked_files={}", report.checked);
+            }
         }
         Command::Doctor { agent } => {
-            doctor(&root, agent)?;
+            doctor(&root, agent, out)?;
         }
         Command::InstallHooks { agent, force } => {
-            install_hooks(&root, agent, force)?;
+            install_hooks(&root, agent, force, out)?;
         }
         Command::UninstallHooks { agent } => {
-            uninstall_hooks(&root, agent)?;
+            uninstall_hooks(&root, agent, out)?;
         }
         Command::Serve { once } => {
             if once {
@@ -627,35 +831,39 @@ fn display_journal(journal_path: &Option<PathBuf>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn doctor(root: &std::path::Path, agent: Option<Agent>) -> Result<()> {
+fn doctor(root: &std::path::Path, agent: Option<Agent>, out: crate::output::Output) -> Result<()> {
+    use serde_json::json;
     let layout = crate::config::Layout::new(root);
-    println!("root={}", root.display());
-    println!(
-        "state_dir={} exists={}",
-        layout.state_dir.display(),
-        layout.state_dir.exists()
-    );
-    println!(
-        "config={} exists={}",
-        layout.config_path.display(),
-        layout.config_path.exists()
-    );
-    println!(
-        "db={} exists={}",
-        layout.db_path.display(),
-        layout.db_path.exists()
-    );
-    println!(
-        "mirror={} exists={}",
-        layout.mirror_dir.display(),
-        layout.mirror_dir.exists()
-    );
-    println!(
-        "maps={} exists={}",
-        layout.maps_dir.display(),
-        layout.maps_dir.exists()
-    );
-    match agent {
+    let path_status = |path: &std::path::Path| json!({ "path": path.display().to_string(), "exists": path.exists() });
+    if !out.is_json() {
+        println!("root={}", root.display());
+        println!(
+            "state_dir={} exists={}",
+            layout.state_dir.display(),
+            layout.state_dir.exists()
+        );
+        println!(
+            "config={} exists={}",
+            layout.config_path.display(),
+            layout.config_path.exists()
+        );
+        println!(
+            "db={} exists={}",
+            layout.db_path.display(),
+            layout.db_path.exists()
+        );
+        println!(
+            "mirror={} exists={}",
+            layout.mirror_dir.display(),
+            layout.mirror_dir.exists()
+        );
+        println!(
+            "maps={} exists={}",
+            layout.maps_dir.display(),
+            layout.maps_dir.exists()
+        );
+    }
+    let agent_status = match agent {
         Some(Agent::Codex) => {
             let hooks = root.join(".codex/hooks.json");
             let pre = root.join(".codex/hooks/pre_tool_use.py");
@@ -666,20 +874,27 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>) -> Result<()> {
                 && fs::read_to_string(&pre)
                     .map(|body| body.contains("permissionDecision"))
                     .unwrap_or(false);
-            println!(
-                "codex hooks.json={} exists={}",
-                hooks.display(),
-                hooks.exists()
-            );
-            println!("codex pre_tool_use.py exists={}", pre.exists());
-            println!("codex post_tool_use.py exists={}", post.exists());
-            println!(
-                "codex hooks installed={} (run `code-sanity install-hooks --agent codex`)",
-                installed
-            );
-            println!(
-                "codex hooks deny raw edits in strict and steer to code_sanity MCP tools; PreToolUse is a guardrail, not a full enforcement boundary"
-            );
+            if !out.is_json() {
+                println!(
+                    "codex hooks.json={} exists={}",
+                    hooks.display(),
+                    hooks.exists()
+                );
+                println!("codex pre_tool_use.py exists={}", pre.exists());
+                println!("codex post_tool_use.py exists={}", post.exists());
+                println!(
+                    "codex hooks installed={} (run `code-sanity install-hooks --agent codex`)",
+                    installed
+                );
+                println!(
+                    "codex hooks deny raw edits in strict and steer to code_sanity MCP tools; PreToolUse is a guardrail, not a full enforcement boundary"
+                );
+            }
+            Some(json!({
+                "name": "codex",
+                "installed": installed,
+                "files": [path_status(&hooks), path_status(&pre), path_status(&post)],
+            }))
         }
         Some(Agent::Claude) => {
             let settings = root.join(".claude/settings.json");
@@ -691,21 +906,33 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>) -> Result<()> {
                 && fs::read_to_string(&pre)
                     .map(|body| body.contains("permissionDecision"))
                     .unwrap_or(false);
-            println!(
-                "claude settings.json={} exists={}",
-                settings.display(),
-                settings.exists()
-            );
-            println!("claude pre_tool_use.py exists={}", pre.exists());
-            println!("claude post_tool_use.py exists={}", post.exists());
-            println!("claude session_start.py exists={}", session.exists());
-            println!(
-                "claude hooks installed={} (run `code-sanity install-hooks --agent claude`)",
-                installed
-            );
-            println!(
-                "claude hooks guard raw Read/Edit/Write in strict and steer to the code-sanity MCP server; hooks are a guardrail, not a hard boundary"
-            );
+            if !out.is_json() {
+                println!(
+                    "claude settings.json={} exists={}",
+                    settings.display(),
+                    settings.exists()
+                );
+                println!("claude pre_tool_use.py exists={}", pre.exists());
+                println!("claude post_tool_use.py exists={}", post.exists());
+                println!("claude session_start.py exists={}", session.exists());
+                println!(
+                    "claude hooks installed={} (run `code-sanity install-hooks --agent claude`)",
+                    installed
+                );
+                println!(
+                    "claude hooks guard raw Read/Edit/Write in strict and steer to the code-sanity MCP server; hooks are a guardrail, not a hard boundary"
+                );
+            }
+            Some(json!({
+                "name": "claude",
+                "installed": installed,
+                "files": [
+                    path_status(&settings),
+                    path_status(&pre),
+                    path_status(&post),
+                    path_status(&session),
+                ],
+            }))
         }
         Some(Agent::Opencode) => {
             let plugin = root.join(".opencode/plugins/code-sanity.ts");
@@ -715,24 +942,47 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>) -> Result<()> {
                 && fs::read_to_string(&plugin)
                     .map(|body| body.contains("project-edit"))
                     .unwrap_or(false);
-            println!("opencode plugin={} exists={}", plugin.display(), plugin_ok);
-            println!(
-                "opencode package.json={} exists={}",
-                pkg.display(),
-                pkg.exists()
-            );
-            println!(
-                "opencode plugin installed={} (run `code-sanity install-hooks --agent opencode`)",
-                installed
-            );
-            println!(
-                "opencode bridges mirror edits via `code-sanity project-edit`; hooks are guardrails, not a hard boundary"
-            );
+            if !out.is_json() {
+                println!("opencode plugin={} exists={}", plugin.display(), plugin_ok);
+                println!(
+                    "opencode package.json={} exists={}",
+                    pkg.display(),
+                    pkg.exists()
+                );
+                println!(
+                    "opencode plugin installed={} (run `code-sanity install-hooks --agent opencode`)",
+                    installed
+                );
+                println!(
+                    "opencode bridges mirror edits via `code-sanity project-edit`; hooks are guardrails, not a hard boundary"
+                );
+            }
+            Some(json!({
+                "name": "opencode",
+                "installed": installed,
+                "files": [path_status(&plugin), path_status(&pkg)],
+            }))
         }
         None => {
-            println!("agents: codex, claude, opencode");
+            if !out.is_json() {
+                println!("agents: codex, claude, opencode");
+            }
+            None
         }
-    }
+    };
+    out.emit(
+        "doctor",
+        json!({
+            "root": root.display().to_string(),
+            "state_dir": path_status(&layout.state_dir),
+            "config": path_status(&layout.config_path),
+            "db": path_status(&layout.db_path),
+            "mirror": path_status(&layout.mirror_dir),
+            "maps": path_status(&layout.maps_dir),
+            "agent": agent_status,
+        }),
+        None,
+    );
     Ok(())
 }
 
@@ -844,7 +1094,12 @@ fn strip_hooks_json(path: &std::path::Path, ours_raw: &str) -> Result<Option<ser
     Ok(Some(existing))
 }
 
-fn install_hooks(root: &std::path::Path, agent: Agent, force: bool) -> Result<()> {
+fn install_hooks(
+    root: &std::path::Path,
+    agent: Agent,
+    force: bool,
+    out: crate::output::Output,
+) -> Result<()> {
     let installed = format!("{agent:?}");
     match agent {
         Agent::Codex => {
@@ -876,11 +1131,19 @@ fn install_hooks(root: &std::path::Path, agent: Agent, force: bool) -> Result<()
             write_with_backup(&root.join(".opencode/package.json"), OPENCODE_PACKAGE_JSON)?;
         }
     }
-    println!("installed hooks for {installed}");
+    if out.is_json() {
+        out.emit(
+            "install-hooks",
+            serde_json::json!({ "agent": installed.to_lowercase() }),
+            None,
+        );
+    } else {
+        println!("installed hooks for {installed}");
+    }
     Ok(())
 }
 
-fn uninstall_hooks(root: &std::path::Path, agent: Agent) -> Result<()> {
+fn uninstall_hooks(root: &std::path::Path, agent: Agent, out: crate::output::Output) -> Result<()> {
     let name = format!("{agent:?}");
     let remove_if_present = |path: &std::path::Path| -> Result<()> {
         match fs::remove_file(path) {
@@ -922,7 +1185,15 @@ fn uninstall_hooks(root: &std::path::Path, agent: Agent) -> Result<()> {
             }
         }
     }
-    println!("uninstalled hooks for {name}");
+    if out.is_json() {
+        out.emit(
+            "uninstall-hooks",
+            serde_json::json!({ "agent": name.to_lowercase() }),
+            None,
+        );
+    } else {
+        println!("uninstalled hooks for {name}");
+    }
     Ok(())
 }
 
