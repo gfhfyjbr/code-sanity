@@ -16,6 +16,16 @@ use std::path::Path;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// Protocol revisions this server actually implements. `initialize` echoes the
+/// client's requested version only when it is one of these; anything else
+/// (including a made-up future string) negotiates down to the default instead
+/// of claiming support the server does not have.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+/// One request line at most; large patches fit comfortably, while a client
+/// that never sends a newline cannot grow the buffer without bound.
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
 /// Serve MCP over the process stdio, blocking until stdin reaches EOF.
 pub fn serve_stdio(root: &Path) -> Result<()> {
     let stdin = io::stdin();
@@ -24,27 +34,92 @@ pub fn serve_stdio(root: &Path) -> Result<()> {
 }
 
 /// Serve MCP over arbitrary line-oriented streams (used directly in tests).
+///
+/// A long-lived session must survive malformed framing: an oversized or
+/// non-UTF-8 request line is answered with a JSON-RPC parse error and the
+/// loop keeps serving, instead of tearing down the whole server over one bad
+/// byte from a buggy client.
 pub fn serve<R: BufRead, W: Write>(root: &Path, mut reader: R, mut writer: W) -> Result<()> {
-    let mut line = String::new();
     loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .context("read MCP request line")?;
-        if read == 0 {
-            break;
-        }
+        let line = match read_bounded_line(&mut reader, MAX_REQUEST_BYTES)
+            .context("read MCP request line")?
+        {
+            None => break,
+            Some(Ok(line)) => line,
+            Some(Err(reason)) => {
+                let response =
+                    error_response(Value::Null, -32700, &format!("parse error: {reason}"));
+                write_response(&mut writer, &response)?;
+                continue;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         if let Some(response) = handle_message(root, trimmed) {
-            let serialized = serde_json::to_string(&response).context("serialize MCP response")?;
-            writeln!(writer, "{serialized}").context("write MCP response")?;
-            writer.flush().context("flush MCP response")?;
+            write_response(&mut writer, &response)?;
         }
     }
     Ok(())
+}
+
+fn write_response<W: Write>(writer: &mut W, response: &Value) -> Result<()> {
+    let serialized = serde_json::to_string(response).context("serialize MCP response")?;
+    writeln!(writer, "{serialized}").context("write MCP response")?;
+    writer.flush().context("flush MCP response")
+}
+
+/// Read one `\n`-terminated request as raw bytes, bounded by `max`.
+///
+/// Returns `None` at clean EOF, `Some(Ok(line))` for a valid UTF-8 line
+/// (terminator excluded), and `Some(Err(reason))` for a line that overflowed
+/// the cap or is not UTF-8 — in both failure cases the input is consumed up to
+/// the next newline (or EOF), so the caller can answer and keep the session.
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    max: usize,
+) -> io::Result<Option<std::result::Result<String, String>>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflowed = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if available.is_empty() {
+            // EOF: nothing buffered at all is a clean end of session.
+            if buf.is_empty() && !overflowed {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|&byte| byte == b'\n');
+        let chunk_len = newline.unwrap_or(available.len());
+        if !overflowed {
+            if buf.len() + chunk_len > max {
+                // Stop buffering but keep draining to the newline so the next
+                // request starts on a clean frame boundary.
+                overflowed = true;
+                buf = Vec::new();
+            } else {
+                buf.extend_from_slice(&available[..chunk_len]);
+            }
+        }
+        let consume = chunk_len + usize::from(newline.is_some());
+        reader.consume(consume);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if overflowed {
+        return Ok(Some(Err(format!("request exceeds {max} bytes"))));
+    }
+    match String::from_utf8(buf) {
+        Ok(line) => Ok(Some(Ok(line))),
+        Err(_) => Ok(Some(Err("request is not valid UTF-8".to_string()))),
+    }
 }
 
 /// The `tools/list` result, pretty-printed for `serve --once` inspection.
@@ -64,8 +139,24 @@ fn handle_message(root: &Path, raw: &str) -> Option<Value> {
             ));
         }
     };
+    // Valid JSON that is not a single request object (a batch array, a bare
+    // scalar) was previously dropped without a reply; per JSON-RPC that is an
+    // Invalid Request the client should hear about.
+    if !message.is_object() {
+        return Some(error_response(
+            Value::Null,
+            -32600,
+            "invalid request: expected a single JSON-RPC object (batches are not supported)",
+        ));
+    }
     let id = message.get("id").cloned();
-    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return Some(error_response(
+            id.unwrap_or(Value::Null),
+            -32600,
+            "invalid request: missing method",
+        ));
+    };
     let is_notification = id.is_none();
 
     match method {
@@ -133,10 +224,14 @@ fn redact_error(root: &Path, message: &str) -> String {
 }
 
 fn initialize_result(message: &Value) -> Value {
+    // Version negotiation, not an echo: a requested revision we implement is
+    // confirmed; anything unknown answers with the default so the server
+    // never claims support for a protocol it has not seen.
     let requested = message
         .get("params")
         .and_then(|params| params.get("protocolVersion"))
         .and_then(Value::as_str)
+        .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
         .unwrap_or(DEFAULT_PROTOCOL_VERSION);
     json!({
         "protocolVersion": requested,
@@ -398,6 +493,87 @@ mod tests {
                 "apply_patch",
                 "verify"
             ]
+        );
+    }
+
+    /// Raw-bytes variant of `call` for inputs that are not valid UTF-8 lines.
+    fn call_bytes(root: &Path, input: Vec<u8>) -> Vec<Value> {
+        let mut output = Vec::new();
+        serve(root, Cursor::new(input), &mut output).unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn non_utf8_input_gets_parse_error_and_session_survives() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut input = vec![0xff, 0xfe, 0x0a]; // invalid UTF-8, then newline
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        input.push(b'\n');
+        let responses = call_bytes(repo.path(), input);
+        assert_eq!(responses.len(), 2, "bad bytes must not end the session");
+        assert_eq!(responses[0]["error"]["code"], -32700);
+        assert_eq!(responses[0]["id"], Value::Null);
+        assert_eq!(responses[1]["id"], 1);
+        assert!(responses[1]["result"].is_object());
+    }
+
+    #[test]
+    fn oversized_line_is_bounded_and_drained_to_next_frame() {
+        // Unit-level: the cap and the drain-to-newline recovery, with a small
+        // max so the test does not allocate MAX_REQUEST_BYTES.
+        let input = format!("{}\nnext\n", "x".repeat(64));
+        let mut reader = Cursor::new(input.into_bytes());
+        let first = read_bounded_line(&mut reader, 16).unwrap().unwrap();
+        assert!(first.unwrap_err().contains("exceeds 16 bytes"));
+        let second = read_bounded_line(&mut reader, 16).unwrap().unwrap();
+        assert_eq!(second.unwrap(), "next");
+        assert!(read_bounded_line(&mut reader, 16).unwrap().is_none());
+        // Oversized final line without a trailing newline still errors.
+        let mut reader = Cursor::new(b"yyyyyyyyyyyyyyyyyyyyyyyy".to_vec());
+        assert!(
+            read_bounded_line(&mut reader, 16)
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn non_object_and_methodless_messages_are_invalid_requests() {
+        let repo = tempfile::tempdir().unwrap();
+        let responses = call(
+            repo.path(),
+            &[
+                r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+                r#""just a string""#,
+                r#"{"jsonrpc":"2.0","id":7}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
+            ],
+        );
+        assert_eq!(responses.len(), 4);
+        assert_eq!(responses[0]["error"]["code"], -32600);
+        assert_eq!(responses[1]["error"]["code"], -32600);
+        assert_eq!(responses[2]["error"]["code"], -32600);
+        assert_eq!(responses[2]["id"], 7, "id is echoed when present");
+        assert!(responses[3]["result"].is_object(), "session continues");
+    }
+
+    #[test]
+    fn initialize_negotiates_unknown_protocol_version_down() {
+        let repo = tempfile::tempdir().unwrap();
+        let responses = call(
+            repo.path(),
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"9999-99-99"}}"#,
+            ],
+        );
+        assert_eq!(
+            responses[0]["result"]["protocolVersion"],
+            DEFAULT_PROTOCOL_VERSION
         );
     }
 

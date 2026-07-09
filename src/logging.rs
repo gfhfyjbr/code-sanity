@@ -12,12 +12,18 @@ use std::sync::Mutex;
 struct CliLogger {
     file: Mutex<Option<File>>,
     file_level: Level,
-    stderr_level: Level,
+    /// `None` disables the stderr sink entirely: the MCP stdio server runs
+    /// with file-only logging because hosts commonly fold server stderr into
+    /// their own logs, and warn/error text can carry unredacted real terms.
+    stderr_level: Option<Level>,
 }
 
 impl Log for CliLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= self.file_level || metadata.level() <= self.stderr_level
+        metadata.level() <= self.file_level
+            || self
+                .stderr_level
+                .is_some_and(|level| metadata.level() <= level)
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -33,7 +39,10 @@ impl Log for CliLogger {
                 record.args()
             );
         }
-        if record.level() <= self.stderr_level {
+        if self
+            .stderr_level
+            .is_some_and(|level| record.level() <= level)
+        {
             eprintln!("code-sanity: {}: {}", record.level(), record.args());
         }
     }
@@ -49,7 +58,9 @@ impl Log for CliLogger {
 
 /// Install the global logger. The log file is opened only when the workspace
 /// state dir already exists; repeated calls (tests) are a no-op.
-pub fn init(layout: &crate::config::Layout, verbosity: u8) {
+/// `stderr` disables the stderr sink when false (file-only logging for the
+/// MCP stdio server — see `CliLogger::stderr_level`).
+pub fn init(layout: &crate::config::Layout, verbosity: u8, stderr: bool) {
     let (file_level, stderr_level) = match verbosity {
         0 => (Level::Info, Level::Warn),
         1 => (Level::Debug, Level::Info),
@@ -63,7 +74,7 @@ pub fn init(layout: &crate::config::Layout, verbosity: u8) {
     let logger = CliLogger {
         file: Mutex::new(file),
         file_level,
-        stderr_level,
+        stderr_level: stderr.then_some(stderr_level),
     };
     if log::set_boxed_logger(Box::new(logger)).is_ok() {
         log::set_max_level(LevelFilter::Trace);

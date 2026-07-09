@@ -230,7 +230,14 @@ pub fn run() -> Result<()> {
         }
         Err(_) => raw_root,
     };
-    crate::logging::init(&crate::config::Layout::new(&root), cli.verbose);
+    // The stdio MCP server logs file-only: hosts capture server stderr into
+    // their own logs, and warn/error lines can carry unredacted real terms.
+    let stderr_logging = !matches!(cli.command, Command::Serve { once: false });
+    crate::logging::init(
+        &crate::config::Layout::new(&root),
+        cli.verbose,
+        stderr_logging,
+    );
 
     match dispatch(cli.command, &root) {
         Ok(()) => Ok(()),
