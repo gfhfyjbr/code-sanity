@@ -170,11 +170,15 @@ enum Command {
         path: Option<PathBuf>,
     },
     /// Run a command in the real repo, sanitizing its stdout/stderr.
+    /// Exits with the wrapped command's code verbatim (the 2/3/64 exit-code
+    /// contract does not apply here).
     Sh {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         command: Vec<String>,
     },
     /// Run a command inside a sanitized worktree, sanitizing its output.
+    /// Exits with the wrapped command's code verbatim (the 2/3/64 exit-code
+    /// contract does not apply here).
     StrictRun {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         command: Vec<String>,
@@ -1393,7 +1397,15 @@ def log_line(cwd, message):
     try:
         log_dir = os.path.join(cwd, ".code-sanity", "logs")
         os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, "hooks.log"), "a", encoding="utf-8") as handle:
+        log_path = os.path.join(log_dir, "hooks.log")
+        try:
+            # Mirror the Rust logger's rotation: one .old generation at 5 MiB,
+            # so per-edit hook syncs cannot grow the log without bound.
+            if os.path.getsize(log_path) > 5 * 1024 * 1024:
+                os.replace(log_path, log_path + ".old")
+        except OSError:
+            pass
+        with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(line)
     except OSError:
         sys.stderr.write("code-sanity hook: " + line)
@@ -1473,7 +1485,15 @@ def log_line(cwd, message):
     try:
         log_dir = os.path.join(cwd, ".code-sanity", "logs")
         os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, "hooks.log"), "a", encoding="utf-8") as handle:
+        log_path = os.path.join(log_dir, "hooks.log")
+        try:
+            # Mirror the Rust logger's rotation: one .old generation at 5 MiB,
+            # so per-edit hook syncs cannot grow the log without bound.
+            if os.path.getsize(log_path) > 5 * 1024 * 1024:
+                os.replace(log_path, log_path + ".old")
+        except OSError:
+            pass
+        with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(line)
     except OSError:
         sys.stderr.write("code-sanity hook: " + line)
@@ -1613,7 +1633,15 @@ def log_line(cwd, message):
     try:
         log_dir = os.path.join(cwd, ".code-sanity", "logs")
         os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, "hooks.log"), "a", encoding="utf-8") as handle:
+        log_path = os.path.join(log_dir, "hooks.log")
+        try:
+            # Mirror the Rust logger's rotation: one .old generation at 5 MiB,
+            # so per-edit hook syncs cannot grow the log without bound.
+            if os.path.getsize(log_path) > 5 * 1024 * 1024:
+                os.replace(log_path, log_path + ".old")
+        except OSError:
+            pass
+        with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(line)
     except OSError:
         sys.stderr.write("code-sanity hook: " + line)

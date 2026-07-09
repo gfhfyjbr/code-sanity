@@ -164,8 +164,12 @@ impl OpenAiClient {
     }
 
     /// One-shot chat completion; returns the first choice's message content.
-    pub fn chat(&self, model: &str, system: &str, user: &str) -> Result<String> {
-        let body = json!({
+    /// `json_mode` additionally requests `response_format: {"type":
+    /// "json_object"}` — opt-in, because not every OpenAI-compatible gateway
+    /// accepts the parameter (the caller's fence-stripping remains the
+    /// fallback either way).
+    pub fn chat(&self, model: &str, system: &str, user: &str, json_mode: bool) -> Result<String> {
+        let mut body = json!({
             "model": model,
             "messages": [
                 { "role": "system", "content": system },
@@ -173,6 +177,9 @@ impl OpenAiClient {
             ],
             "temperature": 0,
         });
+        if json_mode {
+            body["response_format"] = json!({ "type": "json_object" });
+        }
         let value = self.post("/chat/completions", &body)?;
         // A length-truncated reply would otherwise surface as a baffling
         // JSON-parse error on a half-emitted proposal batch.

@@ -150,6 +150,7 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
         model: "test-model".to_string(),
         api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
         timeout_secs: Some(10),
+        json_mode: false,
     };
     config.save(&layout).unwrap();
 
@@ -193,6 +194,48 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
 }
 
 #[test]
+fn json_mode_sends_response_format_opt_in() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("lib.rs"), "fn megacorp_helper() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let saw_response_format = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&saw_response_format);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
+        if request["response_format"]["type"] == "json_object" {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        chat_response("{\"proposals\":[]}")
+    }));
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(10),
+        json_mode: true,
+    };
+    config.save(&layout).unwrap();
+
+    propose_sanitize(
+        repo.path(),
+        Some(Path::new("lib.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        saw_response_format.load(Ordering::SeqCst),
+        1,
+        "json_mode = true must send response_format"
+    );
+}
+
+#[test]
 fn openrouter_preset_routes_through_the_same_gate_and_client() {
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(repo.path().join("lib.rs"), "fn megacorp_helper() {}\n").unwrap();
@@ -218,6 +261,7 @@ fn openrouter_preset_routes_through_the_same_gate_and_client() {
         base_url: Some(base_url.clone()),
         api_key_env: Some("CODE_SANITY_TEST_KEY_UNSET".to_string()),
         timeout_secs: Some(10),
+        json_mode: false,
     };
     config.save(&layout).unwrap();
 
@@ -502,6 +546,7 @@ fn provider_error_on_one_file_does_not_abort_the_run() {
         model: "test-model".to_string(),
         api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
         timeout_secs: Some(5),
+        json_mode: false,
     };
     config.save(&layout).unwrap();
 
@@ -548,6 +593,7 @@ fn oversized_files_are_skipped_with_a_note() {
         model: "test-model".to_string(),
         api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
         timeout_secs: Some(5),
+        json_mode: false,
     };
     config.save(&layout).unwrap();
 
@@ -597,6 +643,7 @@ fn truncated_chat_reply_is_a_clear_error_not_a_parse_failure() {
         model: "test-model".to_string(),
         api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
         timeout_secs: Some(5),
+        json_mode: false,
     };
     config.save(&layout).unwrap();
 

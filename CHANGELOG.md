@@ -45,6 +45,37 @@ contracts.
 
 ### Added
 
+- **`--json`: a machine-readable output contract.** Every command except
+  `sh`/`strict-run`/`serve` prints exactly one compact JSON envelope on
+  stdout (`{ok, command, data, elapsed_ms?}` / `{ok, command, error: {kind,
+  message, …}}`) with `error.kind` conflict/verify_failed/error mapping onto
+  the unchanged exit codes. stderr stays human diagnostics; consumers must
+  ignore unknown fields. `sh`/`strict-run` refuse the flag (exit 64) — their
+  stdout and exit code belong to the wrapped command.
+- **MCP session robustness**: a non-UTF-8 or oversized (>16 MiB) request line
+  is answered with `-32700` and the session continues instead of the server
+  exiting; non-object messages and missing `method` get `-32600`;
+  `initialize` negotiates the protocol version against the supported list
+  instead of echoing arbitrary client strings. The stdio server now logs
+  file-only (hosts capture server stderr, and warn lines could carry real
+  terms).
+- **Journal retention**: `journal.max_entries` (default 500, `0` =
+  unlimited) prunes the oldest terminal journal entries and `patch_journal`
+  rows after each successful apply. In-flight entries and unparseable files
+  are never pruned.
+- Config numeric validation: `confidence_threshold` outside `[0, 1]`,
+  zero `propose_max_file_bytes`/`ignore.max_file_bytes`, and degenerate
+  embedding chunk parameters are policy violations with fix-it messages.
+- A corrupt `db.sqlite` now names the remedy (delete the derived database,
+  re-run `index`) instead of a raw "database disk image is malformed".
+- Network-filesystem warning: the workspace flock is advisory-only across
+  hosts on NFS/SMB/CIFS; a best-effort statfs check logs a warning when the
+  lock sits on one (see the new THREAT_MODEL entry).
+- `json_mode` (opt-in, per LLM provider config): sends
+  `response_format: {"type": "json_object"}` with proposal chat requests;
+  fence-stripping remains the fallback.
+- The generated agent hooks rotate `.code-sanity/logs/hooks.log` at 5 MiB
+  (one `.old` generation), mirroring the Rust logger.
 - `apply-patch --dry-run` (CLI) and `dry_run` (MCP `apply_patch`): the full
   parse/translate/conflict pipeline with zero writes; conflicts still exit 2.
 - `sanitizer.propose_max_file_bytes` (default 192 KiB): files larger than the

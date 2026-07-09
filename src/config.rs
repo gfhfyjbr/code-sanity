@@ -188,6 +188,11 @@ pub enum ProviderConfig {
         api_key_env: String,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Send `response_format: {"type": "json_object"}` with chat requests.
+        /// Off by default: not every OpenAI-compatible gateway accepts the
+        /// parameter, and fence-stripping already handles prose-wrapped JSON.
+        #[serde(default)]
+        json_mode: bool,
     },
     /// OpenRouter preset: the same wire protocol as `llm`, with `base_url`
     /// defaulting to the OpenRouter API and `api_key_env` to
@@ -201,6 +206,8 @@ pub enum ProviderConfig {
         api_key_env: Option<String>,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        #[serde(default)]
+        json_mode: bool,
     },
     /// Local kou-router gateway preset: `base_url` defaults to
     /// `http://127.0.0.1:20128/v1` and `api_key_env` to KOU_ROUTER_API_KEY.
@@ -214,6 +221,8 @@ pub enum ProviderConfig {
         api_key_env: Option<String>,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        #[serde(default)]
+        json_mode: bool,
     },
 }
 
@@ -229,6 +238,8 @@ pub struct LlmEndpoint {
     pub model: String,
     pub api_key_env: String,
     pub timeout_secs: u64,
+    /// Ask the endpoint for strict-JSON output (`response_format`); opt-in.
+    pub json_mode: bool,
 }
 
 impl ProviderConfig {
@@ -241,17 +252,20 @@ impl ProviderConfig {
                 model,
                 api_key_env,
                 timeout_secs,
+                json_mode,
             } => Some(LlmEndpoint {
                 base_url: base_url.clone(),
                 model: model.clone(),
                 api_key_env: api_key_env.clone(),
                 timeout_secs: timeout_secs.unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
+                json_mode: *json_mode,
             }),
             ProviderConfig::Openrouter {
                 model,
                 base_url,
                 api_key_env,
                 timeout_secs,
+                json_mode,
             } => Some(LlmEndpoint {
                 base_url: base_url
                     .clone()
@@ -261,12 +275,14 @@ impl ProviderConfig {
                     .clone()
                     .unwrap_or_else(default_embeddings_api_key_env),
                 timeout_secs: timeout_secs.unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
+                json_mode: *json_mode,
             }),
             ProviderConfig::KouRouter {
                 model,
                 base_url,
                 api_key_env,
                 timeout_secs,
+                json_mode,
             } => Some(LlmEndpoint {
                 base_url: base_url
                     .clone()
@@ -274,6 +290,7 @@ impl ProviderConfig {
                 model: model.clone(),
                 api_key_env: api_key_env.clone().unwrap_or_else(default_llm_api_key_env),
                 timeout_secs: timeout_secs.unwrap_or(DEFAULT_LLM_TIMEOUT_SECS),
+                json_mode: *json_mode,
             }),
             ProviderConfig::Stub
             | ProviderConfig::External { .. }
@@ -667,6 +684,7 @@ mod tests {
             base_url: None,
             api_key_env: None,
             timeout_secs: None,
+            json_mode: false,
         };
         config.save(&layout).unwrap();
         let reloaded = Config::load_or_default(&layout).unwrap();

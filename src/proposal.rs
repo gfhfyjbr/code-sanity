@@ -29,6 +29,10 @@ pub struct Proposal {
     pub category: String,
     pub original_text: String,
     pub sanitized_text: String,
+    /// The provider's self-reported confidence in [0, 1]. Untrusted by
+    /// design: it only decides whether the review item is flagged for extra
+    /// scrutiny (below `sanitizer.confidence_threshold`), never whether a
+    /// proposal is applied — every proposal goes through human review.
     #[serde(default)]
     pub confidence: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -221,6 +225,9 @@ impl ProposalProvider for HeuristicProposalProvider {
 pub struct LlmProposalProvider {
     pub client: crate::llm::OpenAiClient,
     pub model: String,
+    /// Request strict-JSON output from the endpoint (`response_format`);
+    /// opt-in via the provider config's `json_mode` key.
+    pub json_mode: bool,
 }
 
 const LLM_SYSTEM_PROMPT: &str = "You review source code for terms that could \
@@ -256,7 +263,9 @@ impl ProposalProvider for LlmProposalProvider {
             "allowlist": config.sanitizer.allowlist,
             "already_mapped": already_mapped,
         }))?;
-        let reply = self.client.chat(&self.model, LLM_SYSTEM_PROMPT, &user)?;
+        let reply = self
+            .client
+            .chat(&self.model, LLM_SYSTEM_PROMPT, &user, self.json_mode)?;
         parse_proposals(strip_code_fences(&reply))
     }
 }
@@ -289,11 +298,19 @@ fn parse_proposals(raw: &str) -> Result<Vec<Proposal>> {
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    if let Ok(batch) = serde_json::from_str::<ProposalBatch>(trimmed) {
-        return Ok(batch.proposals);
-    }
-    serde_json::from_str::<Vec<Proposal>>(trimmed)
-        .context("parse proposals (expected a ProposalBatch or a proposal array)")
+    let batch_err = match serde_json::from_str::<ProposalBatch>(trimmed) {
+        Ok(batch) => return Ok(batch.proposals),
+        Err(err) => err,
+    };
+    // Report BOTH failures: the batch shape is what providers are told to
+    // emit, so swallowing its error left only the (less relevant) array
+    // error to debug a near-miss batch against.
+    serde_json::from_str::<Vec<Proposal>>(trimmed).map_err(|array_err| {
+        anyhow!(
+            "parse proposals: not a ProposalBatch ({batch_err}) and not a \
+             proposal array ({array_err})"
+        )
+    })
 }
 
 /// Explicit human confirmations for providers that leave the process: External
@@ -324,6 +341,7 @@ fn provider_for(config: &Config, allow: ProviderAllow) -> Result<Box<dyn Proposa
                 endpoint.timeout_secs,
             )?,
             model: endpoint.model,
+            json_mode: endpoint.json_mode,
         }));
     }
     match &config.sanitizer.provider {
