@@ -323,6 +323,29 @@ fn plan_modify(
     };
     let patched_original = apply_file_patch_to_content(&real_content, &original_file_patch)
         .with_context(|| format!("apply translated patch to {rel_string}"))?;
+    // The patch must not introduce an alias word into REAL content (typically
+    // via prose/comment runs that reverse mapping deliberately leaves
+    // verbatim): the post-apply mirror would be ambiguous and the reindex of
+    // this file would refuse, stranding the workspace mid-apply. Conflict now.
+    let terms_after = crate::sanitize::term_table(config);
+    if let Some(collision) =
+        crate::sanitize::alias_collisions(&patched_original, &terms_after).first()
+    {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            &render_file_patch(&original_file_patch),
+            files,
+            format!(
+                "{rel_string}: patch would introduce alias word {:?} (alias of {:?}) into the \
+                 real file; the sanitized view would be ambiguous — use a different word or \
+                 change the alias in .code-sanity/config.toml",
+                collision.word, collision.term
+            ),
+        );
+    }
     // Sanitize with the protected union that will hold AFTER this file lands,
     // exactly what the post-apply reindex of this file will use.
     let fresh_protected = collect_protected_identifiers(&patched_original);
@@ -406,6 +429,24 @@ fn plan_create(
 
     let created = created_content_from_patch(file_patch)
         .with_context(|| format!("build created content for {rel_string}"))?;
+    // Same ambiguity guard as plan_modify: a created file containing an alias
+    // word would make its own mirror ambiguous.
+    let terms_after = crate::sanitize::term_table(config);
+    if let Some(collision) = crate::sanitize::alias_collisions(&created, &terms_after).first() {
+        return write_conflict_and_bail(
+            layout,
+            conn,
+            options,
+            patch_text,
+            original_patch,
+            files,
+            format!(
+                "{rel_string}: created file contains alias word {:?} (alias of {:?}); the \
+                 sanitized view would be ambiguous — use a different word or change the alias",
+                collision.word, collision.term
+            ),
+        );
+    }
     // A created file's patch is written against the mirror, so the added lines
     // become the real file directly. The real repo stays the source of truth,
     // so the new file must already be neutral: sanitize(real) must equal the
@@ -696,6 +737,21 @@ pub fn rename_alias(
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     let conn = db::connect(&layout)?;
     db::ensure_schema(&conn)?;
+
+    // Renaming a real identifier TO a configured alias would collide the
+    // moment this file is reindexed (ambiguous mirror): refuse up front.
+    let config_for_rename = Config::load_or_default(&layout)?;
+    let to_normalized = crate::sanitize::normalize_term(to);
+    if let Some(term) = crate::sanitize::term_table(&config_for_rename)
+        .iter()
+        .find(|term| crate::sanitize::normalize_term(&term.replacement) == to_normalized)
+    {
+        bail!(
+            "{to:?} is already the alias of term {:?} ({}); pick a different name",
+            term.raw,
+            term.policy_source
+        );
+    }
 
     let rel = normalize_sanitized_rel_path(rel_path)?;
     let rel_string = normalize_rel_path(&rel);
@@ -2383,17 +2439,21 @@ mod tests {
     }
 
     #[test]
-    fn rename_resolves_alias_via_span_map_not_first_textual_occurrence() {
+    fn rename_resolves_alias_via_span_map() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        // The alias word "client" (dictionary: acme -> client) appears in a
-        // plain string BEFORE the aliased identifier; rename must target the
-        // real symbol behind the alias, not the first textual match.
+        // "clientele" shares a prefix with the alias but is a different word
+        // run; rename must target the real symbol behind the alias only.
         std::fs::write(
             repo.path().join("src/a.rs"),
-            "const S: &str = \"client says\";\nfn acme() -> usize {\n    1\n}\n",
+            "const S: &str = \"clientele says\";\nfn acme() -> usize {\n    1\n}\n",
         )
         .unwrap();
+        let layout = crate::index::init_workspace(repo.path()).unwrap();
+        let mut config = Config::load_or_default(&layout).unwrap();
+        config.sanitizer.dictionary =
+            std::collections::BTreeMap::from([("acme".to_string(), "client".to_string())]);
+        config.save(&layout).unwrap();
         crate::index::index_workspace(repo.path()).unwrap();
         rename_alias(
             repo.path(),
@@ -2405,36 +2465,71 @@ mod tests {
         .unwrap();
         let real = std::fs::read_to_string(repo.path().join("src/a.rs")).unwrap();
         assert!(real.contains("fn fetcher()"), "{real}");
-        assert!(real.contains("\"client says\""), "{real}");
+        assert!(real.contains("\"clientele says\""), "{real}");
         assert!(crate::verify::verify_workspace(repo.path()).is_ok());
     }
 
     #[test]
-    fn rename_refuses_an_ambiguous_alias() {
+    fn index_fails_when_real_repo_contains_alias_word() {
+        // The old ambiguity: dictionary acme -> client while the repo itself
+        // contains the word "client". This is now a hard collision error at
+        // index time (naming term, alias, and colliding word), not a silently
+        // ambiguous mirror.
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
         std::fs::write(
             repo.path().join("src/a.rs"),
-            "fn acme() {}\nfn corpx() {}\n",
+            "const S: &str = \"client says\";\nfn acme() -> usize {\n    1\n}\n",
         )
         .unwrap();
+        let layout = crate::index::init_workspace(repo.path()).unwrap();
+        let mut config = Config::load_or_default(&layout).unwrap();
+        config.sanitizer.dictionary =
+            std::collections::BTreeMap::from([("acme".to_string(), "client".to_string())]);
+        config.save(&layout).unwrap();
+        let err = crate::index::index_workspace(repo.path()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("client"), "{message}");
+        assert!(message.contains("acme"), "{message}");
+        assert!(message.contains("ambiguous"), "{message}");
+    }
+
+    #[test]
+    fn non_injective_registry_is_refused_at_save() {
+        // Two terms -> one alias used to be caught only at rename time (the
+        // runtime "ambiguous" bail is now an unreached defense); config.save
+        // refuses to persist it in the first place.
+        let repo = tempfile::tempdir().unwrap();
         let layout = crate::index::init_workspace(repo.path()).unwrap();
         let mut config = Config::load_or_default(&layout).unwrap();
         config.sanitizer.dictionary = std::collections::BTreeMap::from([
             ("acme".to_string(), "shared".to_string()),
             ("corpx".to_string(), "shared".to_string()),
         ]);
+        let err = config.save(&layout).unwrap_err();
+        assert!(format!("{err:#}").contains("used for both"), "{err:#}");
+    }
+
+    #[test]
+    fn rename_target_must_not_be_an_existing_alias() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "fn acme() {}\nfn util() {}\n").unwrap();
+        let layout = crate::index::init_workspace(repo.path()).unwrap();
+        let mut config = Config::load_or_default(&layout).unwrap();
+        config.sanitizer.dictionary =
+            std::collections::BTreeMap::from([("acme".to_string(), "gadget".to_string())]);
         config.save(&layout).unwrap();
         crate::index::index_workspace(repo.path()).unwrap();
         let err = rename_alias(
             repo.path(),
             Path::new("src/a.rs"),
-            "shared",
-            "renamed",
+            "util",
+            "gadget",
             ApplyOptions::default(),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("ambiguous"), "{err:#}");
+        assert!(format!("{err:#}").contains("already the alias"), "{err:#}");
     }
 
     proptest::proptest! {

@@ -17,6 +17,19 @@ fn copy_fixture(name: &str) -> TempDir {
     temp
 }
 
+/// The workspace's actual alias for `term`. Default aliases carry a suffix
+/// derived from the per-workspace random salt (`neutral_3fd1`-style), so
+/// tests read the mapping instead of hardcoding a spelling.
+fn alias_of(repo: &Path, term: &str) -> String {
+    code_sanity::Config::load_or_default(&code_sanity::Layout::new(repo))
+        .unwrap()
+        .sanitizer
+        .dictionary
+        .get(term)
+        .cloned()
+        .unwrap_or_else(|| panic!("{term} is not in the workspace dictionary"))
+}
+
 fn python3_bin() -> Option<&'static str> {
     for candidate in ["python3", "python"] {
         let ok = std::process::Command::new(candidate)
@@ -83,15 +96,16 @@ fn index_read_search_and_ignore_rules_work() {
     assert_eq!(repeat.indexed, 0);
     assert!(repeat.unchanged >= 2);
 
+    let alias = alias_of(repo.path(), "dangerous");
     let sanitized = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(sanitized.contains("neutral comment"));
-    assert!(sanitized.contains("fn neutral_parser()"));
+    assert!(sanitized.contains(&format!("{alias} comment")));
+    assert!(sanitized.contains(&format!("fn {alias}_parser()")));
     // Terms are sanitized in every string literal, not only test fixtures.
-    assert!(sanitized.contains("\"neutral runtime string should stay real\""));
-    assert!(sanitized.contains("\"neutral fixture text\""));
+    assert!(sanitized.contains(&format!("\"{alias} runtime string should stay real\"")));
+    assert!(sanitized.contains(&format!("\"{alias} fixture text\"")));
     assert!(!sanitized.to_lowercase().contains("dangerous"));
 
-    let hits = search_mirror(repo.path(), "neutral_parser", None).unwrap();
+    let hits = search_mirror(repo.path(), &format!("{alias}_parser"), None).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].rel_path, "src/lib.rs");
 
@@ -114,6 +128,7 @@ fn span_map_records_utf8_offsets_and_roundtrips_aliases() {
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     let mirror = fs::read_to_string(repo.path().join(".code-sanity/mirror/src/lib.rs")).unwrap();
 
+    let alias = alias_of(repo.path(), "dangerous");
     let replacement = span_map
         .replacements
         .iter()
@@ -125,9 +140,9 @@ fn span_map_records_utf8_offsets_and_roundtrips_aliases() {
     );
     assert_eq!(
         &mirror[replacement.sanitized_start..replacement.sanitized_end],
-        "neutral"
+        alias
     );
-    assert_eq!(replacement.sanitized_text, "neutral");
+    assert_eq!(replacement.sanitized_text, alias);
 }
 
 #[test]
@@ -177,22 +192,23 @@ fn empty_search_and_grep_return_clear_error() {
 fn apply_patch_outside_replacement_updates_real_and_mirror() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
-    let patch = "\
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -2,3 +2,3 @@
- fn neutral_parser() -> usize {
--    1
-+    2
- }
-";
-    let report = apply_patch_text(repo.path(), patch).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
+    let patch = format!(
+        "--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n\
+         @@ -2,3 +2,3 @@\n \
+         fn {alias}_parser() -> usize {{\n\
+         -    1\n\
+         +    2\n \
+         }}\n"
+    );
+    let report = apply_patch_text(repo.path(), &patch).unwrap();
     assert_eq!(report.files, vec!["src/lib.rs"]);
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("fn dangerous_parser() -> usize"));
     assert!(real.contains("    2"));
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror.contains("fn neutral_parser() -> usize"));
+    assert!(mirror.contains(&format!("fn {alias}_parser() -> usize")));
     assert!(mirror.contains("    2"));
     assert!(verify_workspace(repo.path()).is_ok());
 }
@@ -201,44 +217,46 @@ fn apply_patch_outside_replacement_updates_real_and_mirror() {
 fn apply_patch_adjacent_to_replacement_keeps_original_alias() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
-    let patch = "\
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -2,1 +2,1 @@
--fn neutral_parser() -> usize {
-+fn neutral_parser(input: usize) -> usize {
-";
-    apply_patch_text(repo.path(), patch).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
+    let patch = format!(
+        "--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n\
+         @@ -2,1 +2,1 @@\n\
+         -fn {alias}_parser() -> usize {{\n\
+         +fn {alias}_parser(input: usize) -> usize {{\n"
+    );
+    apply_patch_text(repo.path(), &patch).unwrap();
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("fn dangerous_parser(input: usize) -> usize"));
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror.contains("fn neutral_parser(input: usize) -> usize"));
+    assert!(mirror.contains(&format!("fn {alias}_parser(input: usize) -> usize")));
 }
 
 #[test]
 fn apply_patch_reverse_maps_bare_alias_in_added_line() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
-    let patch = "\
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -2,3 +2,4 @@
- fn neutral_parser() -> usize {
-+    let neutral = 10;
-     1
- }
-";
-    apply_patch_text(repo.path(), patch).unwrap();
-    // In mirror-speak "neutral" IS "dangerous": one symbol, one decision. The
+    let alias = alias_of(repo.path(), "dangerous");
+    let patch = format!(
+        "--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n\
+         @@ -2,3 +2,4 @@\n \
+         fn {alias}_parser() -> usize {{\n\
+         +    let {alias} = 10;\n     \
+         1\n \
+         }}\n"
+    );
+    apply_patch_text(repo.path(), &patch).unwrap();
+    // In mirror-speak the alias IS "dangerous": one symbol, one decision. The
     // added alias is reverse-mapped in the real file and re-sanitized back in
     // the mirror, so both views stay byte-consistent.
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("fn dangerous_parser() -> usize"));
     assert!(real.contains("let dangerous = 10;"));
-    assert!(!real.contains("let neutral = 10;"));
+    assert!(!real.contains(&format!("let {alias} = 10;")));
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror.contains("fn neutral_parser() -> usize"));
-    assert!(mirror.contains("let neutral = 10;"));
+    assert!(mirror.contains(&format!("fn {alias}_parser() -> usize")));
+    assert!(mirror.contains(&format!("let {alias} = 10;")));
     assert!(verify_workspace(repo.path()).is_ok());
 }
 
@@ -246,26 +264,27 @@ fn apply_patch_reverse_maps_bare_alias_in_added_line() {
 fn apply_patch_reverse_maps_alias_call_in_added_line() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
     // The agent adds a call to the alias it sees in the mirror; the real file
     // must call the real function, not the (nonexistent) alias.
-    let patch = "\
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -6,3 +6,7 @@
- fn safe_helper() -> &'static str {
-     \"neutral runtime string should stay real\"
- }
-+
-+fn call_it() -> usize {
-+    neutral_parser()
-+}
-";
-    apply_patch_text(repo.path(), patch).unwrap();
+    let patch = format!(
+        "--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n\
+         @@ -6,3 +6,7 @@\n \
+         fn safe_helper() -> &'static str {{\n     \
+         \"{alias} runtime string should stay real\"\n \
+         }}\n\
+         +\n\
+         +fn call_it() -> usize {{\n\
+         +    {alias}_parser()\n\
+         +}}\n"
+    );
+    apply_patch_text(repo.path(), &patch).unwrap();
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("dangerous_parser()"));
-    assert!(!real.contains("neutral_parser()"));
+    assert!(!real.contains(&format!("{alias}_parser()")));
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror.contains("neutral_parser()"));
+    assert!(mirror.contains(&format!("{alias}_parser()")));
     assert!(!mirror.to_lowercase().contains("dangerous"));
     assert!(verify_workspace(repo.path()).is_ok());
 }
@@ -274,21 +293,19 @@ fn apply_patch_reverse_maps_alias_call_in_added_line() {
 fn apply_patch_leaves_innocent_alias_containing_identifier_alone() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
-    // "neutralize_input" contains the alias "neutral" as a subword, but
-    // reversing it would not roundtrip (sanitize("dangerousize_input") is
-    // "neutralize_input" only if the reversal was exact); the run-level
-    // roundtrip filter must keep innocent identifiers untouched when
-    // reversing them is not byte-stable both ways.
-    let patch = "\
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -2,3 +2,4 @@
- fn neutral_parser() -> usize {
-+    let count_things = 10;
-     1
- }
-";
-    apply_patch_text(repo.path(), patch).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
+    // An added identifier that is NOT an alias word must land verbatim in the
+    // real file — the reverse mapper only fires on whole-run alias matches.
+    let patch = format!(
+        "--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n\
+         @@ -2,3 +2,4 @@\n \
+         fn {alias}_parser() -> usize {{\n\
+         +    let count_things = 10;\n     \
+         1\n \
+         }}\n"
+    );
+    apply_patch_text(repo.path(), &patch).unwrap();
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("let count_things = 10;"));
     assert!(verify_workspace(repo.path()).is_ok());
@@ -493,7 +510,8 @@ fn sync_repairs_external_real_edit() {
     index_workspace(repo.path()).unwrap();
     assert!(verify_workspace(repo.path()).is_ok());
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror.contains("neutral external edit"));
+    let alias = alias_of(repo.path(), "dangerous");
+    assert!(mirror.contains(&format!("{alias} external edit")));
 }
 
 #[test]
@@ -662,10 +680,11 @@ fn rename_alias_renames_real_symbol() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
 
+    let alias = alias_of(repo.path(), "dangerous");
     let report = code_sanity::rename_alias(
         repo.path(),
         Path::new("src/lib.rs"),
-        "neutral_parser",
+        &format!("{alias}_parser"),
         "friendly_parser",
         code_sanity::patch::ApplyOptions::default(),
     )
@@ -776,7 +795,8 @@ fn opencode_bridge_projects_mirror_edit_to_real() {
     assert!(real.contains("    3"));
     assert!(real.contains("fn dangerous_parser()")); // real name preserved
     let mirror_after = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror_after.contains("fn neutral_parser()"));
+    let alias = alias_of(repo.path(), "dangerous");
+    assert!(mirror_after.contains(&format!("fn {alias}_parser()")));
     assert!(mirror_after.contains("    3"));
     assert!(verify_workspace(repo.path()).is_ok());
 }
@@ -790,8 +810,10 @@ fn opencode_bridge_conflicts_on_replacement_span_edit() {
 
     // Edit inside a replacement span (rename the alias itself) via a raw mirror
     // edit; the bridge must refuse and leave the real file untouched.
+    let alias = alias_of(repo.path(), "dangerous");
     let mirror = fs::read_to_string(&mirror_path).unwrap();
-    let edited = mirror.replace("neutral_parser", "pleasant_parser");
+    let edited = mirror.replace(&format!("{alias}_parser"), "pleasant_parser");
+    assert_ne!(mirror, edited);
     fs::write(&mirror_path, &edited).unwrap();
 
     let err = code_sanity::project_mirror_edit(
@@ -840,15 +862,16 @@ fn mcp_server_reads_sanitized_and_applies_patch() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
 
-    let patch = "\
---- a/src/lib.rs
-+++ b/src/lib.rs
-@@ -2,3 +2,3 @@
- fn neutral_parser() -> usize {
--    1
-+    2
- }
-";
+    let alias = alias_of(repo.path(), "dangerous");
+    let patch = format!(
+        "--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n\
+         @@ -2,3 +2,3 @@\n \
+         fn {alias}_parser() -> usize {{\n\
+         -    1\n\
+         +    2\n \
+         }}\n"
+    );
     let requests = [
         json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
             "params":{"name":"read_file","arguments":{"path":"src/lib.rs"}}}),
@@ -881,7 +904,7 @@ fn mcp_server_reads_sanitized_and_applies_patch() {
     let read_text = responses[0]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(read_text.contains("fn neutral_parser()"));
+    assert!(read_text.contains(&format!("fn {alias}_parser()")));
     assert!(!read_text.contains("dangerous_parser"));
     assert_eq!(responses[0]["result"]["isError"], false);
 
@@ -1300,7 +1323,10 @@ fn review_sanitize_reports_applied_replacements() {
         .args(["--root", repo.path().to_str().unwrap(), "review-sanitize"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("dangerous -> neutral"))
+        .stdout(predicate::str::contains(format!(
+            "dangerous -> {}",
+            alias_of(repo.path(), "dangerous")
+        )))
         .stdout(predicate::str::contains("static-dictionary"));
 }
 
@@ -1323,7 +1349,10 @@ fn strict_sh_sanitizes_command_output() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("neutral_parser"))
+        .stdout(predicate::str::contains(format!(
+            "{}_parser",
+            alias_of(repo.path(), "dangerous")
+        )))
         .stdout(predicate::str::contains("dangerous").not());
 }
 
@@ -1346,7 +1375,10 @@ fn strict_run_reads_sanitized_worktree() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("fn neutral_parser()"))
+        .stdout(predicate::str::contains(format!(
+            "fn {}_parser()",
+            alias_of(repo.path(), "dangerous")
+        )))
         .stdout(predicate::str::contains("dangerous_parser").not());
 }
 
@@ -1386,7 +1418,8 @@ fn strict_sh_streams_output_before_command_finishes() {
     let line = rx
         .recv_timeout(Duration::from_secs(3))
         .expect("no output within 3s; strict sh is not streaming");
-    assert!(line.contains("neutral_parser"), "line: {line}");
+    let alias = alias_of(repo.path(), "dangerous");
+    assert!(line.contains(&format!("{alias}_parser")), "line: {line}");
     assert!(!line.contains("dangerous"));
     child.kill().ok();
     child.wait().ok();
@@ -1433,6 +1466,7 @@ fn cli_index_read_search_verify_smoke() {
         .success()
         .stdout(predicate::str::contains("indexed="));
 
+    let alias = alias_of(repo.path(), "dangerous");
     Command::cargo_bin("code-sanity")
         .unwrap()
         .args([
@@ -1443,7 +1477,7 @@ fn cli_index_read_search_verify_smoke() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("neutral_parser"));
+        .stdout(predicate::str::contains(format!("{alias}_parser")));
 
     Command::cargo_bin("code-sanity")
         .unwrap()
@@ -1451,7 +1485,7 @@ fn cli_index_read_search_verify_smoke() {
             "--root",
             repo.path().to_str().unwrap(),
             "grep",
-            "neutral_parser",
+            &format!("{alias}_parser"),
         ])
         .assert()
         .success()
@@ -1476,8 +1510,12 @@ fn crlf_file_roundtrips_through_the_patch_bridge() {
     )
     .unwrap();
     index_workspace(repo.path()).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
     let mirror = read_sanitized_file(repo.path(), Path::new("src/win.rs")).unwrap();
-    assert!(mirror.contains("// neutral note\r\n"), "{mirror:?}");
+    assert!(
+        mirror.contains(&format!("// {alias} note\r\n")),
+        "{mirror:?}"
+    );
 
     // Whole-file write through the bridge: edit one line of the mirror.
     let edited = mirror.replace("    1\r\n", "    2\r\n");
@@ -1515,16 +1553,17 @@ fn diff_u0_insertion_lands_after_the_anchor_line() {
 }
 
 #[test]
-fn added_comment_and_string_with_alias_words_stay_verbatim_in_real_file() {
+fn added_prose_comment_stays_verbatim_in_real_file() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    // Add a comment and a string that mention the alias word "neutral"
-    // (dictionary: dangerous -> neutral) as plain language. Reverse mapping
-    // must not rewrite prose into the real term "dangerous".
+    // Plain-language words (including the alias STEM "neutral", which under
+    // synthetic defaults is not an alias by itself) must land verbatim in the
+    // real file — reverse mapping never rewrites prose.
     let edited = mirror.replace(
-        "fn neutral_parser()",
-        "// stay neutral here\nfn neutral_parser()",
+        &format!("fn {alias}_parser()"),
+        &format!("// stay neutral here\nfn {alias}_parser()"),
     );
     assert_ne!(mirror, edited);
     write_sanitized_content(repo.path(), Path::new("src/lib.rs"), &edited).unwrap();
@@ -1533,6 +1572,38 @@ fn added_comment_and_string_with_alias_words_stay_verbatim_in_real_file() {
         real.contains("// stay neutral here"),
         "comment was reverse-mapped into a real term: {real}"
     );
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn added_prose_containing_the_exact_alias_conflicts() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
+    let real_before = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    // Prose is never reverse-mapped, so the EXACT alias in a comment would
+    // land verbatim in the real file and make the mirror ambiguous. The
+    // bridge must refuse with a collision conflict, not write it.
+    let edited = mirror.replace(
+        &format!("fn {alias}_parser()"),
+        &format!("// see {alias} for details\nfn {alias}_parser()"),
+    );
+    assert_ne!(mirror, edited);
+    let err = write_sanitized_content(repo.path(), Path::new("src/lib.rs"), &edited).unwrap_err();
+    let chain = format!("{err:#}");
+    assert!(chain.contains("ambiguous"), "{chain}");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+        real_before,
+        "real file must stay untouched on conflict"
+    );
+    // Recovery: the conflict left the mirror holding the refused edit; reset.
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", repo.path().to_str().unwrap(), "sync", "--force"])
+        .assert()
+        .success();
     assert!(verify_workspace(repo.path()).is_ok());
 }
 
@@ -1568,8 +1639,9 @@ fn disjoint_whole_file_edits_straddling_an_alias_apply_without_conflict() {
     )
     .unwrap();
     index_workspace(repo.path()).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror.contains("neutral_parser"));
+    assert!(mirror.contains(&format!("{alias}_parser")));
     // Two disjoint edits, one above and one below the alias line.
     let edited = mirror.replacen("    1\n", "    10\n", 1);
     let pos = edited.rfind("    1\n").unwrap();
@@ -1581,5 +1653,146 @@ fn disjoint_whole_file_edits_straddling_an_alias_apply_without_conflict() {
     assert!(real.contains("    10\n"), "{real}");
     assert!(real.contains("    20\n"), "{real}");
     assert!(real.contains("fn dangerous_parser() {}"), "{real}");
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn added_common_word_is_not_reverse_mapped_under_synthetic_defaults() {
+    // THE reproduced audit scenario: repo has `fn acme_handler`, agent adds
+    // `let client = 5;`. Under the old defaults (acme -> client) the reverse
+    // mapper rewrote it to `let acme = 5;` — silent corruption. Synthetic
+    // default aliases (client_xxxx) leave the plain English word alone.
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("src/a.rs"),
+        "fn acme_handler() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+    let alias = alias_of(repo.path(), "acme");
+    let mirror = read_sanitized_file(repo.path(), Path::new("src/a.rs")).unwrap();
+    assert!(mirror.contains(&format!("{alias}_handler")), "{mirror}");
+
+    let patch = format!(
+        "--- a/src/a.rs\n\
+         +++ b/src/a.rs\n\
+         @@ -1,3 +1,4 @@\n \
+         fn {alias}_handler() -> usize {{\n\
+         +    let client = 5;\n     \
+         1\n \
+         }}\n"
+    );
+    apply_patch_text(repo.path(), &patch).unwrap();
+    let real = fs::read_to_string(repo.path().join("src/a.rs")).unwrap();
+    assert!(
+        real.contains("let client = 5;"),
+        "agent's plain word was rewritten: {real}"
+    );
+    assert!(!real.contains("let acme = 5;"), "{real}");
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn verify_lists_config_violations_and_content_collisions() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("src/a.rs"),
+        "fn acme_handler() {}\nlet gadget = 1;\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // Hand-break the persisted config: a multi-token denylist term AND an
+    // alias colliding with real content (config.save would refuse these, so
+    // edit the TOML directly like a human would).
+    let config_path = repo.path().join(".code-sanity/config.toml");
+    let body = fs::read_to_string(&config_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.starts_with("acme = ") {
+                "acme = \"gadget\"".to_string()
+            } else if line.starts_with("denylist = ") {
+                "denylist = [\"secret.internal.key\"]".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&config_path, body).unwrap();
+
+    // Mutating commands refuse the broken config outright...
+    let err = index_workspace(repo.path()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("secret.internal.key"),
+        "{err:#}"
+    );
+
+    // ...while verify (exit 3) LISTS everything: the unmatchable term and the
+    // alias-vs-content collision.
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("code-sanity"))
+        .arg("--root")
+        .arg(repo.path())
+        .arg("verify")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("secret.internal.key"), "stderr: {stderr}");
+    assert!(stderr.contains("gadget"), "stderr: {stderr}");
+    assert!(stderr.contains("ambiguous"), "stderr: {stderr}");
+}
+
+#[test]
+fn resolve_review_refuses_alias_that_occurs_elsewhere_in_repo() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(repo.path().join("src/a.rs"), "fn shadowfax_launch() {}\n").unwrap();
+    // The proposed alias occurs in ANOTHER file: approval must refuse before
+    // the registry is persisted.
+    fs::write(repo.path().join("src/b.rs"), "fn gadget() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let layout = code_sanity::Layout::new(repo.path());
+    let mut config = code_sanity::Config::load_or_default(&layout).unwrap();
+    config.sanitizer.denylist = vec!["shadowfax".to_string()];
+    config.save(&layout).unwrap();
+    // Reconverge under the new denylist so the mirror is consistent again.
+    index_workspace(repo.path()).unwrap();
+
+    // Queue a hand-written proposal (heuristic providers derive sym_ aliases,
+    // which never collide; we need a colliding one).
+    let item = code_sanity::proposal::ReviewItem {
+        id: "2099-01-01T00-00-00.000000000Z-testtest".to_string(),
+        file: "src/a.rs".to_string(),
+        proposal: code_sanity::proposal::Proposal {
+            category: "identifier".to_string(),
+            original_text: "shadowfax".to_string(),
+            sanitized_text: "gadget".to_string(),
+            confidence: 1.0,
+            rationale: None,
+        },
+        status: code_sanity::proposal::ReviewStatus::Pending,
+        flag: "clean".to_string(),
+        created_at: "2099-01-01T00:00:00Z".to_string(),
+    };
+    let review_dir = repo.path().join(".code-sanity/review");
+    fs::create_dir_all(&review_dir).unwrap();
+    fs::write(
+        review_dir.join(format!("{}.json", item.id)),
+        serde_json::to_string_pretty(&item).unwrap(),
+    )
+    .unwrap();
+
+    let err = code_sanity::proposal::resolve_review(repo.path(), &item.id, true).unwrap_err();
+    let chain = format!("{err:#}");
+    assert!(chain.contains("gadget"), "{chain}");
+    assert!(chain.contains("src/b.rs"), "{chain}");
+    // Registry untouched, workspace still consistent.
+    let config = code_sanity::Config::load_or_default(&layout).unwrap();
+    assert!(config.sanitizer.alias_registry.is_empty());
     assert!(verify_workspace(repo.path()).is_ok());
 }

@@ -54,6 +54,9 @@ pub(crate) fn init_workspace_locked(root: &Path) -> Result<(Layout, WorkspaceLoc
     let lock = WorkspaceLock::acquire(&layout)?;
     let mut config = Config::default();
     config.salt = crate::config::random_salt();
+    // Default aliases carry a salted suffix: derive them from the REAL salt,
+    // not the deterministic stub Config::default() uses.
+    config.sanitizer.dictionary = crate::config::default_dictionary(&config.salt);
     config.write_if_missing(&layout)?;
     ensure_gitignore_entry(root, ".code-sanity/")?;
     let conn = db::connect(&layout)?;
@@ -560,6 +563,28 @@ fn render_and_store(
     force_mirror: bool,
 ) -> Result<(FileOutcome, SpanMap, Option<PathBuf>)> {
     let _ = root;
+    // Alias collision = ambiguous mirror: the natural word would survive into
+    // the mirror indistinguishable from the alias, and an agent typing that
+    // word would reverse-map into the real term. Refuse to render; the error
+    // carries the remediation. The incremental fast path stays complete: the
+    // logic fingerprint covers the whole term set, so any alias change
+    // re-renders (and re-checks) every file.
+    let terms = crate::sanitize::term_table(config);
+    if let Some(collision) = crate::sanitize::alias_collisions(content, &terms).first() {
+        anyhow::bail!(
+            "{}: alias {:?} (for term {:?}, {}) occurs naturally in the real file as {:?} \
+             at byte {}; the sanitized mirror would be ambiguous. Choose a different alias \
+             for {:?} in .code-sanity/config.toml (or rename the conflicting word), then \
+             run `code-sanity sync`",
+            state.rel_path,
+            collision.alias,
+            collision.term,
+            collision.policy_source,
+            collision.word,
+            collision.offset,
+            collision.term,
+        );
+    }
     let mut rendered = sanitize_content(rel, content, config, protected_union)
         .with_context(|| format!("sanitize {}", rel.display()))?;
 

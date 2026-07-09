@@ -401,10 +401,22 @@ pub fn validate_proposal(
     content: &str,
     config: &Config,
 ) -> std::result::Result<String, String> {
+    use crate::sanitize::{matchability_error, normalize_term, term_table, word_runs};
+
     if proposal.original_text.is_empty() {
         return Err("empty original text".to_string());
     }
-    if proposal.sanitized_text == proposal.original_text {
+    // The sanitizer can only match word-run terms; a proposal outside that
+    // class would be recorded and silently never fire.
+    if let Some(reason) = matchability_error(&proposal.original_text) {
+        return Err(reason);
+    }
+    if let Some(reason) = matchability_error(&proposal.sanitized_text) {
+        return Err(format!("alias {reason}"));
+    }
+    // Normalized equality: `Acme` -> `ACME` (or `a_cme`) is still the same
+    // term to the matcher, so it sanitizes nothing.
+    if normalize_term(&proposal.sanitized_text) == normalize_term(&proposal.original_text) {
         return Err("alias equals the original".to_string());
     }
     if !content.contains(&proposal.original_text) {
@@ -424,14 +436,34 @@ pub fn validate_proposal(
     if proposal.category == "identifier" && !is_valid_identifier(&proposal.sanitized_text) {
         return Err("alias is not a valid identifier".to_string());
     }
-    let alias_lower = proposal.sanitized_text.to_lowercase();
-    if config
-        .sanitizer
-        .denylist
-        .iter()
-        .any(|term| alias_lower.contains(&term.to_lowercase()))
-    {
-        return Err("alias still contains a denylisted term".to_string());
+    // The alias must be clean against the WHOLE term set (registry +
+    // dictionary + denylist), not just the denylist: containing any term
+    // makes the sanitizer's own output sanitizable, and reusing another
+    // term's alias makes the mirror non-injective.
+    let alias_normalized = normalize_term(&proposal.sanitized_text);
+    for term in term_table(config) {
+        if term.raw == proposal.original_text {
+            continue;
+        }
+        if alias_normalized.contains(term.normalized.as_str()) {
+            return Err(format!(
+                "alias still contains sanitizable term {:?}",
+                term.raw
+            ));
+        }
+        if normalize_term(&term.replacement) == alias_normalized {
+            return Err(format!("alias is already the alias of {:?}", term.raw));
+        }
+    }
+    // Alias-collision guard for this file: a natural word spelled like the
+    // alias would make the rendered mirror ambiguous.
+    for (start, end) in word_runs(content) {
+        if normalize_term(&content[start..end]) == alias_normalized {
+            return Err(format!(
+                "alias already occurs in the file as {:?} (byte {start}); pick a different alias",
+                &content[start..end]
+            ));
+        }
     }
 
     if collect_protected_identifiers(content).contains(&proposal.original_text) {
@@ -520,6 +552,34 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
             .with_context(|| format!("read {}", item.file))?;
         validate_proposal(&item.proposal, &real, &config)
             .map_err(|reason| anyhow!("proposal no longer valid: {reason}"))?;
+        // Repo-wide alias-collision scan BEFORE the registry is persisted:
+        // config.save + reconverge must not be able to fail after the alias
+        // landed (that would strand a registry entry no file can render).
+        // Under the already-held exclusive lock.
+        let candidate_terms = [crate::sanitize::Term {
+            raw: item.proposal.original_text.clone(),
+            normalized: crate::sanitize::normalize_term(&item.proposal.original_text),
+            replacement: item.proposal.sanitized_text.clone(),
+            policy_source: "alias-registry",
+        }];
+        let conn = db::connect(&layout)?;
+        db::check_schema(&conn)?;
+        for rel in db::tracked_files(&conn)? {
+            let Ok(content) = std::fs::read_to_string(root.join(&rel)) else {
+                continue;
+            };
+            if let Some(collision) =
+                crate::sanitize::alias_collisions(&content, &candidate_terms).first()
+            {
+                bail!(
+                    "proposal alias {:?} occurs in {rel} at byte {} as {:?}; approval \
+                     refused — pick a different alias",
+                    item.proposal.sanitized_text,
+                    collision.offset,
+                    collision.word
+                );
+            }
+        }
         config.sanitizer.alias_registry.insert(
             item.proposal.original_text.clone(),
             item.proposal.sanitized_text.clone(),

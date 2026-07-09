@@ -21,7 +21,9 @@ use std::path::Path;
 
 /// Bump when matching/rendering semantics change. Part of the logic
 /// fingerprint, so an upgrade re-renders every mirror file.
-pub const SANITIZER_BEHAVIOR_VERSION: u32 = 2;
+/// v3: alias-collision hard errors + policy validation (the forced re-render
+/// doubles as the migration sweep that checks every file for collisions).
+pub const SANITIZER_BEHAVIOR_VERSION: u32 = 3;
 
 /// One term the sanitizer must remove, with its normalized matching form.
 #[derive(Debug, Clone)]
@@ -38,6 +40,12 @@ pub struct Term {
 /// denylist (denylist terms get a deterministic salted alias so they are
 /// removed even before a human approves a nicer name). Allowlisted terms are
 /// excluded.
+///
+/// Deliberately infallible: the fail-closed MCP error redactor and the strict
+/// runner must always be constructible. Policy enforcement (unmatchable
+/// terms, alias injectivity) happens at config load/save, in `verify`, and in
+/// proposal validation instead; a config that bypassed all of those still
+/// surfaces here as a warning.
 pub fn term_table(config: &Config) -> Vec<Term> {
     let allow: BTreeSet<String> = config
         .sanitizer
@@ -48,9 +56,12 @@ pub fn term_table(config: &Config) -> Vec<Term> {
     let mut seen = BTreeSet::new();
     let mut terms = Vec::new();
     let mut push = |raw: &str, replacement: String, policy_source: &'static str| {
+        if let Some(reason) = matchability_error(raw) {
+            log::warn!("skipping unmatchable sanitizer term ({policy_source}): {reason}");
+            return;
+        }
         let normalized = normalize_term(raw);
-        if normalized.is_empty() || allow.contains(&normalized) || !seen.insert(normalized.clone())
-        {
+        if allow.contains(&normalized) || !seen.insert(normalized.clone()) {
             return;
         }
         terms.push(Term {
@@ -86,6 +97,174 @@ pub fn derive_alias(salt: &str, original: &str) -> String {
         "sym_{}",
         &sha256_hex(format!("{salt}:{original}").as_bytes())[..8]
     )
+}
+
+/// `"{stem}_{4 hex}"` — a readable stem with a per-workspace salted suffix.
+/// The default dictionary uses this: a bare English alias ("client") collides
+/// with real code, a bare hash is unreadable; the suffix keeps natural
+/// occurrence practically impossible while the stem keeps the mirror legible.
+pub fn derive_stemmed_alias(salt: &str, original: &str, stem: &str) -> String {
+    format!(
+        "{stem}_{}",
+        &sha256_hex(format!("{salt}:{original}").as_bytes())[..4]
+    )
+}
+
+/// Why `raw` can never match, or `None` when the term is fine. Matching
+/// happens only inside `[A-Za-z0-9_]+` word runs, so a term whose normalized
+/// form is empty or contains anything outside `[a-z0-9]` is silently inert —
+/// it looks configured but never fires, and `verify`'s leak backstop shares
+/// the same blind spot. Such terms are rejected loudly instead.
+pub fn matchability_error(raw: &str) -> Option<String> {
+    let normalized = normalize_term(raw);
+    if normalized.is_empty() {
+        return Some(format!(
+            "term {raw:?} normalizes to nothing (only '_'/'-' characters)"
+        ));
+    }
+    if let Some(bad) = normalized
+        .chars()
+        .find(|ch| !ch.is_ascii_lowercase() && !ch.is_ascii_digit())
+    {
+        return Some(format!(
+            "term {raw:?} contains {bad:?} after normalization; the sanitizer \
+             matches only inside identifier word runs [A-Za-z0-9_]+ — split it \
+             into single-word entries (e.g. \"acme\" + \"corp\") or remove it"
+        ));
+    }
+    None
+}
+
+/// Every policy violation in the configured term set: unmatchable terms and
+/// aliases, non-injective aliases (two terms sharing one alias makes the
+/// mirror ambiguous), and aliases that themselves contain a sanitizable term
+/// (the sanitizer's own output would be sanitizable — including
+/// alias == original). O(T²) in term count; runs at config load/save and in
+/// verify, never per file.
+pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut entries: Vec<(&str, &String, Option<&String>)> = Vec::new();
+    entries.extend(
+        config
+            .sanitizer
+            .alias_registry
+            .iter()
+            .map(|(term, alias)| ("alias-registry", term, Some(alias))),
+    );
+    entries.extend(
+        config
+            .sanitizer
+            .dictionary
+            .iter()
+            .map(|(term, alias)| ("dictionary", term, Some(alias))),
+    );
+    entries.extend(
+        config
+            .sanitizer
+            .denylist
+            .iter()
+            .map(|term| ("denylist", term, None)),
+    );
+    for (source, term, alias) in entries {
+        if let Some(reason) = matchability_error(term) {
+            violations.push(format!("{source} {reason}"));
+        }
+        if let Some(alias) = alias
+            && let Some(reason) = matchability_error(alias)
+        {
+            violations.push(format!("{source} alias for {term:?}: {reason}"));
+        }
+    }
+    for item in &config.sanitizer.allowlist {
+        if let Some(reason) = matchability_error(item) {
+            violations.push(format!("allowlist {reason}"));
+        }
+    }
+
+    // Injectivity and self-cleanliness over the effective term table (the
+    // table itself already applies precedence and allowlist filtering).
+    let terms = term_table(config);
+    let mut alias_owner: std::collections::BTreeMap<String, &Term> =
+        std::collections::BTreeMap::new();
+    for term in &terms {
+        let alias_normalized = normalize_term(&term.replacement);
+        if let Some(existing) = alias_owner.get(alias_normalized.as_str()) {
+            violations.push(format!(
+                "alias {:?} is used for both {:?} and {:?}; the mirror would be ambiguous",
+                term.replacement, existing.raw, term.raw
+            ));
+        } else {
+            alias_owner.insert(alias_normalized, term);
+        }
+    }
+    for term in &terms {
+        let alias_normalized = normalize_term(&term.replacement);
+        for other in &terms {
+            if alias_normalized.contains(other.normalized.as_str()) {
+                violations.push(format!(
+                    "alias {:?} for {:?} still contains sanitizable term {:?}; \
+                     the sanitizer's own output would be sanitizable",
+                    term.replacement, term.raw, other.raw
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// anyhow wrapper over [`sanitizer_policy_violations`], one bullet per issue.
+pub fn validate_sanitizer_config(config: &Config) -> Result<()> {
+    let violations = sanitizer_policy_violations(config);
+    if violations.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "sanitizer config is not valid:\n  - {}\nfix these entries, then run `code-sanity sync`",
+        violations.join("\n  - ")
+    )
+}
+
+/// A word run in REAL content whose normalized form EQUALS a configured
+/// alias's normalized form — a genuine ambiguity: after rendering, that word
+/// survives verbatim into the mirror where it is indistinguishable from the
+/// alias, so reads are misleading and agent edits reverse-map wrongly.
+#[derive(Debug, Clone)]
+pub struct AliasCollision {
+    /// Byte offset of the colliding word run in the content.
+    pub offset: usize,
+    /// The run as spelled in the real file.
+    pub word: String,
+    /// The configured alias it collides with (raw spelling).
+    pub alias: String,
+    /// The term that alias replaces.
+    pub term: String,
+    pub policy_source: &'static str,
+}
+
+/// Scan REAL content for word runs colliding with configured aliases.
+/// Equality of normalized forms (not substring): `client_x` does not collide
+/// with alias `client`. Protected identifiers and keywords are NOT excluded —
+/// a protected word equal to an alias is the worst ambiguity, not a
+/// sanctioned one.
+pub fn alias_collisions(content: &str, terms: &[Term]) -> Vec<AliasCollision> {
+    let by_alias: std::collections::BTreeMap<String, &Term> = terms
+        .iter()
+        .map(|term| (normalize_term(&term.replacement), term))
+        .collect();
+    let mut collisions = Vec::new();
+    for (start, end) in word_runs(content) {
+        let run = &content[start..end];
+        if let Some(term) = by_alias.get(normalize_term(run).as_str()) {
+            collisions.push(AliasCollision {
+                offset: start,
+                word: run.to_string(),
+                alias: term.replacement.clone(),
+                term: term.raw.clone(),
+                policy_source: term.policy_source,
+            });
+        }
+    }
+    collisions
 }
 
 /// A term occurrence inside a word run.
@@ -674,21 +853,36 @@ mod tests {
         sanitize_content(Path::new(rel), content, &config, &BTreeSet::new()).unwrap()
     }
 
+    /// The default alias for `term` (stemmed + salted suffix; deterministic
+    /// under Config::default()'s stub salt).
+    fn default_alias(term: &str) -> String {
+        Config::default()
+            .sanitizer
+            .dictionary
+            .get(term)
+            .cloned()
+            .unwrap_or_else(|| panic!("{term} is not in the default dictionary"))
+    }
+
     #[test]
     fn sanitizes_comments_and_private_identifiers() {
         let rendered = sanitize(
             "src/lib.rs",
             "// dangerous comment\nfn dangerous_parser() {}\n",
         );
-        assert!(rendered.sanitized.contains("neutral comment"));
-        assert!(rendered.sanitized.contains("fn neutral_parser()"));
+        let alias = default_alias("dangerous");
+        assert!(rendered.sanitized.contains(&format!("{alias} comment")));
+        assert!(rendered.sanitized.contains(&format!("fn {alias}_parser()")));
         assert!(!rendered.sanitized.contains("dangerous"));
     }
 
     #[test]
     fn sanitizes_all_string_literals() {
         let rendered = sanitize("src/lib.rs", "let s = \"dangerous\";\n");
-        assert_eq!(rendered.sanitized, "let s = \"neutral\";\n");
+        assert_eq!(
+            rendered.sanitized,
+            format!("let s = \"{}\";\n", default_alias("dangerous"))
+        );
         assert_eq!(rendered.span_map.replacements[0].category, "string_literal");
     }
 
@@ -698,8 +892,90 @@ mod tests {
             "src/lib.rs",
             "fn f<'a>(acme_x: &'a str) -> &'a str {\n    acme_x\n}\n",
         );
-        assert!(rendered.sanitized.contains("client_x"));
+        assert!(
+            rendered
+                .sanitized
+                .contains(&format!("{}_x", default_alias("acme")))
+        );
         assert!(!rendered.sanitized.contains("acme_x"));
+    }
+
+    #[test]
+    fn multi_token_terms_are_rejected_by_policy_validation() {
+        for term in ["Acme Corp.", "acme.example.com", "a@b", "--", "com/acme"] {
+            let reason = matchability_error(term);
+            assert!(reason.is_some(), "{term:?} must be unmatchable");
+        }
+        assert!(matchability_error("acme").is_none());
+        assert!(matchability_error("Acme_Client-2").is_none());
+
+        let mut config = Config::default();
+        config.sanitizer.denylist = vec!["secret.internal.key".to_string()];
+        let violations = sanitizer_policy_violations(&config);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("secret.internal.key")),
+            "{violations:?}"
+        );
+        assert!(crate::sanitize::validate_sanitizer_config(&config).is_err());
+    }
+
+    #[test]
+    fn alias_injectivity_and_self_cleanliness_violations_are_reported() {
+        // Two terms -> one alias.
+        let mut config = Config::default();
+        config.sanitizer.dictionary = [("acme", "shared"), ("initech", "shared")]
+            .into_iter()
+            .map(|(term, alias)| (term.to_string(), alias.to_string()))
+            .collect();
+        let violations = sanitizer_policy_violations(&config);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("used for both")),
+            "{violations:?}"
+        );
+
+        // Alias contains a (different) sanitizable term.
+        let mut config = Config::default();
+        config.sanitizer.dictionary = [("acme", "gadget"), ("initech", "acme_service")]
+            .into_iter()
+            .map(|(term, alias)| (term.to_string(), alias.to_string()))
+            .collect();
+        let violations = sanitizer_policy_violations(&config);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("still contains sanitizable term")),
+            "{violations:?}"
+        );
+
+        // The shipped defaults must be self-clean.
+        assert_eq!(
+            sanitizer_policy_violations(&Config::default()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn alias_collisions_find_case_and_separator_variants() {
+        let mut config = Config::default();
+        config.sanitizer.dictionary =
+            std::iter::once(("acme".to_string(), "client".to_string())).collect();
+        let terms = term_table(&config);
+
+        let hits = alias_collisions("fn client() {}\nlet CLI_ENT = c_lient;\n", &terms);
+        // `client`, `CLI_ENT` and `c_lient` all normalize to the alias.
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].word, "client");
+        assert_eq!(hits[0].term, "acme");
+
+        // Equality, not substring: client_x is a different identifier.
+        assert!(alias_collisions("let client_x = 1;\n", &terms).is_empty());
+        // The shipped stemmed defaults do not collide with plain English.
+        let default_terms = term_table(&Config::default());
+        assert!(alias_collisions("let client = 1; // neutral sample\n", &default_terms).is_empty());
     }
 
     #[test]

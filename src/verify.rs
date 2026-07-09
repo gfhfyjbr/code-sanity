@@ -49,10 +49,15 @@ pub fn verify_workspace(root: &Path) -> Result<VerifyReport> {
     // Verify only reads; a shared lock keeps writers out for a consistent
     // snapshot while letting other readers proceed.
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
-    let config = Config::load_or_default(&layout)?;
+    // Lenient load: a policy-violating config is a FINDING verify reports,
+    // not a reason verify cannot run.
+    let config = Config::load_or_default_lenient(&layout)?;
     let conn = db::connect(&layout)?;
     db::check_schema(&conn)?;
     let mut report = VerifyReport::default();
+    for violation in crate::sanitize::sanitizer_policy_violations(&config) {
+        report.failures.push(format!("config: {violation}"));
+    }
 
     let tracked = db::tracked_files(&conn)?;
     let tracked_set: BTreeSet<String> = tracked.iter().cloned().collect();
@@ -69,6 +74,19 @@ pub fn verify_workspace(root: &Path) -> Result<VerifyReport> {
         }
     }
     let terms = term_table(&config);
+
+    // Injectivity against content: an alias occurring naturally in a REAL
+    // file makes the mirror ambiguous (the word survives rendering verbatim,
+    // indistinguishable from the alias). Real contents are already in memory.
+    for (rel, real) in &real_contents {
+        for collision in crate::sanitize::alias_collisions(real, &terms) {
+            report.failures.push(format!(
+                "{rel}: alias {:?} (for term {:?}) occurs in real content as {:?} at byte {}; \
+                 mirror is ambiguous — change the alias in .code-sanity/config.toml",
+                collision.alias, collision.term, collision.word, collision.offset
+            ));
+        }
+    }
 
     for rel in &tracked {
         report.checked += 1;

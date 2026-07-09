@@ -328,17 +328,37 @@ pub struct IgnoreConfig {
     pub max_file_bytes: u64,
 }
 
+/// Default dictionary with per-salt synthetic aliases (`neutral_3fd1`-style,
+/// see `derive_stemmed_alias`). Bare English aliases ("client", "neutral")
+/// collide with words that occur naturally in real code — and a collision
+/// makes the mirror ambiguous and reverse-maps agent-typed words into real
+/// terms. The stem keeps the mirror readable; the salted suffix makes natural
+/// occurrence practically impossible.
+pub fn default_dictionary(salt: &str) -> BTreeMap<String, String> {
+    [
+        ("acme", "client"),
+        ("attack", "exercise"),
+        ("dangerous", "neutral"),
+        ("evil", "sample"),
+        ("exfiltrate", "transfer"),
+        ("malware", "diagnostic"),
+        ("privatecorp", "examplecorp"),
+    ]
+    .into_iter()
+    .map(|(term, stem)| {
+        (
+            term.to_string(),
+            crate::sanitize::derive_stemmed_alias(salt, term, stem),
+        )
+    })
+    .collect()
+}
+
 impl Default for Config {
     fn default() -> Self {
-        let dictionary = BTreeMap::from([
-            ("acme".to_string(), "client".to_string()),
-            ("attack".to_string(), "exercise".to_string()),
-            ("dangerous".to_string(), "neutral".to_string()),
-            ("evil".to_string(), "sample".to_string()),
-            ("exfiltrate".to_string(), "transfer".to_string()),
-            ("malware".to_string(), "diagnostic".to_string()),
-            ("privatecorp".to_string(), "examplecorp".to_string()),
-        ]);
+        // The stub salt keeps unit tests deterministic; init_workspace
+        // re-derives the dictionary from the real random salt.
+        let dictionary = default_dictionary("code-sanity-local-stub");
 
         Self {
             version: 1,
@@ -391,7 +411,20 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Load and policy-validate the config. The validation error names every
+    /// offending entry (this is the actionable upgrade path for a persisted
+    /// config that predates validation), never a panic.
     pub fn load_or_default(layout: &Layout) -> Result<Self> {
+        let config = Self::load_or_default_lenient(layout)?;
+        crate::sanitize::validate_sanitizer_config(&config)
+            .with_context(|| format!("{} failed validation", layout.config_path.display()))?;
+        Ok(config)
+    }
+
+    /// Load without policy validation (TOML parse errors still fail). Only
+    /// for `verify`, which reports violations as findings instead of dying,
+    /// and for other paths that must observe a broken config to explain it.
+    pub fn load_or_default_lenient(layout: &Layout) -> Result<Self> {
         if !layout.config_path.exists() {
             return Ok(Self::default());
         }
@@ -409,8 +442,10 @@ impl Config {
 
     /// Durable atomic save with a `.bak` copy of previous, different content —
     /// the config holds the salt and the human-approved alias registry, which
-    /// are not derivable from anything else.
+    /// are not derivable from anything else. Validates first: programmatic
+    /// writers (proposal approval) must not persist a policy violation.
     pub fn save(&self, layout: &Layout) -> Result<()> {
+        crate::sanitize::validate_sanitizer_config(self).context("refusing to save config")?;
         let raw = toml::to_string_pretty(self).context("serialize config")?;
         crate::fsutil::write_with_backup_sync(&layout.config_path, &raw)
             .with_context(|| format!("write {}", layout.config_path.display()))
