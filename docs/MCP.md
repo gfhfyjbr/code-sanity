@@ -8,10 +8,10 @@
 | `search` | `{ "query": "...", "glob": "*.rs"?, "max_results"? }` | `path:line:column:text` lines (sanitized, capped) |
 | `list_files` | `{ "glob": "src/**"? }` | repo-relative mirror paths |
 | `semantic_search` | `{ "query": "...", "k"? }` | `path:start-end score preview` lines (sanitized); requires embeddings enabled + `embed-index` |
-| `apply_patch` | `{ "patch": "<unified diff>", "agent"?, "session_id"? }` | applied files + journal path |
+| `apply_patch` | `{ "patch": "<unified diff>", "agent"?, "session_id"?, "dry_run"? }` | applied files + workspace-relative journal path (`dry_run: true` plans/validates only) |
 | `verify` | `{}` | tracked-file consistency check |
 
-`read_file`, `search`, and `list_files` only ever read `.code-sanity/mirror`, so the model never sees raw identifiers/comments. `apply_patch` accepts a diff written against sanitized mirror paths (`a/src/lib.rs`, `b/src/lib.rs`, or `.code-sanity/mirror/src/lib.rs`) and projects it back onto the real repo through the span-aware, conflict-safe bridge.
+`read_file`, `search`, and `list_files` only ever read `.code-sanity/mirror`, so the model never sees raw identifiers/comments. Glob parameters use gitignore-style dispatch: without `/` they match file names at any depth (`*.rs`); with `/` they match the repo-relative path (`src/**/*.rs`). Tool output never carries host-absolute paths (journal references are workspace-relative; errors are redacted and root-scrubbed). `apply_patch` accepts a diff written against sanitized mirror paths (`a/src/lib.rs`, `b/src/lib.rs`, or `.code-sanity/mirror/src/lib.rs`) and projects it back onto the real repo through the span-aware, conflict-safe bridge.
 
 Inspect the manifest without starting a session:
 

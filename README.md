@@ -99,6 +99,14 @@ and `acmeClientFactory`.
 - terms come from the static dictionary, the human-approved alias registry, and
   the denylist (denylist terms are removed immediately with a deterministic
   salted `sym_xxxxxxxx` alias, before any human picks a nicer name);
+- terms must be single word-run tokens: entries containing `.`/`@`/spaces
+  (emails, hostnames, `com.acme.Foo`) can never match and are **rejected at
+  config load** with a fix-it message — split them into per-word entries;
+- aliases must be **collision-free**: an alias that occurs naturally in the
+  real repo (or is shared by two terms) makes the mirror ambiguous and is a
+  hard error at index/verify/approve time. Default dictionary aliases carry a
+  per-workspace salted suffix (`neutral_3fd1`-style) so natural collisions are
+  practically impossible;
 - replacements adapt to the casing of the matched slice (`ACME` → `CLIENT`,
   `Acme` → `Client`);
 - the **repo-wide protected identifier set** (public declarations,
@@ -110,7 +118,7 @@ and `acmeClientFactory`.
 - zone detection (comment/string/identifier) only labels the replacement
   category — it can never suppress a replacement;
 - line count is preserved, but replacement lengths may differ;
-- the per-workspace salt is randomly generated at `init`.
+- the per-workspace salt is 128-bit, read from `/dev/urandom` at `init`.
 
 Every tracked file gets a JSON span map with original and sanitized byte offsets, line starts, hashes, replacement spans, and rendered sizes.
 
@@ -227,6 +235,7 @@ Conflicts write `.code-sanity/journal/*.patch.json` and leave the real file unch
 - `0` — success;
 - `2` — patch conflict (real files untouched, conflict journal written);
 - `3` — `verify` found the workspace broken (every failure is printed);
+- `64` — command-line usage error (unknown flags/subcommand);
 - `1` — any other error.
 
 ### Crash safety and recover
@@ -244,7 +253,7 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `read <path>`
 - `search <query> [--glob <glob>] [--max-results <n>]`
 - `grep <query> [--glob <glob>] [--max-results <n>]`
-- `apply-patch [--patch <file>] [--agent <name>] [--session-id <id>]`
+- `apply-patch [--patch <file>] [--dry-run] [--agent <name>] [--session-id <id>]` (`--dry-run` plans and validates without writing; conflicts still exit 2)
 - `write --path <path> [--sanitized-content <file>]`
 - `rename --path <path> --from <alias> --to <name> [--agent <name>] [--session-id <id>]`
 - `project-edit --path <path> [--agent <name>] [--session-id <id>]`
@@ -265,6 +274,8 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `serve [--once]`
 
 Search results are capped (default 200, hard max 1000) with an explicit truncation notice.
+
+`--glob` uses gitignore-style dispatch: a pattern without `/` matches file **names** at any depth (`*.rs` = every Rust file); a pattern with `/` matches the repo-relative **path**, with `*` stopping at separators and `**` crossing them (`src/*.rs`, `src/**`, `**/*.rs`). Invalid patterns are an error.
 
 ## MCP Server
 

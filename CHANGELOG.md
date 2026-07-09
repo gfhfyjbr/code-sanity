@@ -5,6 +5,101 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-09
+
+Production-hardening release: every finding from the v0.2.0 readiness audit
+closed — the alias model, path safety, lock/schema discipline, journal
+scalability, LLM-loop robustness, MCP output privacy, and the CLI/CI
+contracts.
+
+### Breaking
+
+- **Sanitizer config is validated at load and save.** Terms containing
+  anything outside `[A-Za-z0-9_-]` (emails, hostnames, `com.acme.Foo`) can
+  never match the word-run engine and were silently inert — they are now
+  rejected with a fix-it message (split into per-word entries). Non-injective
+  alias sets (two terms → one alias) and aliases containing a sanitizable
+  term are rejected too. `verify` lists the same violations as findings
+  instead of dying.
+- **Alias collisions are hard errors.** An alias occurring naturally in the
+  real repo made the mirror ambiguous and silently reverse-mapped agent-typed
+  words into real terms (`let client = 5;` became `let acme = 5;`). Collisions
+  now fail index/verify/rename/approval with the offending word, file, and
+  offset; patches that would introduce an alias word conflict (exit 2). New
+  workspaces get collision-proof default aliases (`neutral_3fd1`-style,
+  per-workspace salted suffix). Existing configs are untouched, but the
+  sanitizer behavior-version bump forces a one-time full re-render that
+  surfaces any legacy collision as an actionable error.
+- **Usage errors exit 64** (EX_USAGE), not clap's default 2 — `2` is
+  exclusively the patch-conflict contract.
+- **Glob semantics are real now** (globset): a pattern without `/` matches
+  file names at any depth (`*.rs`, as always documented); with `/` it matches
+  the repo-relative path — `src/*.rs` used to silently match nothing. The
+  substring fallback is gone; invalid patterns are errors.
+- **Read commands require an initialized workspace** and no longer create
+  `.code-sanity/` in arbitrary directories; on an outdated DB schema they say
+  "run `code-sanity index`" instead of migrating under a shared lock.
+- `ApplyReport.journal_path` is now `Option<PathBuf>` (`None` for dry runs);
+  `list_journal_entries` returns a `JournalListing` with corrupt entries
+  surfaced (library API).
+
+### Added
+
+- `apply-patch --dry-run` (CLI) and `dry_run` (MCP `apply_patch`): the full
+  parse/translate/conflict pipeline with zero writes; conflicts still exit 2.
+- `sanitizer.propose_max_file_bytes` (default 192 KiB): files larger than the
+  cap are skipped with a note instead of overflowing the model context; one
+  file's provider error no longer aborts a multi-file `propose-sanitize` run.
+- Semantic-search fingerprint gate: changing the embeddings model/chunking
+  without re-running `embed-index` is now a clear error before any HTTP call
+  (it used to silently score the query against a different vector space).
+- Index reports `errors=`/`symlinks=`: unreadable files (e.g. invalid UTF-8
+  past the binary probe) are skipped per-file with their mirror preserved,
+  instead of aborting the whole pass; symlinks are counted, never followed.
+- Release workflow gates binaries on fmt/clippy/tests (both platforms) and
+  cargo-deny; CI checks the declared MSRV (1.85) and runs tests `--locked`.
+- Log rotation for `.code-sanity/logs/code-sanity.log` at 5 MiB (one `.old`
+  generation).
+
+### Fixed
+
+- **Path traversal in `sync --path`**: `../…` paths (routinely produced by
+  the editor hooks) read files outside the repo, wrote sanitized copies
+  outside the mirror, and poisoned the stale sweep into deleting outside
+  `.code-sanity/`. Out-of-repo paths are now a clean no-op skip (hooks) or a
+  hard error (`--force`); the sweep validates stored paths before touching
+  the filesystem; `recover` refuses journal entries with escaping paths;
+  `propose-sanitize --path` validates too.
+- **MCP success output leaked the absolute workspace path** (journal
+  reference): now workspace-relative, and tool errors are root-scrubbed
+  before term redaction.
+- **Schema migration escaped the lock discipline**: init side effects (salt,
+  `.gitignore`, migration) now run under one exclusive lock; the
+  drop-and-recreate migration is transactional; concurrent first-init races
+  are gone.
+- **Journal**: the interrupted-apply check is O(1) via in-flight markers
+  instead of parsing all history on every command; corrupt `applying`
+  entries BLOCK with instructions instead of being silently quarantined
+  (which unblocked torn workspaces); rolled-back entries drop their full
+  file snapshots; durable writes fsync newly created parent directories.
+- **Incremental index**: an unknown mtime (mtime-less filesystems) never
+  rides the fast path (same-size edits were invisible forever); a source
+  FILE named `build`/`dist`/`target` is indexed again (the name skip now
+  applies to directories only).
+- **Patch bridge**: appending after a final line without a trailing newline
+  no longer merges lines; corrupt span maps yield conflicts instead of slice
+  panics; header paths split on TAB (spaces are refused, not silently
+  truncated to the wrong file); CRLF/LF tie prefers LF.
+- `is_loopback` parses the host as an IP: DNS names like `127.evil.com` no
+  longer count as keyless-eligible loopback.
+- Truncated LLM replies (`finish_reason="length"`) are a clear error with
+  remediation instead of a JSON-parse failure; retries honor `Retry-After`
+  (capped) with jitter.
+- The per-workspace salt comes from `/dev/urandom` (128-bit); the previous
+  time+PID hash was guessable, contradicting its own documentation.
+- Explicit `--root` pointing at a nonexistent path errors immediately;
+  half of `--help` no longer renders blank.
+
 ## [0.2.0] - 2026-07-07
 
 First installable release: prebuilt binaries for Linux and macOS (x86_64 and

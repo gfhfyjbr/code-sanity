@@ -156,10 +156,34 @@ tampered config could point that at an attacker's server.
 Tool successes serve sanitized mirror content, but tool **errors** interpolate
 whatever the failure touched — real paths, io error text, hunk context.
 - **Mitigation:** every MCP tool error passes through the workspace redactor
-  before leaving the server; if the redactor itself cannot be built, a generic
-  message is returned instead (fail closed).
+  before leaving the server, with the absolute workspace-root prefix scrubbed
+  first (the root's own directory names are not dictionary terms); if the
+  redactor itself cannot be built, a generic message is returned instead
+  (fail closed).
 - **Residual risk:** the redactor covers known terms only, like `sh` output
   sanitization (bypass 8).
+
+### 8b. Success output leaks the host path through the MCP server
+`apply_patch` success used to embed the absolute journal path — including the
+workspace root's directory names (e.g. a company-named repo folder), which the
+dictionary redactor cannot know about.
+- **Mitigation:** journal references in MCP tool output are workspace-relative;
+  the fallback is the bare file name, never an absolute prefix.
+- **Residual risk:** none known for tool output; CLI stdout (host-side) keeps
+  absolute paths by design.
+
+### 8c. An alias collides with a natural word (ambiguous mirror)
+If a configured alias also occurs naturally in the real repo, the mirror
+becomes non-injective: the natural word is indistinguishable from the alias,
+reads mislead, and an agent-typed word reverse-maps into the real term
+(silent corruption of agent intent).
+- **Mitigation:** alias collisions are hard errors at index, verify, patch
+  (conflict, exit 2), rename, and proposal-approval time; config load/save
+  rejects non-injective or self-sanitizable alias sets and unmatchable
+  multi-token terms; default dictionary aliases carry a per-workspace salted
+  suffix so natural collisions are practically impossible.
+- **Residual risk:** a legacy workspace keeps its human-chosen aliases until
+  the first post-upgrade sync surfaces any collision as an actionable error.
 
 ### 9. Sanitization breaks the code
 A replacement produces invalid code or renames a public symbol.
