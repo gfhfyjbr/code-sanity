@@ -1936,3 +1936,70 @@ fn mcp_success_output_carries_no_absolute_paths() {
         "leaked in error: {error_text}"
     );
 }
+
+#[test]
+fn usage_errors_exit_64_and_conflicts_keep_2() {
+    // 2 is the documented "patch conflict" contract; a typo in the flags must
+    // not read as a conflict. Usage errors take 64 (EX_USAGE).
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .arg("definitely-not-a-command")
+        .assert()
+        .code(64);
+    Command::cargo_bin("code-sanity").unwrap().assert().code(64); // bare invocation = usage error too
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("Apply a unified diff"));
+    // (2-for-conflict is pinned by apply_patch_conflict_exits_with_code_2.)
+}
+
+#[test]
+fn explicit_missing_root_is_a_clear_error() {
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", "/definitely/not/here", "verify"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("--root"));
+}
+
+#[test]
+fn cli_glob_matches_paths_and_rejects_invalid_patterns() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src/nested")).unwrap();
+    fs::write(repo.path().join("top.rs"), "fn needle_top() {}\n").unwrap();
+    fs::write(repo.path().join("src/direct.rs"), "fn needle_direct() {}\n").unwrap();
+    fs::write(
+        repo.path().join("src/nested/deep.rs"),
+        "fn needle_deep() {}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // Path glob: direct children of src/ only (used to silently match NOTHING).
+    let hits = search_mirror(repo.path(), "needle_", Some("src/*.rs")).unwrap();
+    let paths: Vec<&str> = hits.iter().map(|hit| hit.rel_path.as_str()).collect();
+    assert_eq!(paths, vec!["src/direct.rs"], "{paths:?}");
+
+    // Name glob still matches at any depth.
+    let hits = search_mirror(repo.path(), "needle_", Some("*.rs")).unwrap();
+    assert_eq!(hits.len(), 3, "{hits:?}");
+
+    // Invalid glob is a loud error.
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "grep",
+            "needle_",
+            "--glob",
+            "[",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("glob"));
+}

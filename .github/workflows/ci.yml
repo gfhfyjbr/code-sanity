@@ -26,7 +26,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test
+        run: cargo test --locked
+
+  # Declared rust-version must actually build; `cargo check` without
+  # --all-targets on purpose (dev-dependencies need not honor the MSRV).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV
+        run: cargo check --locked
 
   deny:
     runs-on: ubuntu-latest

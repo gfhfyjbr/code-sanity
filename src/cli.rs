@@ -16,8 +16,9 @@ use std::path::PathBuf;
 #[command(version)]
 #[command(about = "Sanitized mirror and patch bridge for agent code workflows")]
 pub struct Cli {
-    #[arg(long, global = true, default_value = ".")]
-    root: PathBuf,
+    /// Workspace root (defaults to the current directory).
+    #[arg(long, global = true)]
+    root: Option<PathBuf>,
 
     /// Raise log verbosity (-v: debug to log file, info to stderr; -vv: trace).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
@@ -29,25 +30,37 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create the .code-sanity workspace (config, salt, mirror, db).
     Init,
+    /// Build or refresh the sanitized mirror from the real files (incremental).
     Index,
+    /// Print a file from the sanitized mirror.
     Read {
+        /// Repo-relative path, e.g. src/lib.rs.
         path: PathBuf,
     },
+    /// Substring-search the sanitized mirror (alias: grep).
     #[command(alias = "grep")]
     Search {
+        /// Substring to look for.
         query: String,
+        /// Glob filter: without '/' matches file names at any depth (*.rs);
+        /// with '/' matches the repo-relative path (src/**/*.rs).
         #[arg(long)]
         glob: Option<String>,
         /// Cap on returned matches (default 200, hard max 1000).
         #[arg(long)]
         max_results: Option<usize>,
     },
+    /// Apply a unified diff written against mirror paths to the real repo.
     ApplyPatch {
+        /// Patch file (defaults to stdin).
         #[arg(long)]
         patch: Option<PathBuf>,
+        /// Agent name recorded in the journal.
         #[arg(long)]
         agent: Option<String>,
+        /// Session id recorded in the journal.
         #[arg(long)]
         session_id: Option<String>,
         /// Plan and validate only; report what would change without writing
@@ -55,9 +68,12 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Replace one mirror file's content and project it to the real repo.
     Write {
+        /// Repo-relative target path.
         #[arg(long)]
         path: PathBuf,
+        /// Content file (defaults to stdin).
         #[arg(long)]
         sanitized_content: Option<PathBuf>,
     },
@@ -129,6 +145,7 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         command: Vec<String>,
     },
+    /// Reconcile the mirror with the real files (one path or the whole repo).
     Sync {
         /// Sync only this repo-relative path (used by agent hooks).
         #[arg(long)]
@@ -146,12 +163,17 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         k: usize,
     },
+    /// Check mirror/map/db consistency and scan for term leaks (exit 3 on failure).
     Verify,
+    /// Print workspace status and agent hook installation state.
     Doctor {
+        /// Agent whose hooks to inspect.
         #[arg(long)]
         agent: Option<Agent>,
     },
+    /// Generate agent hooks that route reads and edits through the mirror.
     InstallHooks {
+        /// Agent to install hooks for.
         #[arg(long)]
         agent: Agent,
         /// Replace files even when the existing config cannot be merged.
@@ -160,10 +182,13 @@ enum Command {
     },
     /// Remove code-sanity hooks, preserving foreign configuration.
     UninstallHooks {
+        /// Agent to remove hooks from.
         #[arg(long)]
         agent: Agent,
     },
+    /// Run the MCP server over stdio.
     Serve {
+        /// Print the tool manifest and exit (wiring check).
         #[arg(long)]
         once: bool,
     },
@@ -177,8 +202,34 @@ enum Agent {
 }
 
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let root = cli.root.canonicalize().unwrap_or(cli.root);
+    // Usage errors exit 64 (EX_USAGE), NOT clap's default of 2: 2 is the
+    // documented "patch conflict" contract agents script against, and a typo
+    // in the flags must not read as a conflict.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            use clap::error::ErrorKind;
+            let code = match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+                _ => 64,
+            };
+            let _ = err.print(); // clap routes help to stdout, errors to stderr
+            std::process::exit(code);
+        }
+    };
+    let (raw_root, explicit_root) = match cli.root {
+        Some(path) => (path, true),
+        None => (PathBuf::from("."), false),
+    };
+    let root = match raw_root.canonicalize() {
+        Ok(root) => root,
+        // An explicitly given root that does not resolve is a user error to
+        // report now — downstream errors ("create /nonexistent/...") mislead.
+        Err(err) if explicit_root => {
+            anyhow::bail!("--root {}: {err}", raw_root.display());
+        }
+        Err(_) => raw_root,
+    };
     crate::logging::init(&crate::config::Layout::new(&root), cli.verbose);
 
     match dispatch(cli.command, &root) {

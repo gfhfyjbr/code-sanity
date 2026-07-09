@@ -167,7 +167,7 @@ fn tools_manifest() -> Value {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Substring to search for" },
-                    "glob": { "type": "string", "description": "Optional glob filter, e.g. *.rs" },
+                    "glob": { "type": "string", "description": "Glob filter: without '/' matches file names at any depth (*.rs); with '/' matches the repo-relative path (src/**/*.rs)" },
                     "max_results": {
                         "type": "integer",
                         "minimum": 1,
@@ -185,7 +185,7 @@ fn tools_manifest() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "glob": { "type": "string", "description": "Optional glob filter, e.g. src/**" }
+                    "glob": { "type": "string", "description": "Glob filter: without '/' matches file names at any depth (*.rs); with '/' matches the repo-relative path (src/**)" }
                 },
                 "additionalProperties": false
             }

@@ -54,12 +54,12 @@ pub fn search_mirror_limited(
         .clamp(1, HARD_MAX_RESULTS);
     let layout = Layout::new(root);
     layout.require_initialized()?;
+    let filter = compile_glob(glob)?;
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
     let mut matches = Vec::new();
     if !layout.mirror_dir.exists() {
         bail!("sanitized mirror is missing; run `code-sanity index` first");
     }
-    let glob = glob.map(ToOwned::to_owned);
     for entry in WalkBuilder::new(&layout.mirror_dir)
         .hidden(false)
         .git_ignore(false)
@@ -74,7 +74,7 @@ pub fn search_mirror_limited(
             continue;
         }
         let rel = entry.path().strip_prefix(&layout.mirror_dir)?.to_path_buf();
-        if !matches_glob(&rel, glob.as_deref()) {
+        if !filter.matches(&rel) {
             continue;
         }
         let content = fs::read_to_string(entry.path())
@@ -102,6 +102,7 @@ pub fn search_mirror_limited(
 pub fn list_mirror_files(root: &Path, glob: Option<&str>) -> Result<Vec<String>> {
     let layout = Layout::new(root);
     layout.require_initialized()?;
+    let filter = compile_glob(glob)?;
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
     if !layout.mirror_dir.exists() {
         bail!("sanitized mirror is missing; run `code-sanity index` first");
@@ -120,7 +121,7 @@ pub fn list_mirror_files(root: &Path, glob: Option<&str>) -> Result<Vec<String>>
             continue;
         }
         let rel = entry.path().strip_prefix(&layout.mirror_dir)?.to_path_buf();
-        if !matches_glob(&rel, glob) {
+        if !filter.matches(&rel) {
             continue;
         }
         files.push(normalize_rel_path(&rel));
@@ -146,19 +147,83 @@ pub(crate) fn ensure_existing_path_inside(path: &Path, base: &Path, rel_path: &P
     Ok(())
 }
 
-fn matches_glob(rel: &Path, glob: Option<&str>) -> bool {
-    let Some(glob) = glob else {
-        return true;
+/// Compiled glob filter with gitignore-style dispatch: a pattern without `/`
+/// matches file NAMES at any depth (`*.rs` == every Rust file, as documented
+/// everywhere this parameter appears); a pattern with `/` matches the
+/// repo-relative path, `*` stopping at separators and `**` crossing them
+/// (`src/*.rs`, `src/**`, `**/*.rs`). The previous hand-rolled matcher
+/// silently matched NOTHING for shapes like `src/*.rs`.
+#[derive(Debug)]
+pub(crate) enum GlobFilter {
+    All,
+    Name(globset::GlobMatcher),
+    Path(globset::GlobMatcher),
+}
+
+pub(crate) fn compile_glob(glob: Option<&str>) -> Result<GlobFilter> {
+    let Some(pattern) = glob else {
+        return Ok(GlobFilter::All);
     };
-    let path = normalize_rel_path(rel);
-    if glob == "*" || glob == "**/*" {
-        return true;
+    let matcher = globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .with_context(|| {
+            format!(
+                "invalid glob pattern {pattern:?}; supported syntax: `*`, `?`, \
+                 `[..]`, `**` (e.g. \"*.rs\", \"src/**/*.rs\")"
+            )
+        })?
+        .compile_matcher();
+    Ok(if pattern.contains('/') {
+        GlobFilter::Path(matcher)
+    } else {
+        GlobFilter::Name(matcher)
+    })
+}
+
+impl GlobFilter {
+    fn matches(&self, rel: &Path) -> bool {
+        match self {
+            GlobFilter::All => true,
+            GlobFilter::Name(matcher) => rel
+                .file_name()
+                .is_some_and(|file_name| matcher.is_match(file_name)),
+            GlobFilter::Path(matcher) => matcher.is_match(normalize_rel_path(rel)),
+        }
     }
-    if let Some(suffix) = glob.strip_prefix("*.") {
-        return path.ends_with(&format!(".{suffix}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GlobFilter, compile_glob};
+    use std::path::Path;
+
+    fn matches(pattern: &str, rel: &str) -> bool {
+        compile_glob(Some(pattern)).unwrap().matches(Path::new(rel))
     }
-    if let Some(prefix) = glob.strip_suffix("/**") {
-        return path.starts_with(prefix);
+
+    #[test]
+    fn name_globs_match_at_any_depth() {
+        assert!(matches("*.rs", "lib.rs"));
+        assert!(matches("*.rs", "src/lib.rs"));
+        assert!(matches("*.rs", "src/nested/deep.rs"));
+        assert!(!matches("*.rs", "src/lib.ts"));
     }
-    path.contains(glob.trim_matches('*'))
+
+    #[test]
+    fn path_globs_respect_separators() {
+        assert!(matches("src/*.rs", "src/lib.rs"));
+        assert!(!matches("src/*.rs", "src/nested/deep.rs"));
+        assert!(!matches("src/*.rs", "lib.rs"));
+        assert!(matches("src/**", "src/nested/deep.rs"));
+        assert!(!matches("src/**", "src2/x.rs"));
+        assert!(matches("**/*.rs", "src/nested/deep.rs"));
+    }
+
+    #[test]
+    fn invalid_globs_error_and_none_matches_all() {
+        let err = compile_glob(Some("[")).unwrap_err();
+        assert!(err.to_string().contains("glob"), "{err:#}");
+        assert!(matches!(compile_glob(None).unwrap(), GlobFilter::All));
+    }
 }

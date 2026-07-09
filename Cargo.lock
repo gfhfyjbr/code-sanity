@@ -253,6 +253,7 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "clap",
+ "globset",
  "ignore",
  "libc",
  "log",

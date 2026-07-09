@@ -70,11 +70,50 @@ pub fn init(layout: &crate::config::Layout, verbosity: u8) {
     }
 }
 
+/// Rotate at open time: one `.old` generation, overwritten. Bounds total log
+/// disk use at ~2×MAX without new deps or signal handling; per-edit hook
+/// syncs used to grow the log forever.
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
 fn open_log_file(logs_dir: &Path) -> Option<File> {
     std::fs::create_dir_all(logs_dir).ok()?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(logs_dir.join("code-sanity.log"))
-        .ok()
+    let path = logs_dir.join("code-sanity.log");
+    rotate_if_oversized(&path, MAX_LOG_BYTES);
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+/// Best-effort by design: logging must never fail the command.
+fn rotate_if_oversized(path: &Path, max_bytes: u64) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() > max_bytes {
+        let _ = std::fs::rename(path, path.with_extension("log.old"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rotate_if_oversized;
+
+    #[test]
+    fn rotation_keeps_one_old_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code-sanity.log");
+        let old = dir.path().join("code-sanity.log.old");
+
+        std::fs::write(&path, "small").unwrap();
+        rotate_if_oversized(&path, 10);
+        assert!(path.exists() && !old.exists(), "small file must not rotate");
+
+        std::fs::write(&path, "0123456789ab").unwrap();
+        rotate_if_oversized(&path, 10);
+        assert!(!path.exists(), "oversized file must rotate away");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "0123456789ab");
+
+        // A second rotation overwrites the previous generation.
+        std::fs::write(&path, "newer-content").unwrap();
+        rotate_if_oversized(&path, 10);
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "newer-content");
+    }
 }
