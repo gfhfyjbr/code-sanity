@@ -85,6 +85,22 @@ fn read_user_version(conn: &Connection) -> Result<i64> {
         .context("read sqlite user_version")
 }
 
+/// True when `err`'s chain bottoms out in SQLite reporting a corrupt or
+/// not-a-database file. The database is fully derived state, so the right
+/// remedy is delete-and-reindex — the CLI catches this to say so instead of
+/// surfacing a raw "database disk image is malformed".
+pub fn is_corruption_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(ffi, _)) if matches!(
+                ffi.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+        )
+    })
+}
+
 fn refuse_newer_schema(version: i64) -> Result<()> {
     if version > SCHEMA_VERSION {
         // Never silently downgrade: `create table if not exists` would no-op
@@ -602,4 +618,52 @@ pub fn insert_journal_row(
     )
     .context("insert patch journal row")?;
     Ok(())
+}
+
+/// Delete the oldest `patch_journal` rows beyond `keep` (0 = unlimited);
+/// the history table stores full patch texts and grows without bound
+/// otherwise. Returns how many rows were removed.
+pub fn prune_journal_rows(conn: &Connection, keep: u64) -> Result<usize> {
+    if keep == 0 {
+        return Ok(0);
+    }
+    let removed = conn
+        .execute(
+            r#"
+            delete from patch_journal
+            where id not in (select id from patch_journal order by id desc limit ?1)
+            "#,
+            params![keep],
+        )
+        .context("prune patch journal rows")?;
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_journal_rows_keeps_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.ensure_dirs().unwrap();
+        let conn = connect(&layout).unwrap();
+        ensure_schema(&conn).unwrap();
+        for i in 0..5 {
+            insert_journal_row(&conn, None, None, &format!("patch-{i}"), "", "success", "t")
+                .unwrap();
+        }
+        assert_eq!(prune_journal_rows(&conn, 2).unwrap(), 3);
+        let kept: Vec<String> = conn
+            .prepare("select sanitized_patch from patch_journal order by id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(kept, vec!["patch-3".to_string(), "patch-4".to_string()]);
+        // 0 disables pruning.
+        assert_eq!(prune_journal_rows(&conn, 0).unwrap(), 0);
+    }
 }

@@ -200,6 +200,33 @@ pub fn ensure_no_interrupted_apply(layout: &Layout) -> Result<()> {
     Ok(())
 }
 
+/// Delete the oldest TERMINAL journal entries beyond `keep` (0 = unlimited).
+/// Returns how many were removed. `Applying` entries (the crash-recovery
+/// record) and unparseable files (possibly the sole record of an interrupted
+/// apply) are never touched; terminal entries have no in-flight marker, so no
+/// marker bookkeeping is needed. The caller must hold the exclusive workspace
+/// lock — pruning races a concurrent apply's own journal writes otherwise.
+pub fn prune_terminal_entries(layout: &Layout, keep: u64) -> Result<usize> {
+    if keep == 0 {
+        return Ok(0);
+    }
+    let listing = list_journal_entries(layout)?;
+    // `entries` is sorted by id (a sortable UTC timestamp): oldest first.
+    let terminal: Vec<&(PathBuf, JournalEntry)> = listing
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.status != JournalStatus::Applying)
+        .collect();
+    let excess = terminal.len().saturating_sub(keep as usize);
+    let mut removed = 0usize;
+    for (path, _) in terminal.into_iter().take(excess) {
+        crate::fsutil::remove_file_sync(path)
+            .with_context(|| format!("prune journal entry {}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn bail_interrupted(id: &str, count: usize) -> Result<()> {
     bail!(
         "interrupted apply {id} found ({count} pending); run `code-sanity recover` to replay \
@@ -215,4 +242,54 @@ fn bail_corrupt_journal(path: &Path, reason: &str) -> Result<()> {
          manually and re-run",
         path.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, status: JournalStatus) -> JournalEntry {
+        JournalEntry {
+            id: id.to_string(),
+            status,
+            session_id: None,
+            agent: None,
+            files: Vec::new(),
+            sanitized_patch: String::new(),
+            original_patch: String::new(),
+            error: None,
+            created_at: Utc::now().to_rfc3339(),
+            pending: None,
+        }
+    }
+
+    #[test]
+    fn prune_keeps_newest_terminals_and_never_touches_applying_or_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.ensure_dirs().unwrap();
+        // Sortable ids: 01..04 terminal (oldest first), 05 in-flight.
+        for id in ["01", "02", "03", "04"] {
+            write_journal(&layout, &entry(id, JournalStatus::Success)).unwrap();
+        }
+        write_journal(&layout, &entry("05", JournalStatus::Applying)).unwrap();
+        let corrupt = layout.journal_dir.join("00garbage.patch.json");
+        fs::write(&corrupt, "{ not json").unwrap();
+
+        assert_eq!(prune_terminal_entries(&layout, 2).unwrap(), 2);
+        assert!(!layout.journal_dir.join("01.patch.json").exists());
+        assert!(!layout.journal_dir.join("02.patch.json").exists());
+        assert!(layout.journal_dir.join("03.patch.json").exists());
+        assert!(layout.journal_dir.join("04.patch.json").exists());
+        assert!(
+            layout.journal_dir.join("05.patch.json").exists(),
+            "applying entries are the crash-recovery record; never pruned"
+        );
+        assert!(corrupt.exists(), "unparseable files are never pruned");
+
+        // keep=0 disables pruning entirely.
+        assert_eq!(prune_terminal_entries(&layout, 0).unwrap(), 0);
+        // Under the limit: nothing to do.
+        assert_eq!(prune_terminal_entries(&layout, 10).unwrap(), 0);
+    }
 }

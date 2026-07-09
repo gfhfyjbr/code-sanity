@@ -209,6 +209,40 @@ pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
             }
         }
     }
+
+    // Numeric ranges: out-of-range values would not fail loudly anywhere —
+    // they silently route everything (or nothing) to review, skip every file,
+    // or degenerate the chunker — so they are policy violations with fix-its.
+    let sanitizer = &config.sanitizer;
+    if !(0.0..=1.0).contains(&sanitizer.confidence_threshold) {
+        violations.push(format!(
+            "sanitizer.confidence_threshold {} is outside 0.0..=1.0",
+            sanitizer.confidence_threshold
+        ));
+    }
+    if sanitizer.propose_max_file_bytes == 0 {
+        violations.push(
+            "sanitizer.propose_max_file_bytes is 0; every file would be silently skipped"
+                .to_string(),
+        );
+    }
+    if config.ignore.max_file_bytes == 0 {
+        violations
+            .push("ignore.max_file_bytes is 0; every file would be silently skipped".to_string());
+    }
+    let embeddings = &config.embeddings;
+    if embeddings.chunk_lines == 0 {
+        violations.push("embeddings.chunk_lines must be at least 1".to_string());
+    }
+    if embeddings.chunk_lines > 0 && embeddings.chunk_overlap >= embeddings.chunk_lines {
+        violations.push(format!(
+            "embeddings.chunk_overlap ({}) must be smaller than embeddings.chunk_lines ({})",
+            embeddings.chunk_overlap, embeddings.chunk_lines
+        ));
+    }
+    if embeddings.batch_size == 0 {
+        violations.push("embeddings.batch_size must be at least 1".to_string());
+    }
     violations
 }
 
@@ -956,6 +990,38 @@ mod tests {
             sanitizer_policy_violations(&Config::default()),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn numeric_ranges_are_policy_violations() {
+        let mut config = Config::default();
+        config.sanitizer.confidence_threshold = 5.0;
+        config.sanitizer.propose_max_file_bytes = 0;
+        config.ignore.max_file_bytes = 0;
+        config.embeddings.chunk_lines = 4;
+        config.embeddings.chunk_overlap = 4; // must be < chunk_lines
+        config.embeddings.batch_size = 0;
+        let violations = sanitizer_policy_violations(&config);
+        for needle in [
+            "confidence_threshold",
+            "propose_max_file_bytes",
+            "ignore.max_file_bytes",
+            "chunk_overlap",
+            "batch_size",
+        ] {
+            assert!(
+                violations.iter().any(|v| v.contains(needle)),
+                "missing {needle} violation in {violations:?}"
+            );
+        }
+        assert!(crate::sanitize::validate_sanitizer_config(&config).is_err());
+
+        // In-range values stay clean.
+        let mut config = Config::default();
+        config.sanitizer.confidence_threshold = 0.0;
+        assert_eq!(sanitizer_policy_violations(&config), Vec::<String>::new());
+        config.sanitizer.confidence_threshold = 1.0;
+        assert_eq!(sanitizer_policy_violations(&config), Vec::<String>::new());
     }
 
     #[test]

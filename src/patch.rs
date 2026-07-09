@@ -210,6 +210,7 @@ pub(crate) fn apply_patch_text_locked(
         &original_patch,
         &files,
         &planned,
+        config.journal.max_entries,
         fail_after_writes_for_test,
     )?;
 
@@ -859,6 +860,7 @@ pub fn rename_alias(
         &original_patch,
         std::slice::from_ref(&rel_string),
         &planned,
+        config_for_rename.journal.max_entries,
         None,
     )?;
 
@@ -1106,6 +1108,7 @@ fn commit_planned_apply(
     original_patch: &str,
     files: &[String],
     planned: &[PlannedFileApply],
+    journal_max_entries: u64,
     fail_after_writes_for_test: Option<usize>,
 ) -> Result<PathBuf> {
     // Record the full intent (before/after per file) BEFORE touching any real
@@ -1174,6 +1177,13 @@ fn commit_planned_apply(
                 // renderings are stale; reconverge before releasing the lock.
                 reconverge_workspace(root, layout)
                     .context("reindex after protected symbol change")?;
+            }
+            // Best-effort retention sweep under the already-held lock: a
+            // pruning failure must never fail an apply that already landed.
+            if let Err(err) = crate::journal::prune_terminal_entries(layout, journal_max_entries)
+                .and_then(|_| db::prune_journal_rows(conn, journal_max_entries))
+            {
+                log::warn!("journal pruning failed: {err:#}");
             }
             Ok(journal_path)
         }

@@ -87,6 +87,32 @@ pub struct Config {
     /// Optional semantic index over the sanitized mirror (disabled by default).
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub journal: JournalConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalConfig {
+    /// Terminal journal entries (success/conflict/rolled-back) kept on disk
+    /// and rows kept in the `patch_journal` table; the oldest beyond this are
+    /// pruned after each successful apply. Entries hold full before/after
+    /// file snapshots, so an unbounded journal grows without limit on a busy
+    /// workspace. `0` disables pruning. In-flight (`applying`) entries and
+    /// unparseable files are never pruned.
+    #[serde(default = "default_journal_max_entries")]
+    pub max_entries: u64,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: default_journal_max_entries(),
+        }
+    }
+}
+
+fn default_journal_max_entries() -> u64 {
+    500
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -417,6 +443,7 @@ impl Default for Config {
                 max_file_bytes: 1024 * 1024,
             },
             embeddings: EmbeddingsConfig::default(),
+            journal: JournalConfig::default(),
         }
     }
 }

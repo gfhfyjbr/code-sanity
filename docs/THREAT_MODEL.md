@@ -102,6 +102,17 @@ The real file changes outside the bridge, so the mirror is stale.
 - **Residual risk:** a read between an external edit and the next `sync` serves
   stale (but still sanitized) content.
 
+### 5a. Workspace on a network filesystem
+All writer serialization is a single advisory `flock(2)`. On NFS/SMB/CIFS,
+`flock` may be host-local (or a no-op) depending on mount options and server
+support, so two hosts editing the same workspace can both hold the "exclusive"
+lock and silently corrupt the mirror/db.
+- **Mitigation:** a best-effort per-process warning is logged when the lock
+  file's filesystem looks networked (statfs); the db/mirror are derived state
+  and rebuildable by `index`.
+- **Residual risk:** the warning is advisory, not a gate. Keep the repo on a
+  local filesystem; the real files themselves are not protected by a rebuild.
+
 ### 6. Crash mid-apply
 The process dies after real files start changing.
 - **Mitigation:** the full before/after intent is journaled as `applying` and

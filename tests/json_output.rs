@@ -227,6 +227,31 @@ fn mode_doctor_and_review_list_shapes() {
 }
 
 #[test]
+fn corrupt_db_error_names_the_remedy() {
+    let repo = copy_fixture("basic-rust");
+    index(repo.path());
+    fs::write(
+        repo.path().join(".code-sanity/db.sqlite"),
+        "this is not a sqlite database at all",
+    )
+    .unwrap();
+    // Remove WAL sidecars so sqlite reads the corrupt main file.
+    for sidecar in ["db.sqlite-wal", "db.sqlite-shm"] {
+        let _ = fs::remove_file(repo.path().join(".code-sanity").join(sidecar));
+    }
+    let assert = cli(repo.path()).arg("verify").assert().code(1);
+    let output = assert.get_output();
+    let value = envelope(&output.stdout);
+    assert_eq!(value["error"]["kind"], "error");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("delete .code-sanity/db.sqlite"),
+        "corruption must name the remedy, got: {message}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("db.sqlite"));
+}
+
+#[test]
 fn sh_and_strict_run_reject_json_as_usage_error() {
     let repo = copy_fixture("basic-rust");
     for command in ["sh", "strict-run"] {

@@ -329,6 +329,16 @@ pub fn run() -> Result<()> {
                 eprint!("{failed}");
                 std::process::exit(3);
             }
+            // A corrupt db.sqlite would otherwise surface as a raw rusqlite
+            // error; the database is derived state, so name the remedy.
+            let err = if crate::db::is_corruption_error(&err) {
+                err.context(
+                    "db.sqlite appears corrupt; the database is derived state — \
+                     delete .code-sanity/db.sqlite and run `code-sanity index` to rebuild",
+                )
+            } else {
+                err
+            };
             if out.is_json() {
                 crate::output::emit_error(
                     name,
