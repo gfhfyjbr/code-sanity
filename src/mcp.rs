@@ -113,6 +113,12 @@ fn redact_error(root: &Path, message: &str) -> String {
     const GENERIC: &str = "error: tool failed and the output redactor is unavailable; \
                            details withheld — run `code-sanity verify` on the host for diagnostics";
     let layout = crate::config::Layout::new(root);
+    // Never conjure a .code-sanity dir from the error path (acquiring the
+    // lock would create tmp/): an uninitialized workspace gets the generic
+    // message, which is also fail-closed.
+    if layout.require_initialized().is_err() {
+        return GENERIC.to_string();
+    }
     let Ok(_lock) = crate::lock::WorkspaceLock::acquire_shared(&layout) else {
         return GENERIC.to_string();
     };

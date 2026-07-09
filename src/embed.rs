@@ -109,20 +109,22 @@ pub struct EmbedReport {
 /// request; untracked files lose their vectors.
 pub fn embed_index(root: &Path) -> Result<EmbedReport> {
     let layout = Layout::new(root);
+    layout.require_initialized()?;
     let config = Config::load_or_default(&layout)?;
     ensure_enabled(&config)?;
     let client = client_for(&config)?;
     let fingerprint = embed_fingerprint(&config);
     let mut conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
 
     let mut report = EmbedReport::default();
 
     // Snapshot the tracked set and drop vectors of files nothing tracks.
     // Sweep and snapshot share one exclusive lock (all DB writers hold it),
-    // so the sweep can never delete rows a concurrent index just produced.
+    // so the sweep can never delete rows a concurrent index just produced —
+    // and schema init (a write) belongs under the same lock.
     let tracked: Vec<String> = {
         let _lock = WorkspaceLock::acquire(&layout)?;
+        db::ensure_schema(&conn)?;
         crate::journal::ensure_no_interrupted_apply(&layout)?;
         let tracked = db::tracked_files(&conn)?;
         let tracked_set: BTreeSet<&String> = tracked.iter().collect();
@@ -238,6 +240,7 @@ pub fn semantic_search(root: &Path, query: &str, k: usize) -> Result<Vec<Semanti
         bail!("semantic search query must not be empty");
     }
     let layout = Layout::new(root);
+    layout.require_initialized()?;
     let config = Config::load_or_default(&layout)?;
     ensure_enabled(&config)?;
     let client = client_for(&config)?;
@@ -248,7 +251,7 @@ pub fn semantic_search(root: &Path, query: &str, k: usize) -> Result<Vec<Semanti
 
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
     let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
+    db::check_schema(&conn)?;
 
     // Top-k selection over a streamed scan: every vector is scored, but only
     // k (score, rowid) pairs are ever held; chunk texts are fetched afterwards
@@ -375,7 +378,7 @@ mod tests {
         let layout = Layout::new(dir.path());
         layout.ensure_dirs().unwrap();
         let mut conn = db::connect(&layout).unwrap();
-        db::init_schema(&conn).unwrap();
+        db::ensure_schema(&conn).unwrap();
         let snapshot = "snapshot content";
         let file_sha = sha256_hex(snapshot.as_bytes());
         let rows = vec![(1usize, 1usize, snapshot, vector_to_blob(&[1.0, 0.0]))];

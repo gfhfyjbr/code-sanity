@@ -25,25 +25,29 @@ pub fn connect(layout: &Layout) -> Result<Connection> {
     Ok(conn)
 }
 
-pub fn init_schema(conn: &Connection) -> Result<()> {
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .context("read sqlite user_version")?;
-    if version > SCHEMA_VERSION {
-        // Never silently downgrade: `create table if not exists` would no-op
-        // against unknown newer shapes and then stamp the old version over it.
-        bail!(
-            "db.sqlite has schema version {version}, newer than this build's \
-             {SCHEMA_VERSION}; upgrade code-sanity or delete .code-sanity/db.sqlite \
-             (the database is derived state, `index` rebuilds it)"
-        );
+/// Create or migrate the schema. The caller MUST hold the exclusive workspace
+/// lock: migration drops derived tables, and even the create-if-missing batch
+/// races a concurrent migrator. A current version returns immediately without
+/// touching the header page, so misuse on a read path degrades to a no-op
+/// rather than a write.
+pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    let version = read_user_version(conn)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
     }
-    if version != 0 && version < SCHEMA_VERSION {
+    refuse_newer_schema(version)?;
+    // Read-check-drop-create-stamp must be atomic: a crash or error mid-way
+    // must leave either the old schema (old version stamp) or the new one.
+    // DDL is transactional in SQLite, so one transaction covers all of it.
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin schema transaction")?;
+    if version != 0 {
         // NOTE for the next SCHEMA_VERSION bump: every derived table that has
         // existed in ANY released version must be in this drop list —
         // embedding_state/embedding_chunks (added in v2) are absent only
         // because no pre-v2 database can contain them.
-        conn.execute_batch(
+        tx.execute_batch(
             r#"
             drop table if exists spans;
             drop table if exists replacements;
@@ -53,7 +57,48 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         )
         .context("drop outdated derived tables")?;
     }
+    create_tables(&tx)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .context("set sqlite user_version")?;
+    tx.commit().context("commit schema transaction")
+}
 
+/// Read-path guard: verify the schema is current without writing anything.
+/// An outdated (or fresh, version 0) database is an error directing the user
+/// to `index`, never an in-place migration — read paths hold only the shared
+/// lock, and migration under a shared lock can drop tables under a writer.
+pub fn check_schema(conn: &Connection) -> Result<()> {
+    let version = read_user_version(conn)?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    refuse_newer_schema(version)?;
+    bail!(
+        "db.sqlite has schema version {version}, older than this build's \
+         {SCHEMA_VERSION}; run `code-sanity index` to migrate (the database \
+         is derived state)"
+    );
+}
+
+fn read_user_version(conn: &Connection) -> Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("read sqlite user_version")
+}
+
+fn refuse_newer_schema(version: i64) -> Result<()> {
+    if version > SCHEMA_VERSION {
+        // Never silently downgrade: `create table if not exists` would no-op
+        // against unknown newer shapes and then stamp the old version over it.
+        bail!(
+            "db.sqlite has schema version {version}, newer than this build's \
+             {SCHEMA_VERSION}; upgrade code-sanity or delete .code-sanity/db.sqlite \
+             (the database is derived state, `index` rebuilds it)"
+        );
+    }
+    Ok(())
+}
+
+fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
         create table if not exists files(
@@ -129,10 +174,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         create index if not exists embedding_chunks_rel on embedding_chunks(rel_path);
         "#,
     )
-    .context("initialize sqlite schema")?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-        .context("set sqlite user_version")?;
-    Ok(())
+    .context("initialize sqlite schema")
 }
 
 /// Per-file incremental index state: input fingerprint (content hash plus the
@@ -345,16 +387,22 @@ pub fn file_hashes(conn: &Connection, rel_path: &str) -> Result<Option<(String, 
     .context("load file hashes")
 }
 
+/// Drop every row a file owns (files cascades to replacements/spans, plus
+/// index_state and embeddings) in one transaction — a crash mid-removal must
+/// not leave a files-less index_state row for `verify` to trip over.
 pub fn remove_file(conn: &Connection, rel_path: &str) -> Result<()> {
-    conn.execute("delete from files where rel_path = ?1", params![rel_path])
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin remove transaction")?;
+    tx.execute("delete from files where rel_path = ?1", params![rel_path])
         .with_context(|| format!("remove stale db row for {rel_path}"))?;
-    conn.execute(
+    tx.execute(
         "delete from index_state where rel_path = ?1",
         params![rel_path],
     )
     .with_context(|| format!("remove stale index_state row for {rel_path}"))?;
-    remove_embeddings(conn, rel_path)?;
-    Ok(())
+    remove_embeddings(&tx, rel_path)?;
+    tx.commit().context("commit remove transaction")
 }
 
 /// The last embedded state of one mirror file: (mirror content sha256, embed

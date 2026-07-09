@@ -351,6 +351,8 @@ pub fn propose_sanitize(
     rel: Option<&Path>,
     allow: ProviderAllow,
 ) -> Result<ProposeReport> {
+    // Plain init (the wrapper drops the exclusive lock): provider calls may
+    // block on HTTP or a child process and must not starve workspace writers.
     let layout = crate::index::init_workspace(root)?;
     let config = Config::load_or_default(&layout)?;
     let provider = provider_for(&config, allow)?;
@@ -358,8 +360,10 @@ pub fn propose_sanitize(
     let files = match rel {
         Some(rel) => vec![crate::config::normalize_rel_path(rel)],
         None => {
+            // Short shared lock just for the tracked-file snapshot.
+            let _lock = WorkspaceLock::acquire_shared(&layout)?;
             let conn = db::connect(&layout)?;
-            db::init_schema(&conn)?;
+            db::check_schema(&conn)?;
             db::tracked_files(&conn)?
         }
     };
@@ -491,11 +495,10 @@ pub fn list_review(root: &Path, include_resolved: bool) -> Result<Vec<ReviewItem
 /// registry (deterministic) and reindexes the affected file so the deterministic
 /// engine applies it; rejecting just marks the item.
 pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem> {
-    let layout = crate::index::init_workspace(root)?;
     // Approval is a read-modify-write of the config registry plus a reindex;
     // hold the exclusive lock for the whole sequence so concurrent approvals
     // cannot lose registry entries.
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = crate::index::init_workspace_locked(root)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     let path = layout.review_dir.join(format!("{id}.json"));
     let raw = std::fs::read_to_string(&path)
@@ -548,8 +551,10 @@ pub struct AuditRow {
 /// Audit report of every applied replacement, read from the span maps.
 pub fn audit_replacements(root: &Path, rel: Option<&Path>) -> Result<Vec<AuditRow>> {
     let layout = Layout::new(root);
+    layout.require_initialized()?;
+    let _lock = WorkspaceLock::acquire_shared(&layout)?;
     let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
+    db::check_schema(&conn)?;
     let files = match rel {
         Some(rel) => vec![crate::config::normalize_rel_path(rel)],
         None => db::tracked_files(&conn)?,

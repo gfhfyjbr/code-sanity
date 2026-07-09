@@ -65,7 +65,7 @@ fn old_user_version_drops_derived_tables_and_preserves_journal() {
     set_user_version(repo.path(), 1);
 
     let conn = db::connect(&layout).unwrap();
-    db::init_schema(&conn).unwrap();
+    db::ensure_schema(&conn).unwrap();
 
     assert_eq!(user_version(repo.path()), 2);
     let files: i64 = conn
@@ -83,7 +83,7 @@ fn old_user_version_drops_derived_tables_and_preserves_journal() {
     assert_eq!(journal, 1, "patch_journal history must survive migration");
     // Documented current behavior: embedding tables were added in v2, so the
     // v1->v2 drop list does not touch them. A future SCHEMA_VERSION bump must
-    // extend the drop list (see the NOTE in init_schema).
+    // extend the drop list (see the NOTE in ensure_schema).
     let chunks: i64 = conn
         .query_row("select count(*) from embedding_chunks", [], |row| {
             row.get(0)
@@ -101,7 +101,7 @@ fn pre_versioning_v0_database_is_not_dropped() {
 
     let layout = Layout::new(repo.path());
     let conn = db::connect(&layout).unwrap();
-    db::init_schema(&conn).unwrap();
+    db::ensure_schema(&conn).unwrap();
 
     assert_eq!(user_version(repo.path()), 2);
     // init created a .gitignore next to src/a.rs; both rows must survive.
@@ -118,7 +118,7 @@ fn future_schema_version_is_refused_without_downgrade() {
 
     let layout = Layout::new(repo.path());
     let conn = db::connect(&layout).unwrap();
-    let err = db::init_schema(&conn).unwrap_err();
+    let err = db::ensure_schema(&conn).unwrap_err();
     assert!(err.to_string().contains("schema version 3"), "{err:#}");
     drop(conn);
 
@@ -130,11 +130,87 @@ fn future_schema_version_is_refused_without_downgrade() {
 }
 
 #[test]
+fn read_paths_never_migrate_or_stamp_the_version() {
+    let repo = indexed_workspace();
+    set_user_version(repo.path(), 1);
+
+    // A read command on an outdated schema must direct the user to `index`,
+    // not migrate in place (it holds only the shared lock) and not write the
+    // version header.
+    let err = code_sanity::verify_workspace(repo.path()).unwrap_err();
+    assert!(err.to_string().contains("code-sanity index"), "{err:#}");
+    assert_eq!(user_version(repo.path()), 1, "read path wrote user_version");
+
+    let layout = Layout::new(repo.path());
+    let conn = db::connect(&layout).unwrap();
+    let files: i64 = conn
+        .query_row("select count(*) from files", [], |row| row.get(0))
+        .unwrap();
+    assert!(files > 0, "read path dropped derived tables");
+}
+
+#[test]
+fn check_schema_covers_current_newer_and_older() {
+    let repo = indexed_workspace();
+    let layout = Layout::new(repo.path());
+    let conn = db::connect(&layout).unwrap();
+    db::check_schema(&conn).unwrap();
+    drop(conn);
+
+    set_user_version(repo.path(), 3);
+    let conn = db::connect(&layout).unwrap();
+    let err = db::check_schema(&conn).unwrap_err();
+    assert!(err.to_string().contains("newer"), "{err:#}");
+    drop(conn);
+
+    set_user_version(repo.path(), 1);
+    let conn = db::connect(&layout).unwrap();
+    let err = db::check_schema(&conn).unwrap_err();
+    assert!(err.to_string().contains("older"), "{err:#}");
+    assert!(err.to_string().contains("code-sanity index"), "{err:#}");
+}
+
+#[test]
+fn concurrent_index_after_upgrade_is_serialized() {
+    // The drop-tables-under-a-writer race: several processes hit the v1->v2
+    // migration at once. The exclusive lock inside init must serialize them so
+    // every run exits clean and the final state verifies.
+    let repo = indexed_workspace();
+    set_user_version(repo.path(), 1);
+
+    let binary = assert_cmd::cargo::cargo_bin("code-sanity");
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let binary = binary.clone();
+            let root = repo.path().to_path_buf();
+            std::thread::spawn(move || {
+                std::process::Command::new(&binary)
+                    .arg("--root")
+                    .arg(&root)
+                    .arg("index")
+                    .output()
+                    .unwrap()
+            })
+        })
+        .collect();
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "concurrent index failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(user_version(repo.path()), 2);
+    assert!(code_sanity::verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
 fn reindex_after_migration_repopulates_derived_state() {
     let repo = indexed_workspace();
     set_user_version(repo.path(), 1);
 
-    // index_workspace calls init_schema internally: migrate + rebuild.
+    // index_workspace calls ensure_schema internally: migrate + rebuild.
     code_sanity::index_workspace(repo.path()).unwrap();
 
     let layout = Layout::new(repo.path());

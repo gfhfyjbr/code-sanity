@@ -104,3 +104,59 @@ fn readers_never_observe_torn_mirrors_or_leaks_during_writes() {
     });
     assert!(verify_workspace(repo.path()).is_ok());
 }
+
+#[test]
+fn concurrent_first_init_agrees_on_one_salt_and_gitignore_line() {
+    // Two first-time processes racing init used to write different salts
+    // (last-writer-wins) and could drop a concurrent .gitignore edit; init's
+    // side effects now run under the exclusive lock.
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join("a.rs"), "fn a() {}\n").unwrap();
+
+    let binary = assert_cmd::cargo::cargo_bin("code-sanity");
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let binary = binary.clone();
+            let root = repo.path().to_path_buf();
+            std::thread::spawn(move || {
+                std::process::Command::new(&binary)
+                    .arg("--root")
+                    .arg(&root)
+                    .arg("init")
+                    .output()
+                    .unwrap()
+            })
+        })
+        .collect();
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "concurrent init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let config = fs::read_to_string(repo.path().join(".code-sanity/config.toml")).unwrap();
+    let salt_line = config
+        .lines()
+        .find(|line| line.starts_with("salt"))
+        .unwrap()
+        .to_string();
+    // Re-running init must not change the salt (write_if_missing).
+    std::process::Command::new(&binary)
+        .arg("--root")
+        .arg(repo.path())
+        .arg("init")
+        .output()
+        .unwrap();
+    let config_after = fs::read_to_string(repo.path().join(".code-sanity/config.toml")).unwrap();
+    assert!(config_after.contains(&salt_line), "salt changed on re-init");
+
+    let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+    let entries = gitignore
+        .lines()
+        .filter(|line| line.trim() == ".code-sanity/")
+        .count();
+    assert_eq!(entries, 1, "gitignore entry duplicated: {gitignore:?}");
+}

@@ -51,6 +51,21 @@ impl Layout {
         Ok(())
     }
 
+    /// Read-path guard: fail without creating any state when the workspace
+    /// has never been initialized. Write paths go through init and create the
+    /// state dir; read commands pointed at a random directory must not conjure
+    /// a `.code-sanity/` there just to report an error.
+    pub fn require_initialized(&self) -> Result<()> {
+        if self.state_dir.is_dir() {
+            return Ok(());
+        }
+        bail!(
+            "{} is not a code-sanity workspace; run `code-sanity init` \
+             (or `code-sanity index`) first",
+            self.root.display()
+        )
+    }
+
     pub fn map_path(&self, rel_path: &Path) -> PathBuf {
         let mut out = self.maps_dir.join(rel_path);
         let file_name = rel_path

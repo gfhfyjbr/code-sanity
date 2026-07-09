@@ -8,7 +8,11 @@
 //! process exits, so a crash mid-apply never wedges the workspace.
 //!
 //! flock is per open file description: never acquire a second lock on the same
-//! workspace from a process already holding one — it self-deadlocks.
+//! workspace from a process already holding one — it self-deadlocks. In
+//! practice: entry points take the lock exactly once via
+//! `index::init_workspace_locked` (or a direct `acquire`) and pass control to
+//! `_locked` functions from there; `acquire`/`acquire_shared` must be
+//! unreachable while the same process already holds a workspace lock.
 
 use crate::config::Layout;
 use anyhow::{Context, Result};

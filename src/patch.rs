@@ -1,13 +1,12 @@
 use crate::config::{Config, Layout, normalize_rel_path, normalize_safe_rel_path};
 use crate::db;
 use crate::index::{
-    index_single_file_locked, init_workspace, reconverge_workspace,
+    index_single_file_locked, init_workspace_locked, reconverge_workspace,
     stored_protected_union_with_override,
 };
 use crate::journal::{
     JournalEntry, JournalStatus, PendingFile, list_journal_entries, new_journal_id, write_journal,
 };
-use crate::lock::WorkspaceLock;
 use crate::map::{SpanMap, common_changed_range, load_span_map, sha256_hex};
 use crate::sanitize::{
     Term, adapt_replacement, collect_protected_identifiers, hits_in_run, normalize_term,
@@ -113,8 +112,7 @@ fn apply_patch_text_with_options_inner(
     options: ApplyOptions,
     fail_after_writes_for_test: Option<usize>,
 ) -> Result<ApplyReport> {
-    let layout = init_workspace(root)?;
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = init_workspace_locked(root)?;
     apply_patch_text_locked(
         root,
         &layout,
@@ -136,7 +134,7 @@ pub(crate) fn apply_patch_text_locked(
     crate::journal::ensure_no_interrupted_apply(layout)?;
     let config = Config::load_or_default(layout)?;
     let conn = db::connect(layout)?;
-    db::init_schema(&conn)?;
+    db::ensure_schema(&conn)?;
 
     let parsed = parse_unified_patch(patch_text)?;
     if parsed.files.is_empty() {
@@ -524,7 +522,9 @@ pub fn write_sanitized_content(
     sanitized_content: &str,
 ) -> Result<ApplyReport> {
     let rel_path = normalize_sanitized_rel_path(rel_path)?;
-    let layout = Layout::new(root);
+    // One exclusive lock across read-diff-apply: reading the mirror unlocked
+    // would let a concurrent sync change it between the diff and the apply.
+    let (layout, _lock) = init_workspace_locked(root)?;
     let mirror_path = layout.mirror_dir.join(&rel_path);
     ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, &rel_path)?;
     let current = fs::read_to_string(&mirror_path).with_context(|| {
@@ -534,7 +534,6 @@ pub fn write_sanitized_content(
         )
     })?;
     if current == sanitized_content {
-        let layout = init_workspace(root)?;
         let entry = JournalEntry {
             id: new_journal_id(),
             status: JournalStatus::Success,
@@ -554,7 +553,7 @@ pub fn write_sanitized_content(
         });
     }
     let patch = whole_file_patch(&rel_path, &current, sanitized_content);
-    apply_patch_text(root, &patch)
+    apply_patch_text_locked(root, &layout, &patch, ApplyOptions::default(), None)
 }
 
 /// Back-project an in-place edit of a mirror file to the real repo. This is the
@@ -570,11 +569,10 @@ pub fn project_mirror_edit(
     options: ApplyOptions,
 ) -> Result<ApplyReport> {
     let rel = normalize_sanitized_rel_path(rel_path)?;
-    let layout = init_workspace(root)?;
     // One exclusive lock across the whole read-refresh-diff-apply sequence: a
     // concurrent sync or edit can neither clobber the captured mirror edit nor
     // interleave with the baseline refresh.
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = init_workspace_locked(root)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
 
     let mirror_path = layout.mirror_dir.join(&rel);
@@ -601,7 +599,7 @@ pub fn project_mirror_edit(
     // the external change. Record the edit in a conflict journal entry (the
     // durable copy), reset the mirror to sanitize(real), and refuse.
     let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
+    db::ensure_schema(&conn)?;
     let real_content = fs::read_to_string(&real_path)
         .with_context(|| format!("read real file {}", real_path.display()))?;
     let drifted = match db::file_hashes(&conn, &rel_string)? {
@@ -694,11 +692,10 @@ pub fn rename_alias(
         bail!("rename target {to:?} is not a valid identifier");
     }
 
-    let layout = init_workspace(root)?;
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = init_workspace_locked(root)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
+    db::ensure_schema(&conn)?;
 
     let rel = normalize_sanitized_rel_path(rel_path)?;
     let rel_string = normalize_rel_path(&rel);
@@ -817,12 +814,11 @@ pub struct RecoverReport {
 /// target). Anything else means newer work landed after the crash; the file is
 /// reported as a conflict and left alone unless `force` overrides.
 pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<RecoverReport> {
-    let layout = init_workspace(root)?;
     // flock is released by the kernel when the crashed process died, so a
     // leftover lock file is harmless; recover just takes the lock normally.
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = init_workspace_locked(root)?;
     let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
+    db::ensure_schema(&conn)?;
 
     let mut report = RecoverReport {
         rolled_back: rollback,

@@ -395,7 +395,7 @@ fn embed_index_sweeps_untracked_embedding_rows() {
     // Plant vectors for a path nothing tracks (e.g. leftovers from an
     // interrupted run whose file was deleted before its rows were swept).
     let mut conn = code_sanity::db::connect(&layout).unwrap();
-    code_sanity::db::init_schema(&conn).unwrap();
+    code_sanity::db::ensure_schema(&conn).unwrap();
     code_sanity::db::replace_embeddings(
         &mut conn,
         "ghost.txt",

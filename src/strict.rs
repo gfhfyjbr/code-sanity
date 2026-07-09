@@ -71,6 +71,7 @@ pub fn run(root: &Path, command: &[String], in_worktree: bool) -> Result<i32> {
     // child runs so long commands do not starve writers.
     let (sanitizer, worktree) = {
         let layout = crate::config::Layout::new(root);
+        layout.require_initialized()?;
         let _lock = crate::lock::WorkspaceLock::acquire_shared(&layout)?;
         let pairs = build_reverse_pairs(root)?;
         let sanitizer = std::sync::Arc::new(OutputSanitizer::new(&pairs)?);
@@ -154,9 +155,10 @@ fn stream_sanitized(
 /// longest, but a deterministic order keeps replacement choices stable).
 pub fn build_reverse_pairs(root: &Path) -> Result<Vec<(String, String)>> {
     let layout = Layout::new(root);
+    layout.require_initialized()?;
     let config = Config::load_or_default(&layout)?;
     let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
+    db::check_schema(&conn)?;
 
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for file in db::tracked_files(&conn)? {

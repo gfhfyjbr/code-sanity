@@ -34,21 +34,32 @@ pub struct IndexReport {
     pub stashed: Vec<String>,
 }
 
-pub fn init_workspace(root: &Path) -> Result<Layout> {
+/// Ensure dirs, acquire the exclusive lock, then — under it — write the
+/// default config/salt if missing, ensure the `.gitignore` entry, and ensure
+/// the DB schema. Returns the held lock so the caller continues under the
+/// same acquisition: re-acquiring from the same process would self-deadlock
+/// (flock, see lock.rs), and init's read-modify-writes (salt, .gitignore,
+/// schema migration) must not race a concurrent first run.
+pub(crate) fn init_workspace_locked(root: &Path) -> Result<(Layout, WorkspaceLock)> {
     let layout = Layout::new(root);
     layout.ensure_dirs()?;
+    let lock = WorkspaceLock::acquire(&layout)?;
     let mut config = Config::default();
     config.salt = crate::config::random_salt();
     config.write_if_missing(&layout)?;
     ensure_gitignore_entry(root, ".code-sanity/")?;
     let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
+    db::ensure_schema(&conn)?;
+    Ok((layout, lock))
+}
+
+pub fn init_workspace(root: &Path) -> Result<Layout> {
+    let (layout, _lock) = init_workspace_locked(root)?;
     Ok(layout)
 }
 
 pub fn index_workspace(root: &Path) -> Result<IndexReport> {
-    let layout = init_workspace(root)?;
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = init_workspace_locked(root)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     index_workspace_locked(root, &layout)
 }
@@ -57,8 +68,7 @@ pub fn index_workspace(root: &Path) -> Result<IndexReport> {
 /// edits back to sanitize(real). The recovery path when a mirror was tampered
 /// with or an agent edit must be discarded.
 pub fn index_workspace_force(root: &Path) -> Result<IndexReport> {
-    let layout = init_workspace(root)?;
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = init_workspace_locked(root)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     index_workspace_locked_inner(root, &layout, true)
 }
@@ -75,7 +85,7 @@ fn index_workspace_locked_inner(
 ) -> Result<IndexReport> {
     let config = Config::load_or_default(layout)?;
     let mut conn = db::connect(layout)?;
-    db::init_schema(&conn)?;
+    db::ensure_schema(&conn)?;
 
     let states: BTreeMap<String, IndexState> = db::all_index_states(&conn)?
         .into_iter()
@@ -251,8 +261,7 @@ fn index_workspace_locked_inner(
 /// mirror (used by the patch bridge and proposal approval, where the mirror
 /// must be reset to sanitize(real)).
 pub fn index_single_file(root: &Path, rel: &Path) -> Result<SpanMap> {
-    let layout = init_workspace(root)?;
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = init_workspace_locked(root)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     let indexed = index_single_file_locked(root, &layout, rel, true)?;
     Ok(indexed.span_map)
@@ -260,14 +269,12 @@ pub fn index_single_file(root: &Path, rel: &Path) -> Result<SpanMap> {
 
 /// Sync one path (used by agent hooks): pending mirror edits are preserved.
 pub fn sync_single_file(root: &Path, rel: &Path) -> Result<IndexReport> {
-    let layout = init_workspace(root)?;
-    let _lock = WorkspaceLock::acquire(&layout)?;
+    let (layout, _lock) = init_workspace_locked(root)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     let mut report = IndexReport::default();
     if !root.join(rel).exists() {
         // The real file is gone: drop its targets.
         let conn = db::connect(&layout)?;
-        db::init_schema(&conn)?;
         let rel_string = normalize_rel_path(rel);
         db::remove_file(&conn, &rel_string)?;
         remove_if_exists(layout.mirror_dir.join(rel))?;
@@ -309,7 +316,7 @@ pub(crate) fn index_single_file_locked(
 ) -> Result<SingleFileIndex> {
     let config = Config::load_or_default(layout)?;
     let mut conn = db::connect(layout)?;
-    db::init_schema(&conn)?;
+    db::ensure_schema(&conn)?;
 
     let rel_string = normalize_rel_path(rel);
     let source_path = root.join(rel);

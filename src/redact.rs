@@ -45,9 +45,10 @@ impl Redactor {
     /// process — flock would self-deadlock).
     pub fn for_workspace(root: &Path) -> Result<Self> {
         let layout = Layout::new(root);
+        layout.require_initialized()?;
         let config = Config::load_or_default(&layout)?;
         let conn = db::connect(&layout)?;
-        db::init_schema(&conn)?;
+        db::check_schema(&conn)?;
 
         let mut terms = term_table(&config);
         let mut seen: BTreeSet<String> = terms.iter().map(|term| term.normalized.clone()).collect();

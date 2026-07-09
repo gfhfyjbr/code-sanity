@@ -45,12 +45,13 @@ impl std::error::Error for VerifyFailed {}
 
 pub fn verify_workspace(root: &Path) -> Result<VerifyReport> {
     let layout = Layout::new(root);
+    layout.require_initialized()?;
     // Verify only reads; a shared lock keeps writers out for a consistent
     // snapshot while letting other readers proceed.
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
     let config = Config::load_or_default(&layout)?;
     let conn = db::connect(&layout)?;
-    db::init_schema(&conn)?;
+    db::check_schema(&conn)?;
     let mut report = VerifyReport::default();
 
     let tracked = db::tracked_files(&conn)?;
