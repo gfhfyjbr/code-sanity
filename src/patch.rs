@@ -839,6 +839,23 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
         let Some(pending) = entry.pending.clone() else {
             continue;
         };
+        // The journal is local state, but recover writes REAL files from it:
+        // a hand-tampered entry with a `..` rel must not direct writes (or
+        // temp sweeps) outside the repo. Fail closed: report, leave the entry
+        // in `applying`, recover the rest.
+        if let Some(bad) = pending
+            .iter()
+            .find(|file| normalize_safe_rel_path(Path::new(&file.rel), "repo").is_err())
+        {
+            report.conflicts.push(format!(
+                "{}: journal entry {} has a pending path escaping the repo; \
+                 refusing to recover it (inspect {} manually)",
+                bad.rel,
+                entry.id,
+                path.display()
+            ));
+            continue;
+        }
         for pending_file in &pending {
             let real_dir = root
                 .join(&pending_file.rel)

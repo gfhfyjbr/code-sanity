@@ -32,6 +32,14 @@ pub struct IndexReport {
     pub pending: usize,
     /// Durable copies of pending agent edits that a force pass discarded.
     pub stashed: Vec<String>,
+    /// Files skipped with a reason (unreadable, invalid UTF-8 past the binary
+    /// probe, metadata/walk errors). Their previous index state, mirror, and
+    /// map are preserved until they become indexable again; `verify` is the
+    /// strict gate that keeps reporting them.
+    pub errors: Vec<(String, String)>,
+    /// Symlinked entries encountered; never followed (following could escape
+    /// the repo boundary), never indexed.
+    pub skipped_symlinks: usize,
 }
 
 /// Ensure dirs, acquire the exclusive lock, then — under it — write the
@@ -106,28 +114,66 @@ fn index_workspace_locked_inner(
 
     let mut report = IndexReport::default();
     let mut candidates = Vec::new();
+    // `seen` is shared with the stale sweep below and must include files that
+    // errored: an unreadable file keeps its previous mirror/map/db row instead
+    // of being swept as if it were deleted.
+    let mut seen = BTreeSet::new();
+    let mut first_entry = true;
     for entry in walk_repo(root, &config)? {
-        let entry = entry?;
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
+        let is_root_probe = std::mem::take(&mut first_entry);
+        let entry = match entry {
+            Ok(entry) => entry,
+            // The first walk item is the root itself: an unreadable root is a
+            // workspace-level failure, not a per-file skip.
+            Err(err) if is_root_probe => {
+                return Err(err).with_context(|| format!("walk repo root {}", root.display()));
+            }
+            Err(err) => {
+                report
+                    .errors
+                    .push(("<walk>".to_string(), format!("walk: {err}")));
+                continue;
+            }
+        };
+        let file_type = entry.file_type();
+        if file_type.is_some_and(|file_type| file_type.is_symlink()) {
+            report.skipped_symlinks += 1;
+            continue;
+        }
+        if !file_type.is_some_and(|file_type| file_type.is_file()) {
             continue;
         }
         let rel = rel_path(root, entry.path())?;
-        let metadata = fs::metadata(entry.path())
-            .with_context(|| format!("metadata {}", entry.path().display()))?;
-        if should_skip_file(&rel, entry.path(), &metadata, &config)? {
-            report.skipped += 1;
-            continue;
-        }
         let rel_string = normalize_rel_path(&rel);
+        let metadata = match fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                report
+                    .errors
+                    .push((rel_string.clone(), format!("metadata: {err}")));
+                seen.insert(rel_string);
+                continue;
+            }
+        };
+        match should_skip_file(&rel, entry.path(), &metadata, &config) {
+            Ok(true) => {
+                report.skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                report
+                    .errors
+                    .push((rel_string.clone(), format!("probe: {err:#}")));
+                seen.insert(rel_string);
+                continue;
+            }
+        }
         let mtime = mtime_ns(&metadata);
         let size = metadata.len() as i64;
 
         if let Some(state) = states.get(&rel_string)
-            && state.mtime_ns == mtime
-            && state.size == size
+            && fast_path_matches(state, mtime, size)
         {
             candidates.push(Candidate {
                 rel,
@@ -142,8 +188,18 @@ fn index_workspace_locked_inner(
             continue;
         }
 
-        let content = fs::read_to_string(entry.path())
-            .with_context(|| format!("read source {}", entry.path().display()))?;
+        // Invalid UTF-8 past the 8 KiB binary probe (or a permission flip
+        // between probe and read) lands here: skip the file, keep the pass.
+        let content = match fs::read_to_string(entry.path()) {
+            Ok(content) => content,
+            Err(err) => {
+                report
+                    .errors
+                    .push((rel_string.clone(), format!("read: {err}")));
+                seen.insert(rel_string);
+                continue;
+            }
+        };
         let sha = sha256_hex(content.as_bytes());
         let protected = collect_protected_identifiers(&content);
         candidates.push(Candidate {
@@ -164,7 +220,6 @@ fn index_workspace_locked_inner(
         .collect();
     let logic = logic_fingerprint(&config, &union);
 
-    let mut seen = BTreeSet::new();
     for candidate in &candidates {
         seen.insert(candidate.rel_string.clone());
         let state = states.get(&candidate.rel_string);
@@ -182,8 +237,17 @@ fn index_workspace_locked_inner(
 
         let content = match &candidate.content {
             Some(content) => content.clone(),
-            None => fs::read_to_string(root.join(&candidate.rel))
-                .with_context(|| format!("read source {}", candidate.rel.display()))?,
+            None => match fs::read_to_string(root.join(&candidate.rel)) {
+                Ok(content) => content,
+                // Became unreadable between pass 1 and here: same skip-and-
+                // report semantics; the rel is already in `seen`.
+                Err(err) => {
+                    report
+                        .errors
+                        .push((candidate.rel_string.clone(), format!("read: {err}")));
+                    continue;
+                }
+            },
         };
         let sha = candidate
             .sha
@@ -248,8 +312,18 @@ fn index_workspace_locked_inner(
     for tracked in stale {
         if !seen.contains(&tracked) {
             db::remove_file(&conn, &tracked)?;
-            remove_if_exists(layout.mirror_dir.join(&tracked))?;
-            remove_if_exists(layout.map_path(Path::new(&tracked)))?;
+            // Never touch the filesystem from an unvalidated stored path: a DB
+            // poisoned with a `..` rel (pre-validation versions) must lose its
+            // row without `mirror_dir.join("..")` deleting outside the mirror.
+            match crate::config::normalize_safe_rel_path(Path::new(&tracked), "mirror") {
+                Ok(rel) => {
+                    remove_if_exists(layout.mirror_dir.join(&rel))?;
+                    remove_if_exists(layout.map_path(&rel))?;
+                }
+                Err(err) => {
+                    log::warn!("dropping db row with unsafe path {tracked:?}: {err:#}");
+                }
+            }
             report.removed += 1;
         }
     }
@@ -257,32 +331,69 @@ fn index_workspace_locked_inner(
     Ok(report)
 }
 
+/// Resolve a CLI/hook-supplied path into a safe repo-relative path. Absolute
+/// paths inside the mirror or the repo are accepted and stripped (hooks pass
+/// both shapes); anything escaping the repo — `..`, absolute paths elsewhere —
+/// is an error. Every downstream join (real file, mirror, map, db rel key)
+/// must go through this: an unvalidated `..` rel reads files outside the repo,
+/// writes sanitized copies outside the mirror, and poisons the stale sweep
+/// into deleting outside `.code-sanity/`.
+fn resolve_repo_rel(root: &Path, layout: &Layout, path: &Path) -> Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.strip_prefix(&layout.mirror_dir)
+            .or_else(|_| path.strip_prefix(root))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "path escapes repo: {} is not under {}",
+                    path.display(),
+                    root.display()
+                )
+            })?
+    } else {
+        path
+    };
+    crate::config::normalize_safe_rel_path(candidate, "repo")
+}
+
 /// Index one file with the workspace lock held by this call. Force-writes the
 /// mirror (used by the patch bridge and proposal approval, where the mirror
 /// must be reset to sanitize(real)).
 pub fn index_single_file(root: &Path, rel: &Path) -> Result<SpanMap> {
     let (layout, _lock) = init_workspace_locked(root)?;
+    // Explicit user action (`sync --path --force`): escaping paths hard-fail.
+    let rel = resolve_repo_rel(root, &layout, rel)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
-    let indexed = index_single_file_locked(root, &layout, rel, true)?;
+    let indexed = index_single_file_locked(root, &layout, &rel, true)?;
     Ok(indexed.span_map)
 }
 
 /// Sync one path (used by agent hooks): pending mirror edits are preserved.
 pub fn sync_single_file(root: &Path, rel: &Path) -> Result<IndexReport> {
     let (layout, _lock) = init_workspace_locked(root)?;
-    crate::journal::ensure_no_interrupted_apply(&layout)?;
     let mut report = IndexReport::default();
-    if !root.join(rel).exists() {
+    // Hooks fire on every editor save and compute relpath from the cwd, so an
+    // edit outside the workspace root arrives here as `../…`: a clean no-op
+    // skip, not an error (the file is simply not part of this workspace).
+    let rel = match resolve_repo_rel(root, &layout, rel) {
+        Ok(rel) => rel,
+        Err(err) => {
+            log::info!("sync --path {}: {err:#}; skipped", rel.display());
+            report.skipped += 1;
+            return Ok(report);
+        }
+    };
+    crate::journal::ensure_no_interrupted_apply(&layout)?;
+    if !root.join(&rel).exists() {
         // The real file is gone: drop its targets.
         let conn = db::connect(&layout)?;
-        let rel_string = normalize_rel_path(rel);
+        let rel_string = normalize_rel_path(&rel);
         db::remove_file(&conn, &rel_string)?;
-        remove_if_exists(layout.mirror_dir.join(rel))?;
-        remove_if_exists(layout.map_path(rel))?;
+        remove_if_exists(layout.mirror_dir.join(&rel))?;
+        remove_if_exists(layout.map_path(&rel))?;
         report.removed += 1;
         return Ok(report);
     }
-    match index_single_file_locked(root, &layout, rel, false)?.outcome {
+    match index_single_file_locked(root, &layout, &rel, false)?.outcome {
         FileOutcome::Updated => report.indexed += 1,
         FileOutcome::Unchanged => report.unchanged += 1,
         FileOutcome::PendingSkipped => report.pending += 1,
@@ -532,6 +643,8 @@ fn render_and_store(
     ))
 }
 
+/// `0` is the "unknown" sentinel (mtime-less filesystem or a metadata error).
+/// See `fast_path_matches`: unknown must never satisfy the pre-check.
 fn mtime_ns(metadata: &fs::Metadata) -> i64 {
     metadata
         .modified()
@@ -539,6 +652,14 @@ fn mtime_ns(metadata: &fs::Metadata) -> i64 {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// mtime/size pre-check for skipping the content read. An unknown mtime
+/// (`0`) never matches: on a filesystem without mtimes every same-size change
+/// would otherwise stay invisible forever — the slow path (read + hash) is
+/// the only safe answer there.
+fn fast_path_matches(state: &IndexState, mtime_ns: i64, size: i64) -> bool {
+    mtime_ns != 0 && state.mtime_ns == mtime_ns && state.size == size
 }
 
 fn walk_repo(
@@ -560,6 +681,14 @@ fn walk_repo(
         .parents(false)
         .require_git(false)
         .filter_entry(move |entry| {
+            // The name-based skip applies to DIRECTORIES only: a source FILE
+            // named `build` or `dist` is legitimate content.
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+            {
+                return true;
+            }
             let name = entry.file_name().to_string_lossy();
             !extra_dirs.contains(name.as_ref())
         })

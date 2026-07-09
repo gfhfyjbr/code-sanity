@@ -205,13 +205,18 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
         Command::Index => {
             let started = std::time::Instant::now();
             let report = index_workspace(&root)?;
+            for (path, reason) in &report.errors {
+                eprintln!("error: {path}: {reason}");
+            }
             println!(
-                "indexed={} unchanged={} skipped={} removed={} pending={} elapsed={}",
+                "indexed={} unchanged={} skipped={} removed={} pending={} symlinks={} errors={} elapsed={}",
                 report.indexed,
                 report.unchanged,
                 report.skipped,
                 report.removed,
                 report.pending,
+                report.skipped_symlinks,
+                report.errors.len(),
                 format_elapsed(started.elapsed())
             );
         }
@@ -417,14 +422,19 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                 (None, false) => index_workspace(&root)?,
                 (None, true) => crate::index::index_workspace_force(&root)?,
             };
+            for (path, reason) in &report.errors {
+                eprintln!("error: {path}: {reason}");
+            }
             println!(
-                "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={} elapsed={}",
+                "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={} symlinks={} errors={} elapsed={}",
                 report.indexed,
                 report.unchanged,
                 report.skipped,
                 report.removed,
                 report.pending,
                 report.stashed.len(),
+                report.skipped_symlinks,
+                report.errors.len(),
                 format_elapsed(started.elapsed())
             );
             for stash in &report.stashed {

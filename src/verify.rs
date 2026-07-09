@@ -127,7 +127,9 @@ fn verify_file(
     let map_path = layout.map_path(&rel_path);
 
     let Some(real) = real else {
-        report.failures.push(format!("{rel}: missing real file"));
+        report
+            .failures
+            .push(format!("{rel}: real file missing or unreadable"));
         return Ok(());
     };
     let mirror = match fs::read_to_string(&mirror_path) {

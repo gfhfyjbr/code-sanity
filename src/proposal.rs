@@ -358,7 +358,11 @@ pub fn propose_sanitize(
     let provider = provider_for(&config, allow)?;
 
     let files = match rel {
-        Some(rel) => vec![crate::config::normalize_rel_path(rel)],
+        // The path is repo-config-adjacent input and the file's REAL content
+        // goes to a provider: never allow it to point outside the repo.
+        Some(rel) => vec![crate::config::normalize_rel_path(
+            &crate::config::normalize_safe_rel_path(rel, "repo")?,
+        )],
         None => {
             // Short shared lock just for the tracked-file snapshot.
             let _lock = WorkspaceLock::acquire_shared(&layout)?;

@@ -213,3 +213,115 @@ fn sync_force_stashes_the_discarded_pending_edit() {
     assert_eq!(fs::read_to_string(&mirror_path).unwrap(), mirror);
     assert!(verify_workspace(repo.path()).is_ok());
 }
+
+#[test]
+fn one_undecodable_file_does_not_abort_the_index() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(repo.path().join("src/good.rs"), "fn good() {}\n").unwrap();
+    // 9000 ASCII bytes then a latin-1 byte: passes the 8 KiB binary probe,
+    // fails read_to_string.
+    let mut bad = vec![b'a'; 9000];
+    bad.push(0xE9);
+    fs::write(repo.path().join("src/bad.txt"), &bad).unwrap();
+
+    let report = index_workspace(repo.path()).unwrap();
+    assert_eq!(report.errors.len(), 1, "errors: {:?}", report.errors);
+    assert!(report.errors[0].0.contains("bad.txt"));
+    assert!(report.indexed >= 1);
+    assert!(repo.path().join(".code-sanity/mirror/src/good.rs").exists());
+    assert!(verify_workspace(repo.path()).is_ok());
+
+    // Re-running is stable: same single error, no flapping removals.
+    let again = index_workspace(repo.path()).unwrap();
+    assert_eq!(again.errors.len(), 1);
+    assert_eq!(again.removed, 0);
+}
+
+#[test]
+fn error_skipped_file_keeps_its_previous_mirror() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    let path = repo.path().join("src/flaky.rs");
+    fs::write(&path, "fn fine() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+    let mirror = repo.path().join(".code-sanity/mirror/src/flaky.rs");
+    assert!(mirror.exists());
+
+    // The file turns undecodable: the sweep must NOT treat it as deleted.
+    let mut bad = vec![b'b'; 9000];
+    bad.push(0xE9);
+    fs::write(&path, &bad).unwrap();
+    let report = index_workspace(repo.path()).unwrap();
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.removed, 0, "error-skipped file was swept");
+    assert!(mirror.exists(), "previous mirror lost");
+    let layout = code_sanity::config::Layout::new(repo.path());
+    let conn = code_sanity::db::connect(&layout).unwrap();
+    assert!(
+        code_sanity::db::tracked_files(&conn)
+            .unwrap()
+            .contains(&"src/flaky.rs".to_string())
+    );
+}
+
+#[test]
+fn zero_mtime_state_never_rides_the_fast_path() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    let path = repo.path().join("src/a.rs");
+    fs::write(&path, "fn v() -> usize {\n    1\n}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // Simulate an mtime-less filesystem: stored mtime is the unknown sentinel.
+    let layout = code_sanity::config::Layout::new(repo.path());
+    let conn = code_sanity::db::connect(&layout).unwrap();
+    conn.execute_batch("update index_state set mtime_ns = 0")
+        .unwrap();
+    drop(conn);
+
+    // Same-size different content; a pure mtime/size pre-check would miss it.
+    fs::write(&path, "fn v() -> usize {\n    2\n}\n").unwrap();
+    let report = index_workspace(repo.path()).unwrap();
+    assert_eq!(report.indexed, 1, "unknown mtime rode the fast path");
+    let mirror = fs::read_to_string(repo.path().join(".code-sanity/mirror/src/a.rs")).unwrap();
+    assert!(mirror.contains('2'), "stale mirror served: {mirror}");
+}
+
+#[test]
+fn a_file_named_like_a_skip_dir_is_indexed() {
+    let repo = tempfile::tempdir().unwrap();
+    // FILE named `build` (extensionless script) plus a real `target/` dir.
+    fs::write(repo.path().join("build"), "#!/bin/sh\necho build\n").unwrap();
+    fs::create_dir_all(repo.path().join("target")).unwrap();
+    fs::write(repo.path().join("target/ignored.rs"), "fn ignored() {}\n").unwrap();
+
+    index_workspace(repo.path()).unwrap();
+    assert!(
+        repo.path().join(".code-sanity/mirror/build").exists(),
+        "file named like a skip-dir was not indexed"
+    );
+    assert!(
+        !repo.path().join(".code-sanity/mirror/target").exists(),
+        "skip-dir contents leaked into the mirror"
+    );
+}
+
+#[test]
+fn symlinked_sources_are_counted_and_not_followed() {
+    let outer = tempfile::tempdir().unwrap();
+    fs::write(outer.path().join("outside.rs"), "fn outside() {}\n").unwrap();
+    let repo = outer.path().join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/real.rs"), "fn real() {}\n").unwrap();
+    std::os::unix::fs::symlink(repo.join("src/real.rs"), repo.join("src/link.rs")).unwrap();
+    std::os::unix::fs::symlink(outer.path().join("outside.rs"), repo.join("src/escape.rs"))
+        .unwrap();
+
+    let report = index_workspace(&repo).unwrap();
+    assert_eq!(report.skipped_symlinks, 2);
+    assert!(repo.join(".code-sanity/mirror/src/real.rs").exists());
+    assert!(!repo.join(".code-sanity/mirror/src/link.rs").exists());
+    assert!(!repo.join(".code-sanity/mirror/src/escape.rs").exists());
+    assert!(verify_workspace(&repo).is_ok());
+}
