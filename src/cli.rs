@@ -50,6 +50,10 @@ enum Command {
         agent: Option<String>,
         #[arg(long)]
         session_id: Option<String>,
+        /// Plan and validate only; report what would change without writing
+        /// (conflicts still exit 2 and record a conflict journal entry).
+        #[arg(long)]
+        dry_run: bool,
     },
     Write {
         #[arg(long)]
@@ -247,20 +251,32 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             patch,
             agent,
             session_id,
+            dry_run,
         } => {
             let patch_text = read_optional_file_or_stdin(patch.as_ref())?;
             let started = std::time::Instant::now();
             let report = apply_patch_text_with_options(
                 &root,
                 &patch_text,
-                ApplyOptions { session_id, agent },
+                ApplyOptions {
+                    session_id,
+                    agent,
+                    dry_run,
+                },
             )?;
-            println!(
-                "applied files={} journal={} elapsed={}",
-                report.files.join(","),
-                report.journal_path.display(),
-                format_elapsed(started.elapsed())
-            );
+            match &report.journal_path {
+                Some(journal) => println!(
+                    "applied files={} journal={} elapsed={}",
+                    report.files.join(","),
+                    journal.display(),
+                    format_elapsed(started.elapsed())
+                ),
+                None => println!(
+                    "dry-run ok files={} (no changes written) elapsed={}",
+                    report.files.join(","),
+                    format_elapsed(started.elapsed())
+                ),
+            }
         }
         Command::Write {
             path,
@@ -271,7 +287,7 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             println!(
                 "wrote files={} journal={}",
                 report.files.join(","),
-                report.journal_path.display()
+                display_journal(&report.journal_path)
             );
         }
         Command::Rename {
@@ -281,8 +297,17 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             agent,
             session_id,
         } => {
-            let report =
-                rename_alias(&root, &path, &from, &to, ApplyOptions { session_id, agent })?;
+            let report = rename_alias(
+                &root,
+                &path,
+                &from,
+                &to,
+                ApplyOptions {
+                    session_id,
+                    agent,
+                    dry_run: false,
+                },
+            )?;
             println!(
                 "renamed real={} -> {} occurrences={} sanitized_now={} files={} journal={}",
                 report.real_from,
@@ -290,7 +315,7 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
                 report.occurrences,
                 report.sanitized_to,
                 report.apply.files.join(","),
-                report.apply.journal_path.display()
+                display_journal(&report.apply.journal_path)
             );
         }
         Command::ProjectEdit {
@@ -298,11 +323,19 @@ fn dispatch(command: Command, root: &std::path::Path) -> Result<()> {
             agent,
             session_id,
         } => {
-            let report = project_mirror_edit(&root, &path, ApplyOptions { session_id, agent })?;
+            let report = project_mirror_edit(
+                &root,
+                &path,
+                ApplyOptions {
+                    session_id,
+                    agent,
+                    dry_run: false,
+                },
+            )?;
             println!(
                 "projected files={} journal={}",
                 report.files.join(","),
-                report.journal_path.display()
+                display_journal(&report.journal_path)
             );
         }
         Command::Recover { rollback, force } => {
@@ -525,6 +558,15 @@ fn read_optional_file_or_stdin(path: Option<&PathBuf>) -> Result<String> {
         .read_to_string(&mut input)
         .context("read stdin")?;
     Ok(input)
+}
+
+/// Journal path for CLI stdout; `-` for the no-journal (dry-run) case, which
+/// non-dry paths never produce.
+fn display_journal(journal_path: &Option<PathBuf>) -> String {
+    journal_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn doctor(root: &std::path::Path, agent: Option<Agent>) -> Result<()> {

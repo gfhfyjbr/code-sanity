@@ -122,8 +122,12 @@ fn redact_error(root: &Path, message: &str) -> String {
     let Ok(_lock) = crate::lock::WorkspaceLock::acquire_shared(&layout) else {
         return GENERIC.to_string();
     };
+    // The workspace root's own directory names (e.g. a company-named repo
+    // folder) are not dictionary terms, so the term redactor cannot remove
+    // them from interpolated absolute paths — scrub the prefix first.
+    let message = message.replace(&root.display().to_string(), ".");
     match crate::redact::Redactor::for_workspace(root) {
-        Ok(redactor) => redactor.redact(message),
+        Ok(redactor) => redactor.redact(&message),
         Err(_) => GENERIC.to_string(),
     }
 }
@@ -207,7 +211,8 @@ fn tools_manifest() -> Value {
                 "properties": {
                     "patch": { "type": "string", "description": "Unified diff against a/ b/ mirror paths" },
                     "agent": { "type": "string" },
-                    "session_id": { "type": "string" }
+                    "session_id": { "type": "string" },
+                    "dry_run": { "type": "boolean", "description": "Validate and plan only; do not write. Reports the files that would change." }
                 },
                 "required": ["patch"],
                 "additionalProperties": false
@@ -285,13 +290,26 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
                 ApplyOptions {
                     agent: optional_str(args, "agent"),
                     session_id: optional_str(args, "session_id"),
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 },
             )?;
-            Ok(format!(
-                "applied files={} journal={}",
-                report.files.join(","),
-                report.journal_path.display()
-            ))
+            match &report.journal_path {
+                // Workspace-relative: the absolute root path (directory names
+                // the dictionary redactor cannot know about) must never reach
+                // the agent, success or not.
+                Some(journal) => Ok(format!(
+                    "applied files={} journal={}",
+                    report.files.join(","),
+                    relative_journal(root, journal)
+                )),
+                None => Ok(format!(
+                    "dry-run ok: would apply files={} (no changes written)",
+                    report.files.join(",")
+                )),
+            }
         }
         "verify" => {
             let report = verify_workspace(root)?;
@@ -299,6 +317,20 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
         }
         other => bail!("unknown tool: {other}"),
     }
+}
+
+/// Render a journal path workspace-relative for agent-facing output; fail
+/// closed to the bare file name — never an absolute host prefix.
+fn relative_journal(root: &Path, journal: &Path) -> String {
+    journal
+        .strip_prefix(root)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| {
+            journal
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
 }
 
 fn required_str(args: &Value, key: &str) -> Result<String> {

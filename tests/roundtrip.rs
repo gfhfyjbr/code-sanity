@@ -1796,3 +1796,143 @@ fn resolve_review_refuses_alias_that_occurs_elsewhere_in_repo() {
     assert!(config.sanitizer.alias_registry.is_empty());
     assert!(verify_workspace(repo.path()).is_ok());
 }
+
+#[test]
+fn dry_run_plans_without_writing() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
+    let real_before = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    let mirror_before = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
+    let patch = format!(
+        "--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n\
+         @@ -2,3 +2,3 @@\n \
+         fn {alias}_parser() -> usize {{\n\
+         -    1\n\
+         +    2\n \
+         }}\n"
+    );
+
+    let patch_file = repo.path().join("patch.diff");
+    fs::write(&patch_file, &patch).unwrap();
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "apply-patch",
+            "--patch",
+            patch_file.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry-run ok"))
+        .stdout(predicate::str::contains("src/lib.rs"));
+
+    // Nothing changed, no Success journal entry.
+    assert_eq!(
+        fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+        real_before
+    );
+    assert_eq!(
+        read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap(),
+        mirror_before
+    );
+    let listing =
+        code_sanity::journal::list_journal_entries(&code_sanity::Layout::new(repo.path())).unwrap();
+    assert!(listing.entries.is_empty(), "dry run journaled an apply");
+
+    // The same patch applies for real afterwards.
+    apply_patch_text(repo.path(), &patch).unwrap();
+    assert!(
+        fs::read_to_string(repo.path().join("src/lib.rs"))
+            .unwrap()
+            .contains("    2")
+    );
+}
+
+#[test]
+fn dry_run_conflict_still_exits_2() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let alias = alias_of(repo.path(), "dangerous");
+    let real_before = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
+    // Editing inside a replacement span conflicts, dry run or not.
+    let patch = format!(
+        "--- a/src/lib.rs\n\
+         +++ b/src/lib.rs\n\
+         @@ -2,1 +2,1 @@\n\
+         -fn {alias}_parser() -> usize {{\n\
+         +fn pleasant_parser() -> usize {{\n"
+    );
+    let patch_file = repo.path().join("patch.diff");
+    fs::write(&patch_file, &patch).unwrap();
+    Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args([
+            "--root",
+            repo.path().to_str().unwrap(),
+            "apply-patch",
+            "--patch",
+            patch_file.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(
+        fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+        real_before
+    );
+}
+
+#[test]
+fn mcp_success_output_carries_no_absolute_paths() {
+    use serde_json::{Value, json};
+    // The workspace root's directory name is exactly the kind of private
+    // token the dictionary cannot know about.
+    let outer = tempfile::tempdir().unwrap();
+    let repo = outer.path().join("megacorp_private_root");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/a.rs"), "fn plain() -> usize {\n    1\n}\n").unwrap();
+    index_workspace(&repo).unwrap();
+
+    let patch = "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@\n fn plain() -> usize {\n-    1\n+    2\n }\n";
+    let requests = [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"apply_patch","arguments":{"patch":patch}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"apply_patch","arguments":{"patch":patch,"dry_run":true}}}),
+    ];
+    let input = requests
+        .iter()
+        .map(|request| request.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = Vec::new();
+    code_sanity::mcp::serve(&repo, std::io::Cursor::new(input.into_bytes()), &mut out).unwrap();
+    let responses: Vec<Value> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+
+    // Success: workspace-relative journal reference only.
+    assert_eq!(responses[0]["result"]["isError"], false);
+    let text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("journal=.code-sanity/journal/"), "{text}");
+    assert!(!text.contains("megacorp_private_root"), "leaked: {text}");
+
+    // Dry run against the now-changed file: context mismatch -> tool error;
+    // the error must not leak the absolute root either.
+    let error_text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !error_text.contains("megacorp_private_root"),
+        "leaked in error: {error_text}"
+    );
+}

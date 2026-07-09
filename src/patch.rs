@@ -43,13 +43,19 @@ impl std::error::Error for ConflictError {}
 #[derive(Debug, Clone)]
 pub struct ApplyReport {
     pub files: Vec<String>,
-    pub journal_path: PathBuf,
+    /// `None` for a dry run: nothing was journaled as an apply.
+    pub journal_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
     pub session_id: Option<String>,
     pub agent: Option<String>,
+    /// Plan and validate only: the full parse/translate/conflict pipeline
+    /// runs (a conflicting patch still raises ConflictError and records a
+    /// conflict journal entry — state-dir-only writes, kept as the audit
+    /// trail), but no real file, mirror, or apply journal entry is written.
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +191,16 @@ pub(crate) fn apply_patch_text_locked(
         }
     }
 
+    // Dry run stops here: the full plan ran (parse, sanitize projection,
+    // conflict detection — a conflict already bailed above), nothing was
+    // journaled as an apply and no real file was touched.
+    if options.dry_run {
+        return Ok(ApplyReport {
+            files,
+            journal_path: None,
+        });
+    }
+
     let journal_path = commit_planned_apply(
         root,
         layout,
@@ -199,7 +215,7 @@ pub(crate) fn apply_patch_text_locked(
 
     Ok(ApplyReport {
         files,
-        journal_path,
+        journal_path: Some(journal_path),
     })
 }
 
@@ -603,7 +619,7 @@ pub fn write_sanitized_content(
         let journal_path = write_journal(&layout, &entry)?;
         return Ok(ApplyReport {
             files: entry.files,
-            journal_path,
+            journal_path: Some(journal_path),
         });
     }
     let patch = whole_file_patch(&rel_path, &current, sanitized_content);
@@ -703,7 +719,7 @@ pub fn project_mirror_edit(
         let journal_path = write_journal(&layout, &entry)?;
         return Ok(ApplyReport {
             files: entry.files,
-            journal_path,
+            journal_path: Some(journal_path),
         });
     }
     let patch = whole_file_patch(&rel, &baseline, &new_mirror);
@@ -854,7 +870,7 @@ pub fn rename_alias(
     Ok(RenameReport {
         apply: ApplyReport {
             files: vec![rel_string],
-            journal_path,
+            journal_path: Some(journal_path),
         },
         real_from,
         sanitized_to,
