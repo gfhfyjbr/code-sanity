@@ -427,7 +427,7 @@ pub fn propose_sanitize(
         };
         for proposal in proposals {
             report.proposed += 1;
-            match validate_proposal(&proposal, &real, &config) {
+            match validate_proposal(Path::new(&file), &proposal, &real, &config) {
                 Ok(flag) => {
                     enqueue_review(&layout, &file, &proposal, &flag)?;
                     report.queued += 1;
@@ -451,6 +451,7 @@ pub fn propose_sanitize(
 /// (flag is "clean" or a human-review reason); `Err(reason)` means it is rejected
 /// outright and never reaches the queue.
 pub fn validate_proposal(
+    rel_path: &Path,
     proposal: &Proposal,
     content: &str,
     config: &Config,
@@ -520,7 +521,7 @@ pub fn validate_proposal(
         }
     }
 
-    if collect_protected_identifiers(content).contains(&proposal.original_text) {
+    if collect_protected_identifiers(rel_path, content).contains(&proposal.original_text) {
         return Ok("touches a protected name (public API or import); needs review".to_string());
     }
     if proposal.confidence < config.sanitizer.confidence_threshold {
@@ -604,7 +605,7 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
         // Re-validate at approval time so a stale queue can't apply an unsafe alias.
         let real = std::fs::read_to_string(root.join(&item.file))
             .with_context(|| format!("read {}", item.file))?;
-        validate_proposal(&item.proposal, &real, &config)
+        validate_proposal(Path::new(&item.file), &item.proposal, &real, &config)
             .map_err(|reason| anyhow!("proposal no longer valid: {reason}"))?;
         // Repo-wide alias-collision scan BEFORE the registry is persisted:
         // config.save + reconverge must not be able to fail after the alias
@@ -825,7 +826,12 @@ mod tests {
             confidence: 1.0,
             rationale: None,
         };
-        let verdict = validate_proposal(&proposal, "fn helper() {}", &config);
+        let verdict = validate_proposal(
+            Path::new("src/lib.rs"),
+            &proposal,
+            "fn helper() {}",
+            &config,
+        );
         assert!(verdict.is_err());
     }
 
@@ -839,7 +845,15 @@ mod tests {
             confidence: 1.0,
             rationale: None,
         };
-        assert!(validate_proposal(&proposal, "// widget here", &config).is_err());
+        assert!(
+            validate_proposal(
+                Path::new("src/lib.rs"),
+                &proposal,
+                "// widget here",
+                &config
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -892,7 +906,13 @@ mod tests {
             confidence: 0.3,
             rationale: None,
         };
-        let flag = validate_proposal(&proposal, "fn helper() {}", &config).unwrap();
+        let flag = validate_proposal(
+            Path::new("src/lib.rs"),
+            &proposal,
+            "fn helper() {}",
+            &config,
+        )
+        .unwrap();
         assert!(flag.contains("confidence"));
     }
 }

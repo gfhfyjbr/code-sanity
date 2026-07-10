@@ -84,7 +84,7 @@ pub fn verify_workspace(root: &Path) -> Result<VerifyReport> {
     let mut protected_union: BTreeSet<String> = BTreeSet::new();
     for rel in &tracked {
         if let Ok(real) = fs::read_to_string(root.join(rel)) {
-            protected_union.extend(collect_protected_identifiers(&real));
+            protected_union.extend(collect_protected_identifiers(Path::new(rel), &real));
             real_contents.insert(rel.clone(), real);
         }
     }

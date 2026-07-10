@@ -433,67 +433,146 @@ pub fn sanitize_run_text(run: &str, terms: &[Term], protected: &BTreeSet<String>
     out
 }
 
-/// Collect the identifiers this file protects from sanitization: public
-/// declarations, import-position names, and dunder names. Name-based on
-/// purpose: protecting the name everywhere is the only way "one symbol, one
-/// decision" and an independent verify backstop can both hold.
-pub fn collect_protected_identifiers(content: &str) -> BTreeSet<String> {
-    let mut protected = BTreeSet::new();
+/// Formats with no code declarations: nothing in them can be a public symbol
+/// the mirror must keep real, so they contribute NO protected identifiers.
+/// Deliberately narrow — unknown extensions stay "text" (= code), because
+/// classifying real code as prose would rename import-position names and
+/// break the mirror, while the reverse error only over-protects and is
+/// caught by the denylist∩protected check.
+pub(crate) fn is_prose_language(language: &str) -> bool {
+    matches!(language, "markdown" | "plaintext" | "json" | "toml")
+}
 
-    // Line rule: a line led by a declaration/import marker keeps every word
-    // run before any trailing comment. Covers `use a::b::c::d;`, `import x`,
-    // `pub fn name(args)` signatures, `export const x`.
-    let mut line_start = 0usize;
-    for line in content.split_inclusive('\n') {
-        let code_end = line
-            .find("//")
-            .or_else(|| line.find('#'))
-            .unwrap_or(line.len());
-        let code = &line[..code_end];
-        let runs = word_runs(code);
-        let lead: Vec<&str> = runs
+/// Markers that open a declaration/import context. One list for both rules —
+/// the old line/token rules disagreed (package/require vs crate/extern) by
+/// accident, and the asymmetry made coverage arbitrary.
+fn is_protection_marker(token: &str) -> bool {
+    matches!(
+        token,
+        "use"
+            | "import"
+            | "from"
+            | "mod"
+            | "package"
+            | "require"
+            | "pub"
+            | "export"
+            | "crate"
+            | "extern"
+    )
+}
+
+/// Import-position markers: on these lines string-literal runs stay protected
+/// too (JS/TS `import x from "acme_sdk"`, Go `import "acme/pkg"`) — external
+/// module specifiers the mirror cannot rename consistently.
+fn is_import_marker(token: &str) -> bool {
+    matches!(token, "use" | "import" | "from" | "require" | "package")
+}
+
+/// Collect the identifiers this file protects from sanitization: public
+/// declarations, import-position names, and code dunders (`__init__`).
+/// Name-based on purpose: protecting the name everywhere is the only way
+/// "one symbol, one decision" and an independent verify backstop can both
+/// hold.
+///
+/// Collection is CONTEXT-AWARE: prose formats contribute nothing, and within
+/// code, runs inside comments or string literals never protect. English
+/// prose is full of `from`/`use`/`import` — "Data from shadowfax is loaded"
+/// in a README used to protect the denylisted term repo-wide, and verify
+/// blessed the leak because it recomputes this same set.
+pub fn collect_protected_identifiers(rel_path: &Path, content: &str) -> BTreeSet<String> {
+    let mut protected = BTreeSet::new();
+    let language = detect_language(rel_path, content);
+    if is_prose_language(&language) {
+        return protected;
+    }
+    let strings = string_ranges(&language, content);
+    let comments = comment_ranges(&language, content, &strings);
+
+    // One classified run stream shared by both rules. Word runs never
+    // contain '\n', so counting newlines in the gaps yields the line number.
+    struct Run<'a> {
+        text: &'a str,
+        line: usize,
+        /// Outside comments AND string literals.
+        code: bool,
+        in_comment: bool,
+    }
+    let bytes = content.as_bytes();
+    let mut runs: Vec<Run> = Vec::new();
+    let mut line = 0usize;
+    let mut cursor = 0usize;
+    for (start, end) in word_runs(content) {
+        line += bytes[cursor..start]
             .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        cursor = start;
+        let in_comment = range_contains(&comments, start);
+        let in_string = range_contains(&strings, start);
+        runs.push(Run {
+            text: &content[start..end],
+            line,
+            code: !in_comment && !in_string,
+            in_comment,
+        });
+    }
+
+    // Line rule: a line whose first two CODE runs include a marker protects
+    // every non-keyword code run on the line. Covers `use a::b::c::d;`,
+    // `import x`, `pub fn name(args)` signatures, `export const x`. On
+    // import-position lines, string runs are kept too (module specifiers) —
+    // but never comment runs.
+    let mut idx = 0usize;
+    while idx < runs.len() {
+        let line_no = runs[idx].line;
+        let line_end = runs[idx..]
+            .iter()
+            .position(|run| run.line != line_no)
+            .map_or(runs.len(), |offset| idx + offset);
+        let line_runs = &runs[idx..line_end];
+        let lead: Vec<&str> = line_runs
+            .iter()
+            .filter(|run| run.code)
             .take(2)
-            .map(|(start, end)| &code[*start..*end])
+            .map(|run| run.text)
             .collect();
-        let marker = |token: &str| {
-            matches!(
-                token,
-                "use" | "import" | "from" | "mod" | "package" | "require" | "pub" | "export"
-            )
-        };
-        if lead.iter().any(|token| marker(token)) {
-            for (start, end) in &runs {
-                let run = &code[*start..*end];
-                if !is_keyword(run) {
-                    protected.insert(run.to_string());
+        if lead.iter().copied().any(is_protection_marker) {
+            let import_line = lead.iter().copied().any(is_import_marker);
+            for run in line_runs {
+                let eligible = run.code || (import_line && !run.in_comment);
+                if eligible && !is_keyword(run.text) {
+                    protected.insert(run.text.to_string());
                 }
             }
         }
-        line_start += line.len();
+        idx = line_end;
     }
-    let _ = line_start;
 
-    // Token rule: an identifier within four tokens after a visibility or
-    // import marker is protected (struct fields after `pub`, later path
-    // segments, `extern` items).
-    for (start, end) in word_runs(content) {
-        let run = &content[start..end];
-        if is_keyword(run) {
+    // Token rule: a code identifier within four code tokens after a marker ON
+    // THE SAME LINE is protected (struct fields after `pub`, later path
+    // segments, `extern` items). The lookback never crosses a newline and
+    // never reads tokens out of comments or strings — prose like
+    // "...comes from\nshadowfax handles it" must not protect anything.
+    // Genuine code dunders stay protected here; dunder-shaped prose
+    // (markdown bold `__term__`) never reaches this branch.
+    for (index, run) in runs.iter().enumerate() {
+        if !run.code || is_keyword(run.text) {
             continue;
         }
-        if run.starts_with("__") {
-            protected.insert(run.to_string());
+        if run.text.starts_with("__") {
+            protected.insert(run.text.to_string());
             continue;
         }
-        let previous = previous_identifier_tokens(content, start, 4);
-        if previous.iter().any(|token| {
-            matches!(
-                *token,
-                "pub" | "export" | "import" | "from" | "use" | "mod" | "crate" | "extern"
-            )
-        }) {
-            protected.insert(run.to_string());
+        let marker_nearby = runs[..index]
+            .iter()
+            .rev()
+            .take_while(|prev| prev.line == run.line)
+            .filter(|prev| prev.code)
+            .take(4)
+            .any(|prev| is_protection_marker(prev.text));
+        if marker_nearby {
+            protected.insert(run.text.to_string());
         }
     }
 
@@ -636,15 +715,6 @@ fn select_non_overlapping(mut candidates: Vec<PendingReplacement>) -> Vec<Pendin
         }
     }
     selected
-}
-
-fn previous_identifier_tokens(content: &str, start: usize, limit: usize) -> Vec<&str> {
-    content[..start]
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-        .rev()
-        .filter(|token| !token.is_empty())
-        .take(limit)
-        .collect()
 }
 
 fn is_keyword(ident: &str) -> bool {
@@ -1154,15 +1224,116 @@ mod tests {
         assert!(rendered.sanitized.contains("dangerous_parser()"));
     }
 
+    fn protected_in(rel: &str, content: &str) -> BTreeSet<String> {
+        collect_protected_identifiers(Path::new(rel), content)
+    }
+
     #[test]
     fn public_declarations_and_imports_are_collected_as_protected() {
-        let protected = collect_protected_identifiers(
+        let protected = protected_in(
+            "src/lib.rs",
             "pub fn dangerous_parser() {}\nuse dangerous_lib::helper::thing;\nfn private_one() {}\n",
         );
         assert!(protected.contains("dangerous_parser"));
         assert!(protected.contains("dangerous_lib"));
         assert!(protected.contains("thing"));
         assert!(!protected.contains("private_one"));
+    }
+
+    #[test]
+    fn prose_formats_protect_nothing() {
+        // English prose is full of `from`/`use`/`import`. A README mentioning
+        // a denylisted term used to protect it repo-wide, and verify blessed
+        // the leak because it recomputes this same set.
+        for rel in [
+            "README.md",
+            "notes.txt",
+            "doc.rst",
+            "pkg.json",
+            "Cargo.toml",
+        ] {
+            let protected = protected_in(rel, "Data from shadowfax is loaded nightly.\n");
+            assert!(protected.is_empty(), "{rel} protected {protected:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_bold_dunder_is_not_protected_and_leaks_are_reported() {
+        assert!(protected_in("README.md", "__shadowfax__ is the codename.\n").is_empty());
+        // The guard change is what makes this actually sanitize: an
+        // unprotected `__term__` run must be reported by the backstop.
+        let mut config = Config::default();
+        config.sanitizer.denylist = vec!["shadowfax".to_string()];
+        let terms = term_table(&config);
+        let leaks = find_leaks("__shadowfax__", &terms, &BTreeSet::new());
+        assert_eq!(leaks.len(), 1, "{leaks:?}");
+        assert_eq!(leaks[0].term, "shadowfax");
+    }
+
+    #[test]
+    fn genuine_code_dunders_stay_protected() {
+        let protected = protected_in(
+            "app.py",
+            "def __init__(self):\n    pass\n# note __shadowfax__ here\n",
+        );
+        assert!(protected.contains("__init__"));
+        assert!(
+            !protected.contains("__shadowfax__"),
+            "a dunder inside a comment must not protect"
+        );
+    }
+
+    #[test]
+    fn token_lookback_never_crosses_a_newline() {
+        let protected = protected_in("src/lib.rs", "use foo::bar;\nshadowfax_thing();\n");
+        assert!(protected.contains("foo"));
+        assert!(
+            !protected.contains("shadowfax_thing"),
+            "the marker was on the previous line"
+        );
+    }
+
+    #[test]
+    fn comments_never_protect() {
+        // Rule C used to read tokens straight out of comments.
+        let protected = protected_in("src/lib.rs", "// migrated from acme_v1\nlet x = 1;\n");
+        assert!(!protected.contains("acme_v1"));
+        // Rule A's trailing-comment strip is now the real comment scanner.
+        let protected = protected_in(
+            "src/lib.rs",
+            "pub fn get(url: usize) {} // from shadowfax\n",
+        );
+        assert!(protected.contains("get"));
+        assert!(protected.contains("url"));
+        assert!(!protected.contains("shadowfax"));
+        // A python trailing comment on a non-declaration line protects nothing.
+        assert!(protected_in("app.py", "x = 1  # from shadowfax\n").is_empty());
+    }
+
+    #[test]
+    fn string_literals_never_protect_except_import_specifiers() {
+        // A term in a string literal on a `pub` line must still sanitize.
+        let protected = protected_in("src/lib.rs", "pub const G: &str = \"shadowfax rollout\";\n");
+        assert!(protected.contains("G"));
+        assert!(!protected.contains("shadowfax"));
+        assert!(!protected.contains("rollout"));
+        // Import-position specifiers are external names the mirror cannot
+        // rename consistently, so they stay protected.
+        let protected = protected_in("app.ts", "import { thing } from \"acme_sdk\";\n");
+        assert!(protected.contains("thing"));
+        assert!(protected.contains("acme_sdk"));
+        let protected = protected_in("main.go", "import \"acme/pkg\"\n");
+        assert!(protected.contains("acme"));
+        assert!(protected.contains("pkg"));
+    }
+
+    #[test]
+    fn unified_marker_list_covers_both_rules() {
+        assert!(protected_in("src/lib.rs", "extern crate acme_lib;\n").contains("acme_lib"));
+        assert!(protected_in("main.go", "package acmemain\n").contains("acmemain"));
+        // Unknown extensions are code: shell-style exports keep protection.
+        assert!(protected_in("deploy.sh", "export ACME_TOKEN=x\n").contains("ACME_TOKEN"));
+        assert!(protected_in("Main.java", "import com.acme.Foo;\n").contains("acme"));
     }
 
     #[test]

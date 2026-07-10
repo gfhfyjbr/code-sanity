@@ -365,7 +365,7 @@ fn plan_modify(
     }
     // Sanitize with the protected union that will hold AFTER this file lands,
     // exactly what the post-apply reindex of this file will use.
-    let fresh_protected = collect_protected_identifiers(&patched_original);
+    let fresh_protected = collect_protected_identifiers(&rel, &patched_original);
     let union_after = stored_protected_union_with_override(conn, &rel_string, &fresh_protected)?;
     let rendered_after = sanitize_content(&rel, &patched_original, config, &union_after)
         .with_context(|| format!("resanitize patched {rel_string}"))?;
@@ -481,7 +481,7 @@ fn plan_create(
     // become the real file directly. The real repo stays the source of truth,
     // so the new file must already be neutral: sanitize(real) must equal the
     // content the agent sent, otherwise what they see after create would drift.
-    let fresh_protected = collect_protected_identifiers(&created);
+    let fresh_protected = collect_protected_identifiers(&rel, &created);
     let union_after = stored_protected_union_with_override(conn, &rel_string, &fresh_protected)?;
     let rendered = sanitize_content(&rel, &created, config, &union_after)
         .with_context(|| format!("sanitize created {rel_string}"))?;

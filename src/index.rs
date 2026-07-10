@@ -234,7 +234,7 @@ fn index_workspace_locked_inner(
             }
         };
         let sha = sha256_hex(content.as_bytes());
-        let protected = collect_protected_identifiers(&content);
+        let protected = collect_protected_identifiers(&rel, &content);
         candidates.push(Candidate {
             rel,
             rel_string,
@@ -287,7 +287,7 @@ fn index_workspace_locked_inner(
             .clone()
             .unwrap_or_else(|| sha256_hex(content.as_bytes()));
         let protected = if candidate.fast {
-            collect_protected_identifiers(&content)
+            collect_protected_identifiers(&candidate.rel, &content)
         } else {
             candidate.protected.clone()
         };
@@ -466,7 +466,7 @@ pub(crate) fn index_single_file_locked(
     let source_path = root.join(rel);
     let (content, metadata) = read_with_stat(&source_path)?;
     let sha = sha256_hex(content.as_bytes());
-    let fresh_protected = collect_protected_identifiers(&content);
+    let fresh_protected = collect_protected_identifiers(rel, &content);
 
     let states = db::all_index_states(&conn)?;
     let old_protected = states
