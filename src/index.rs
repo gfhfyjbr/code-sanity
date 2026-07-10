@@ -71,12 +71,23 @@ pub(crate) fn init_workspace_locked(root: &Path) -> Result<(Layout, WorkspaceLoc
     let layout = Layout::new(root);
     layout.ensure_dirs()?;
     let lock = WorkspaceLock::acquire(&layout)?;
-    let mut config = Config::default();
-    config.salt = crate::config::random_salt();
-    // Default aliases carry a salted suffix: derive them from the REAL salt,
-    // not the deterministic stub Config::default() uses.
-    config.sanitizer.dictionary = crate::config::default_dictionary(&config.salt);
-    config.write_if_missing(&layout)?;
+    if !layout.config_path.exists() {
+        // A missing config on a workspace with initialized state means the
+        // config was LOST, not never written: regenerating defaults here
+        // would replace the salt and drop the denylist/alias registry, then
+        // re-render the whole mirror without the user's policy. Hard error;
+        // the loader guard alone fires too late for init/index, which write
+        // the default config before anything loads it.
+        if layout.has_initialized_state() {
+            return Err(crate::config::missing_config_error(&layout));
+        }
+        let mut config = Config::default();
+        config.salt = crate::config::random_salt();
+        // Default aliases carry a salted suffix: derive them from the REAL
+        // salt, not the deterministic stub Config::default() uses.
+        config.sanitizer.dictionary = crate::config::default_dictionary(&config.salt);
+        config.save(&layout)?;
+    }
     ensure_gitignore_entry(root, ".code-sanity/")?;
     let conn = db::connect(&layout)?;
     db::ensure_schema(&conn)?;

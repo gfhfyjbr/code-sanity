@@ -49,6 +49,21 @@ pub fn verify_workspace(root: &Path) -> Result<VerifyReport> {
     // Verify only reads; a shared lock keeps writers out for a consistent
     // snapshot while letting other readers proceed.
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
+    // A lost config is the "workspace broken" contract (exit 3), reported as
+    // an actionable finding: a raw error would exit 1 without one, while
+    // proceeding on stub-salt defaults would drown the report in per-file
+    // mismatch noise.
+    if !layout.config_path.exists() && layout.has_initialized_state() {
+        return Err(anyhow::Error::new(VerifyFailed {
+            report: VerifyReport {
+                checked: 0,
+                failures: vec![format!(
+                    "config: {}",
+                    crate::config::missing_config_error(&layout)
+                )],
+            },
+        }));
+    }
     // Lenient load: a policy-violating config is a FINDING verify reports,
     // not a reason verify cannot run.
     let config = Config::load_or_default_lenient(&layout)?;

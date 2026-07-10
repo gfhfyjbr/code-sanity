@@ -66,6 +66,17 @@ impl Layout {
         )
     }
 
+    /// Durable evidence this workspace was initialized before, independent of
+    /// config.toml: the derived db, or any rendered mirror/map state. Init
+    /// writes the config BEFORE creating the db, so a crashed init never
+    /// leaves initialized state without a config — if this is true and
+    /// config.toml is missing, the config was lost, not never written.
+    pub fn has_initialized_state(&self) -> bool {
+        self.db_path.exists()
+            || dir_has_entries(&self.mirror_dir)
+            || dir_has_entries(&self.maps_dir)
+    }
+
     pub fn map_path(&self, rel_path: &Path) -> PathBuf {
         let mut out = self.maps_dir.join(rel_path);
         let file_name = rel_path
@@ -504,12 +515,20 @@ impl Config {
     /// Load without policy validation (TOML parse errors still fail). Only
     /// for `verify`, which reports violations as findings instead of dying,
     /// and for other paths that must observe a broken config to explain it.
+    ///
+    /// A MISSING config on an already-initialized workspace is a hard error,
+    /// not a silent default: the config holds the workspace salt and the
+    /// human-approved alias registry, and proceeding with defaults would
+    /// re-render the mirror without the user's sanitization policy —
+    /// previously hidden terms would surface in the agent-facing view.
     pub fn load_or_default_lenient(layout: &Layout) -> Result<Self> {
         let config = if layout.config_path.exists() {
             let raw = fs::read_to_string(&layout.config_path)
                 .with_context(|| format!("read {}", layout.config_path.display()))?;
             toml::from_str(&raw)
                 .with_context(|| format!("parse {}", layout.config_path.display()))?
+        } else if layout.has_initialized_state() {
+            return Err(missing_config_error(layout));
         } else {
             Self::default()
         };
@@ -519,12 +538,9 @@ impl Config {
         Ok(config)
     }
 
-    pub fn write_if_missing(&self, layout: &Layout) -> Result<()> {
-        if layout.config_path.exists() {
-            return Ok(());
-        }
-        self.save(layout)
-    }
+    // NOTE: there is deliberately no write_if_missing convenience — a missing
+    // config on an initialized workspace must be a hard error (see
+    // load_or_default_lenient), never a silent regeneration.
 
     /// Durable atomic save with a `.bak` copy of previous, different content —
     /// the config holds the salt and the human-approved alias registry, which
@@ -536,6 +552,28 @@ impl Config {
         crate::fsutil::write_with_backup_sync(&layout.config_path, &raw)
             .with_context(|| format!("write {}", layout.config_path.display()))
     }
+}
+
+fn dir_has_entries(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// The error every path raises when config.toml is missing on a workspace
+/// that has initialized state. One message, one remedy, everywhere.
+pub fn missing_config_error(layout: &Layout) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is missing but this workspace is already initialized; the config \
+         holds the workspace salt and the approved alias registry, which \
+         cannot be re-derived. Restore it from {}.bak or from version \
+         control; or delete the entire {} directory and re-run \
+         `code-sanity init` to reset deliberately (new salt, default policy, \
+         full re-render)",
+        layout.config_path.display(),
+        layout.config_path.display(),
+        layout.state_dir.display(),
+    )
 }
 
 /// A per-workspace random salt so derived aliases are not guessable or

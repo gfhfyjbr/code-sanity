@@ -143,7 +143,7 @@ fn concurrent_first_init_agrees_on_one_salt_and_gitignore_line() {
         .find(|line| line.starts_with("salt"))
         .unwrap()
         .to_string();
-    // Re-running init must not change the salt (write_if_missing).
+    // Re-running init must not change the salt (config exists; init skips it).
     std::process::Command::new(&binary)
         .arg("--root")
         .arg(repo.path())
