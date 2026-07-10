@@ -7,12 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Follow-up hardening from the v0.3.0 production-readiness audit: the two
-remaining medium findings on the repo-boundary and no-leak promises, plus
-power-loss durability, network-FS locking, and retention/contract cleanups.
+Follow-up hardening from the v0.3.0 production-readiness audit. The headline
+is a **soundness fix in the no-leak guarantee**: prose in a README could grant
+a denylisted term repo-wide immunity, and `verify` blessed the leak because it
+recomputes the same protected set. Also: file modes survive the patch bridge,
+`recover` survives a torn file, `sync` no longer destroys un-projected agent
+edits, and a lost `config.toml` no longer silently voids the policy.
 
 ### Breaking
 
+- **Protected identifiers are collected only from code contexts.** The
+  declaration/import heuristics ran over raw content, so `Data from shadowfax
+  is loaded` in a README, `// migrated from acme_v1` in a comment, and
+  markdown bold `__shadowfax__` each added the term to the **repo-wide**
+  protected set — it then survived verbatim in every mirror file, with
+  `verify` exiting 0. Collection now classifies the language and ignores
+  prose formats (`.md`, `.txt`/`.rst`/`.adoc`, `.json`, `.toml`) entirely;
+  within code, runs inside comments or string literals never protect, and the
+  token-rule lookback no longer crosses a newline. Import-position string
+  specifiers (`import x from "acme_sdk"`, Go `import "acme/pkg"`) stay
+  protected. Unknown extensions remain code, so `.java`/`.rb` imports and
+  `export FOO` in shell scripts keep their protection.
+- **Dunder-shaped runs are no longer blanket-sanctioned.** `__init__` in
+  python code is still protected (it now reaches the set through collection),
+  but `__term__` markdown bold sanitizes to `__sym_…__`.
+- **A denylisted term protected as a public name is a hard error.** `pub fn
+  shadowfax_client()` with `shadowfax` denylisted previously kept the term in
+  the mirror silently. `index` now refuses and `verify` reports it (exit 3),
+  naming the declaring file and the three ways out. Dictionary terms in public
+  names remain sanctioned residues (the default dictionary must not brick
+  ordinary repos).
+- **A missing `config.toml` on an initialized workspace is a hard error.**
+  It used to be silently replaced with defaults — new salt, empty denylist and
+  alias registry — and the whole mirror re-rendered without the user's policy,
+  exit 0. The message points at the `config.toml.bak` sibling `Config::save`
+  always keeps. `Config::write_if_missing` is removed.
+- **The db-corruption remedy is now `sync --force`, not `index`** (see the
+  pending-edit fix below). The schema-migration message still says `index`.
+- `.sh`/`.yml`/`.txt` gain comment and string zones, so aliases inside them in
+  **newly added** mirror lines are no longer reverse-mapped into real terms —
+  consistent with how `.rs`/`.py`/`.go` have always behaved.
+- `SANITIZER_BEHAVIOR_VERSION` 3 → 4: the first `sync`/`index` after upgrading
+  re-renders every file and sweeps out any legacy prose leak.
 - **Hyphenated sanitizer terms are rejected at validation.** A term like
   `acme-corp` normalized to a clean-looking needle but spans two word runs,
   so it never matched anywhere — the mirror, the MCP redactor, and `verify`'s
@@ -31,6 +67,24 @@ power-loss durability, network-FS locking, and retention/contract cleanups.
 
 ### Fixed
 
+- **File permission bits survive the patch bridge.** Every real-file write went
+  through a fresh 0644 temp file renamed over the target, so back-projecting an
+  agent edit onto `deploy.sh` silently stripped its executable bit. The atomic
+  write now carries the existing target's mode across the rename, and the
+  journal records `before_mode`/`after_mode` so a rollback or `recover` that
+  re-creates a deleted file restores the right mode too.
+- **`recover` survives a torn, non-UTF-8 pending file.** The freshness check
+  read pending files as UTF-8 and aborted the entire run on `InvalidData` —
+  before `--force` was even consulted — leaving every entry `applying` and the
+  workspace blocked. That is exactly the power-loss case the `F_FULLFSYNC`
+  barrier exists to make recoverable. Freshness now compares bytes, and an
+  unreadable-but-present file is a per-entry conflict.
+- **A plain `sync` no longer destroys un-projected agent mirror edits when the
+  db row is missing.** The pending-edit guard required an existing row, so
+  after `rm db.sqlite` (the documented corruption remedy) or a crash before the
+  first commit, the edit was silently overwritten with `stashed=0`. A missing
+  row now counts as pending; only `sync --force`, which stashes to
+  `journal/discarded/`, may reset it.
 - **Real-file writes no longer follow symlinked directories out of the repo.**
   A pre-planted `src -> /outside` symlink let a create patch (or a tampered
   journal replay) write outside the root despite lexical path validation;

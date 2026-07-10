@@ -562,15 +562,27 @@ fn dir_has_entries(dir: &Path) -> bool {
 
 /// The error every path raises when config.toml is missing on a workspace
 /// that has initialized state. One message, one remedy, everywhere.
+///
+/// `Config::save` only writes a `.bak` when it replaces DIFFERENT previous
+/// content, so a workspace whose config was never re-saved has none — point
+/// at it only when it is actually there, or the remedy sends the user chasing
+/// a file that does not exist.
 pub fn missing_config_error(layout: &Layout) -> anyhow::Error {
+    let backup = layout.config_path.with_extension("toml.bak");
+    let restore = if backup.exists() {
+        format!(
+            "Restore it from {} or from version control",
+            backup.display()
+        )
+    } else {
+        "Restore it from version control".to_string()
+    };
     anyhow::anyhow!(
         "{} is missing but this workspace is already initialized; the config \
          holds the workspace salt and the approved alias registry, which \
-         cannot be re-derived. Restore it from {}.bak or from version \
-         control; or delete the entire {} directory and re-run \
-         `code-sanity init` to reset deliberately (new salt, default policy, \
-         full re-render)",
-        layout.config_path.display(),
+         cannot be re-derived. {restore}; or delete the entire {} directory \
+         and re-run `code-sanity init` to reset deliberately (new salt, \
+         default policy, full re-render)",
         layout.config_path.display(),
         layout.state_dir.display(),
     )

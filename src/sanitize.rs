@@ -7,10 +7,19 @@
 //! `AcmeClient` therefore also catches `ACME_CLIENT` and `acmeClientFactory`.
 //!
 //! The only sanctioned residues of a term in the mirror are word runs in the
-//! repo-wide protected identifier set (public declarations and import-position
-//! names, collected from the real files). That set is name-based: one symbol
-//! gets one decision across the whole mirror, and `verify` can independently
-//! recompute it to tell a sanctioned residue from a leak.
+//! repo-wide protected identifier set (public declarations, import-position
+//! names, and code dunders, collected from the real files). That set is
+//! name-based: one symbol gets one decision across the whole mirror, and
+//! `verify` can independently recompute it to tell a sanctioned residue from
+//! a leak.
+//!
+//! Collection is CONTEXT-AWARE: only code positions can protect a name. Prose
+//! formats contribute nothing, and inside code, runs within comments or string
+//! literals never protect — English prose is full of `from`/`use`/`import`,
+//! and a README sentence must not grant a term repo-wide immunity. Because
+//! `verify` recomputes this same set, a leak it creates would be self-blessed.
+//! A denylisted term that a protected identifier would keep alive is refused
+//! outright rather than silently sanctioned.
 
 use crate::config::Config;
 use crate::map::{PendingReplacement, RenderedSanitization, render_with_map, sha256_hex};
@@ -23,7 +32,14 @@ use std::path::Path;
 /// fingerprint, so an upgrade re-renders every mirror file.
 /// v3: alias-collision hard errors + policy validation (the forced re-render
 /// doubles as the migration sweep that checks every file for collisions).
-pub const SANITIZER_BEHAVIOR_VERSION: u32 = 3;
+/// v4: context-aware protected collection (prose, comments and string
+/// literals no longer protect) + dunders dropped from the sanctioned-residue
+/// guard + denylist∩protected hard error. The bump is required for
+/// correctness, not convention: the guard change alters render output even
+/// for files whose protected set is unchanged (`__acme__` in a python string
+/// was skipped, now sanitizes), which a union-shrink alone would not
+/// invalidate. The forced re-render sweeps legacy prose leaks out.
+pub const SANITIZER_BEHAVIOR_VERSION: u32 = 4;
 
 /// One term the sanitizer must remove, with its normalized matching form.
 #[derive(Debug, Clone)]

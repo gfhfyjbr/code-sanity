@@ -37,8 +37,9 @@ Deliberately **not** hidden (behavior must remain legible):
 
 - control flow, imports/exports, module paths, filenames;
 - public API names — the repo-wide protected identifier set (public
-  declarations, import-position names) keeps one decision per symbol across
-  the whole mirror;
+  declarations, import-position names, code dunders; collected from code
+  positions only, never from prose/comments/strings) keeps one decision per
+  symbol across the whole mirror;
 - SQL statements, shell commands, env var names, feature flags (a configured
   term inside them is still lexically replaced, but structure and semantics
   never change);
@@ -115,12 +116,14 @@ lock and silently corrupt the mirror/db.
 
 ### 6. Crash mid-apply
 The process dies after real files start changing.
-- **Mitigation:** the full before/after intent is journaled as `applying` and
-  fsync'd (temp + rename + directory fsync) before any real write; `recover`
-  replays (roll-forward) or `--rollback` undoes it, and sweeps temp files
-  stranded by a kill mid-atomic-write. All writers serialize on a blocking
-  `flock` that the kernel releases when the process dies, so a crash never
-  wedges the workspace.
+- **Mitigation:** the full before/after intent (contents and permission bits)
+  is journaled as `applying` and fsync'd (temp + rename + directory fsync)
+  before any real write; `recover` replays (roll-forward) or `--rollback`
+  undoes it, and sweeps temp files stranded by a kill mid-atomic-write. A file
+  torn by power loss into non-UTF-8 bytes is a per-entry conflict resolvable
+  with `--force`, never an abort of the whole recovery. All writers serialize
+  on a blocking `flock` that the kernel releases when the process dies, so a
+  crash never wedges the workspace.
 - **Residual risk:** not a cross-crash transactional FS/DB; the sqlite state is
   derived and rebuilt by `index`.
 
@@ -199,10 +202,11 @@ reads mislead, and an agent-typed word reverse-maps into the real term
 ### 9. Sanitization breaks the code
 A replacement produces invalid code or renames a public symbol.
 - **Mitigation:** the repo-wide protected identifier set (public declarations,
-  import-position names) is skipped everywhere — one symbol, one decision — and
-  identifier aliases are validated as identifiers. Terms and their case
-  variants map to one deterministic alias, so cross-file renames stay
-  consistent.
+  import-position names, code dunders) is skipped everywhere — one symbol, one
+  decision — and identifier aliases are validated as identifiers. Terms and
+  their case variants map to one deterministic alias, so cross-file renames
+  stay consistent. A denylisted term that would be protected this way is a hard
+  error, so the two policies can never quietly contradict each other.
 - **Residual risk:** regex/byte-scanner tokenization is not AST-aware; a
   sanitized worktree may still not compile in edge cases (use `sh` against the
   real repo for builds).
@@ -214,10 +218,16 @@ term visible.
   mirror and every span-map replacement output with the same matching primitive
   and recomputes the protected set from the real files; any unsanctioned term
   occurrence, and any untracked file inside the mirror, fails verification
-  (exit code 3, each failure printed).
-- **Residual risk:** residues inside protected identifiers are sanctioned by
-  policy (public names stay real); the backstop shares the matching primitive
-  with the sanitizer, so a bug in that primitive itself would blind both.
+  (exit code 3, each failure printed). The protected set is collected only from
+  **code contexts** — prose formats contribute nothing, and comments and string
+  literals never protect — so an English sentence cannot grant a term repo-wide
+  immunity. A denylisted term that a protected identifier would keep alive is a
+  hard error at index and a verify finding, never a silent residue.
+- **Residual risk:** residues of *dictionary* terms inside protected
+  identifiers are sanctioned by policy (public names stay real); the backstop
+  shares the matching primitive AND the protected-set collector with the
+  sanitizer, so a bug in either would blind both. Import-position string
+  specifiers stay real by design.
 
 ## Guarantees vs non-guarantees
 
@@ -234,11 +244,18 @@ term visible.
   to one alias everywhere (including case/underscore variants).
 - No dictionary/denylist/registry term survives into the mirror outside a
   protected identifier — enforced independently by the `verify` leak backstop.
+  Protected identifiers come only from code positions, so no amount of prose,
+  comments, or string literals can create one; a **denylisted** term can never
+  be a sanctioned residue at all (it is a hard error instead).
 - The model never writes the mirror; only the deterministic engine does.
 - Apply intent is journaled (fsync'd) before any real write, and every writer
-  holds the workspace flock.
+  holds the workspace flock. A back-projected write preserves the real file's
+  permission bits.
 - Sync never overwrites a mirror file holding a pending, not-yet-projected
-  agent edit.
+  agent edit — including when the workspace database row for that file is
+  missing. Only `sync --force`, which stashes the edit first, may reset it.
+- The sanitization policy is never regenerated silently: losing `config.toml`
+  on an initialized workspace is a hard error, not a reset to defaults.
 
 **Non-guarantees**
 - That every byte the model sees passed through the sanitizer.

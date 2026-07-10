@@ -40,8 +40,18 @@ fn missing_config_on_initialized_workspace_is_a_hard_error() {
     ] {
         let message = format!("{err:#}");
         assert!(
-            message.contains("config.toml.bak"),
-            "{what}: the error must name the .bak remedy, got: {message}"
+            message.contains("config.toml is missing"),
+            "{what}: the error must name the lost file, got: {message}"
+        );
+        // No .bak exists here (Config::save only writes one when it replaces
+        // DIFFERENT content), so the remedy must not point at a missing file.
+        assert!(
+            !message.contains("config.toml.bak"),
+            "{what}: must not name a .bak that does not exist, got: {message}"
+        );
+        assert!(
+            message.contains("version control"),
+            "{what}: the remedy must be actionable, got: {message}"
         );
     }
 
@@ -65,7 +75,7 @@ fn verify_reports_missing_config_as_failure() {
         .expect("verify must fail with the typed exit-3 error");
     assert_eq!(failed.report.failures.len(), 1);
     assert!(failed.report.failures[0].contains("config.toml"));
-    assert!(failed.report.failures[0].contains(".bak"));
+    assert!(failed.report.failures[0].contains("version control"));
 }
 
 #[test]
@@ -87,7 +97,9 @@ fn restoring_the_backup_recovers_the_workspace() {
     loaded.save(&layout).unwrap();
     assert!(config.with_file_name("config.toml.bak").exists());
     fs::remove_file(&config).unwrap();
-    index_workspace(repo.path()).unwrap_err();
+    // With a .bak on disk the remedy names it.
+    let err = format!("{:#}", index_workspace(repo.path()).unwrap_err());
+    assert!(err.contains("config.toml.bak"), "{err}");
 
     // The documented remedy: restore from the .bak sibling.
     fs::rename(config.with_file_name("config.toml.bak"), &config).unwrap();
