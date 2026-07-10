@@ -680,6 +680,54 @@ fn recover_rolls_back_interrupted_apply() {
 }
 
 #[test]
+fn recover_treats_torn_non_utf8_file_as_conflict_not_abort() {
+    let repo = copy_fixture("basic-rust");
+    index_workspace(repo.path()).unwrap();
+    let real_path = repo.path().join("src/lib.rs");
+    let before = fs::read_to_string(&real_path).unwrap();
+    let after = before.replace("    1\n", "    9\n");
+    assert_ne!(before, after);
+
+    let layout = code_sanity::config::Layout::new(repo.path());
+    let entry = code_sanity::journal::JournalEntry {
+        id: code_sanity::journal::new_journal_id(),
+        status: code_sanity::journal::JournalStatus::Applying,
+        session_id: None,
+        agent: None,
+        files: vec!["src/lib.rs".to_string()],
+        sanitized_patch: String::new(),
+        original_patch: String::new(),
+        error: None,
+        created_at: "now".to_string(),
+        pending: Some(vec![code_sanity::journal::PendingFile {
+            rel: "src/lib.rs".to_string(),
+            before: Some(before.clone()),
+            after: Some(after.clone()),
+            before_mode: None,
+            after_mode: None,
+        }]),
+    };
+    code_sanity::journal::write_journal(&layout, &entry).unwrap();
+    // Power loss tore the file: invalid UTF-8 that matches neither snapshot.
+    fs::write(&real_path, b"\x80torn mid-write\xff").unwrap();
+
+    // The run must complete with a conflict — not abort before --force is
+    // even consulted — and the workspace must stay blocked.
+    let report = code_sanity::recover_workspace(repo.path(), false, false).unwrap();
+    assert!(report.recovered.is_empty());
+    assert_eq!(report.conflicts.len(), 1);
+    assert!(report.conflicts[0].contains("--force"));
+    let blocked = index_workspace(repo.path()).unwrap_err().to_string();
+    assert!(blocked.contains("recover"));
+
+    // --force replays the journaled target over the torn bytes.
+    let forced = code_sanity::recover_workspace(repo.path(), false, true).unwrap();
+    assert_eq!(forced.recovered.len(), 1);
+    assert_eq!(fs::read_to_string(&real_path).unwrap(), after);
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
 fn rename_alias_renames_real_symbol() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();

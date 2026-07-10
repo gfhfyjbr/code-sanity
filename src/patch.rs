@@ -999,18 +999,39 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
                     pending_file.before.as_deref(),
                 )
             };
-            let current = match fs::read_to_string(root.join(&rel)) {
-                Ok(content) => Some(content),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                Err(err) => {
-                    return Err(err).with_context(|| format!("read current {}", pending_file.rel));
-                }
+            // Bytes, not UTF-8: a power-loss-torn file rarely decodes, and
+            // recover is exactly the tool that must survive it. An
+            // unreadable-but-present file is a per-entry freshness conflict
+            // (overridable with --force), never a whole-run abort.
+            let (current, read_error) = match fs::read(root.join(&rel)) {
+                Ok(bytes) => (Some(bytes), None),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(err) => (None, Some(err)),
             };
-            let fresh = current.as_deref() == precondition || current.as_deref() == target;
+            let matches = |snapshot: Option<&str>| {
+                read_error.is_none() && current.as_deref() == snapshot.map(str::as_bytes)
+            };
+            let fresh = matches(precondition) || matches(target);
             if !fresh && !force {
-                entry_conflicts.push(pending_file.rel.clone());
+                entry_conflicts.push(match &read_error {
+                    Some(err) => format!(
+                        "{}: cannot read current content ({err}); resolve manually or rerun \
+                         with --force",
+                        pending_file.rel
+                    ),
+                    None => format!(
+                        "{}: current content matches neither the recorded snapshot nor the \
+                         target; resolve manually or rerun with --force",
+                        pending_file.rel
+                    ),
+                });
                 continue;
             }
+            // A write failure here stays loud: it is not a freshness question
+            // (disk full, EACCES, containment), --force cannot fix it, and
+            // recover is idempotent on re-run because freshness accepts
+            // current == target. The entry stays `Applying` and the workspace
+            // stays safely blocked.
             protected_drift |= set_file_state(root, &layout, &conn, &rel, target, target_mode)
                 .with_context(|| format!("recover {}", pending_file.rel))?;
         }
@@ -1018,11 +1039,7 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
             // Newer work landed on these files after the crash. Leave the
             // journal entry in `applying` so the workspace stays blocked until
             // a human resolves it (or reruns recover with --force).
-            report.conflicts.extend(entry_conflicts.iter().map(|rel| {
-                format!(
-                    "{rel}: current content matches neither the recorded snapshot nor the                      target; resolve manually or rerun with --force"
-                )
-            }));
+            report.conflicts.extend(entry_conflicts);
             continue;
         }
         entry.status = if rollback {
