@@ -85,8 +85,8 @@ impl Redactor {
         self.terms.is_empty()
     }
 
-    /// Redact every term occurrence in `text`, leaving protected identifiers,
-    /// keywords, and dunders verbatim — the same residue rule as the mirror.
+    /// Redact every term occurrence in `text`, leaving protected identifiers
+    /// and keywords verbatim — the same residue rule as the mirror.
     pub fn redact(&self, text: &str) -> String {
         if self.terms.is_empty() {
             return text.to_string();

@@ -110,9 +110,10 @@ and `acmeClientFactory`.
 - replacements adapt to the casing of the matched slice (`ACME` → `CLIENT`,
   `Acme` → `Client`);
 - the **repo-wide protected identifier set** (public declarations,
-  import-position names, dunder names, collected from the real files) is the
-  only sanctioned residue: one symbol gets one decision across the whole
-  mirror, so a `pub fn` keeps its name at every call site in every file;
+  import-position names, and code dunders like `__init__`, collected from the
+  real files' code contexts — never from prose, comments, or string literals)
+  is the only sanctioned residue: one symbol gets one decision across the
+  whole mirror, so a `pub fn` keeps its name at every call site in every file;
 - `'` is not a string delimiter in Rust/Go, so lifetimes (`&'a str`) cannot
   open phantom strings that would suppress sanitization;
 - zone detection (comment/string/identifier) only labels the replacement

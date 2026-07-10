@@ -390,12 +390,23 @@ pub fn hits_in_run(run: &str, run_start: usize, terms: &[Term], out: &mut Vec<Te
     }
 }
 
+/// The only sanctioned residues of a term in the mirror: language keywords
+/// and repo-protected names. This single predicate is shared by the renderer
+/// (`sanitize_content`), the patch bridge's roundtrip check
+/// (`sanitize_run_text`), and the verify leak backstop (`find_leaks`) — the
+/// two sides MUST agree or a leak becomes verify-blessed. Dunders are NOT
+/// blanket-sanctioned: a genuine code dunder (`__init__`) reaches `protected`
+/// via collection, while `__term__` prose (markdown bold) must sanitize.
+fn is_sanctioned_run(run: &str, protected: &BTreeSet<String>) -> bool {
+    is_keyword(run) || protected.contains(run)
+}
+
 /// Sanitize one word run exactly as `sanitize_content` would (same hit
 /// selection order and case adaptation), returning the replaced text. The
 /// patch bridge uses this to roundtrip-check reverse-mapped identifiers in
 /// newly added lines.
 pub fn sanitize_run_text(run: &str, terms: &[Term], protected: &BTreeSet<String>) -> String {
-    if is_keyword(run) || run.starts_with("__") || protected.contains(run) {
+    if is_sanctioned_run(run, protected) {
         return run.to_string();
     }
     let mut hits = Vec::new();
@@ -499,14 +510,14 @@ pub struct Leak {
 
 /// Scan text with the same primitive the sanitizer uses and report every term
 /// occurrence whose enclosing word run is not a sanctioned residue (protected
-/// identifier, keyword, or dunder). Used by `verify` as an independent
-/// backstop over the mirror and the span-map replacement outputs.
+/// identifier or keyword). Used by `verify` as an independent backstop over
+/// the mirror and the span-map replacement outputs.
 pub fn find_leaks(content: &str, terms: &[Term], protected: &BTreeSet<String>) -> Vec<Leak> {
     let mut leaks = Vec::new();
     let mut hits = Vec::new();
     for (run_start, run_end) in word_runs(content) {
         let run = &content[run_start..run_end];
-        if is_keyword(run) || run.starts_with("__") || protected.contains(run) {
+        if is_sanctioned_run(run, protected) {
             continue;
         }
         hits.clear();
@@ -537,7 +548,7 @@ pub fn sanitize_content(
     let mut hits = Vec::new();
     for (run_start, run_end) in word_runs(content) {
         let run = &content[run_start..run_end];
-        if is_keyword(run) || run.starts_with("__") || protected.contains(run) {
+        if is_sanctioned_run(run, protected) {
             continue;
         }
         hits.clear();
