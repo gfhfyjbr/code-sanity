@@ -132,6 +132,16 @@ pub fn matchability_error(raw: &str) -> Option<String> {
              into single-word entries (e.g. \"acme\" + \"corp\") or remove it"
         ));
     }
+    // Normalization strips '-', but '-' is a run BOUNDARY in text: a term like
+    // "acme-corp" normalizes to a clean-looking needle that spans two word
+    // runs and can never match. The raw form must be exactly one word run.
+    if word_runs(raw) != [(0, raw.len())] {
+        return Some(format!(
+            "term {raw:?} spans more than one word run; the sanitizer matches \
+             only inside identifier word runs [A-Za-z0-9_]+ — split it into \
+             single-word entries (e.g. \"acme\" + \"corp\") or remove it"
+        ));
+    }
     None
 }
 
@@ -242,6 +252,21 @@ pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
     }
     if embeddings.batch_size == 0 {
         violations.push("embeddings.batch_size must be at least 1".to_string());
+    }
+    if embeddings.timeout_secs == 0 {
+        violations.push("embeddings.timeout_secs must be at least 1".to_string());
+    }
+    // A configured 0-second provider timeout is floored to 1s at use; flag it
+    // here so the config says what actually happens.
+    let provider_timeout = match &sanitizer.provider {
+        crate::config::ProviderConfig::External { timeout_secs, .. }
+        | crate::config::ProviderConfig::Llm { timeout_secs, .. }
+        | crate::config::ProviderConfig::Openrouter { timeout_secs, .. }
+        | crate::config::ProviderConfig::KouRouter { timeout_secs, .. } => *timeout_secs,
+        _ => None,
+    };
+    if provider_timeout == Some(0) {
+        violations.push("sanitizer.provider.timeout_secs must be at least 1".to_string());
     }
     violations
 }
@@ -936,12 +961,25 @@ mod tests {
 
     #[test]
     fn multi_token_terms_are_rejected_by_policy_validation() {
-        for term in ["Acme Corp.", "acme.example.com", "a@b", "--", "com/acme"] {
+        // Hyphenated terms normalize to a clean-looking needle but span two
+        // word runs in text — silently inert, so they must be rejected too.
+        for term in [
+            "Acme Corp.",
+            "acme.example.com",
+            "a@b",
+            "--",
+            "com/acme",
+            "acme-corp",
+            "Acme_Client-2",
+            "-acme",
+            "acme-",
+        ] {
             let reason = matchability_error(term);
             assert!(reason.is_some(), "{term:?} must be unmatchable");
         }
         assert!(matchability_error("acme").is_none());
-        assert!(matchability_error("Acme_Client-2").is_none());
+        // '_' is a word byte: underscore-joined terms match fine.
+        assert!(matchability_error("acme_corp").is_none());
 
         let mut config = Config::default();
         config.sanitizer.denylist = vec!["secret.internal.key".to_string()];

@@ -16,9 +16,11 @@
 //!
 //! Network filesystems: `flock` on NFS/SMB/CIFS may be host-local (or a no-op)
 //! depending on mount options and server support, so two hosts can both hold
-//! the "exclusive" lock and silently corrupt the workspace. The repo must live
-//! on a local filesystem; a best-effort warning is logged when the lock file's
-//! filesystem looks networked.
+//! the "exclusive" lock and silently corrupt the workspace. Writers therefore
+//! REFUSE to run on a detected network filesystem unless the workspace opts
+//! in via `durability.allow_network_fs`; readers (which cannot corrupt) only
+//! warn. Detection is an allowlist of known network FS types — an unknown
+//! filesystem is treated as local, never gated.
 
 use crate::config::Layout;
 use anyhow::{Context, Result};
@@ -46,7 +48,17 @@ impl WorkspaceLock {
         std::fs::create_dir_all(&layout.tmp_dir)
             .with_context(|| format!("create {}", layout.tmp_dir.display()))?;
         let path = layout.tmp_dir.join("apply.lock");
-        warn_once_on_network_fs(&path);
+        if let Some(fs_name) = detected_network_fs(&path) {
+            warn_once_on_network_fs(fs_name);
+            // Lenient load: a sanitizer policy violation must not mask the
+            // lock refusal, and an unreadable config fails closed (refuse).
+            let allow = crate::config::Config::load_or_default_lenient(layout)
+                .map(|config| config.durability.allow_network_fs)
+                .unwrap_or(false);
+            if let Some(message) = network_fs_writer_refusal(fs_name, op == libc::LOCK_EX, allow) {
+                anyhow::bail!(message);
+            }
+        }
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -68,21 +80,43 @@ impl WorkspaceLock {
     }
 }
 
-/// Best-effort, once per process: statfs the lock directory and warn when it
-/// sits on a network filesystem, where flock may be host-local and two hosts
-/// could both "hold" the exclusive lock. Any statfs failure stays silent —
-/// this is advisory, never a gate.
-fn warn_once_on_network_fs(path: &Path) {
-    static CHECKED: std::sync::Once = std::sync::Once::new();
-    CHECKED.call_once(|| {
-        let dir = path.parent().unwrap_or(path);
-        if let Some(fs_name) = network_fs_name(dir) {
-            log::warn!(
-                "workspace lock is on a {fs_name} filesystem; flock may not be \
-                 enforced across hosts there — keep the repo on a local \
-                 filesystem to avoid corruption from concurrent writers"
-            );
-        }
+/// statfs the lock directory once per process and remember whether it sits on
+/// a known network filesystem. Any statfs failure counts as local — detection
+/// is best-effort and must never gate an unknown-but-local filesystem.
+fn detected_network_fs(path: &Path) -> Option<&'static str> {
+    static DETECTED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DETECTED
+        .get_or_init(|| network_fs_name(path.parent().unwrap_or(path)))
+        .as_deref()
+}
+
+/// Writer gate as a pure decision: exclusive locks on a network filesystem
+/// are refused unless the workspace opted in; shared readers pass (a reader
+/// cannot corrupt, and refusing reads would brick MCP on such mounts).
+fn network_fs_writer_refusal(
+    fs_name: &str,
+    exclusive: bool,
+    allow_network_fs: bool,
+) -> Option<String> {
+    if !exclusive || allow_network_fs {
+        return None;
+    }
+    Some(format!(
+        "the workspace is on a {fs_name} filesystem, where flock may not be \
+         enforced across hosts — two writers could silently corrupt it. Move \
+         the repo to a local filesystem, or set `durability.allow_network_fs \
+         = true` in .code-sanity/config.toml to accept the risk"
+    ))
+}
+
+fn warn_once_on_network_fs(fs_name: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "workspace lock is on a {fs_name} filesystem; flock may not be \
+             enforced across hosts there — keep the repo on a local \
+             filesystem to avoid corruption from concurrent writers"
+        );
     });
 }
 
@@ -130,5 +164,16 @@ mod tests {
         let layout = Layout::new(dir.path());
         let _a = WorkspaceLock::acquire_shared(&layout).unwrap();
         let _b = WorkspaceLock::acquire_shared(&layout).unwrap();
+    }
+
+    #[test]
+    fn network_fs_refuses_writers_unless_opted_in() {
+        // Writers on a network FS are refused with the escape hatch named...
+        let refusal = network_fs_writer_refusal("nfs", true, false).expect("must refuse");
+        assert!(refusal.contains("nfs"));
+        assert!(refusal.contains("allow_network_fs"));
+        // ...opt-in restores writers, and readers always pass.
+        assert!(network_fs_writer_refusal("nfs", true, true).is_none());
+        assert!(network_fs_writer_refusal("smbfs", false, false).is_none());
     }
 }

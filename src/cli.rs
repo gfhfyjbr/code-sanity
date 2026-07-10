@@ -255,6 +255,28 @@ pub fn run() -> Result<()> {
             std::process::exit(code);
         }
     };
+    let out = if cli.json {
+        crate::output::Output::Json
+    } else {
+        crate::output::Output::Human
+    };
+    let name = command_name(&cli.command);
+    // sh/strict-run hand stdout and the exit code to the wrapped command, and
+    // serve's stdout is the MCP protocol stream (or the --once manifest);
+    // wrapping either would corrupt the stream, so a harness that sets --json
+    // globally must hear a loud refusal, not trust garbage.
+    if out.is_json()
+        && matches!(
+            cli.command,
+            Command::Sh { .. } | Command::StrictRun { .. } | Command::Serve { .. }
+        )
+    {
+        eprintln!(
+            "--json is not supported for {name}: stdout already belongs to \
+             the wrapped command (sh/strict-run) or the MCP stream (serve)"
+        );
+        std::process::exit(64);
+    }
     let (raw_root, explicit_root) = match cli.root {
         Some(path) => (path, true),
         None => (PathBuf::from("."), false),
@@ -263,8 +285,13 @@ pub fn run() -> Result<()> {
         Ok(root) => root,
         // An explicitly given root that does not resolve is a user error to
         // report now — downstream errors ("create /nonexistent/...") mislead.
+        // Post-clap, every error must honor the --json envelope contract.
         Err(err) if explicit_root => {
-            anyhow::bail!("--root {}: {err}", raw_root.display());
+            let message = format!("--root {}: {err}", raw_root.display());
+            if out.is_json() {
+                crate::output::emit_error(name, "error", &message, serde_json::json!({}));
+            }
+            anyhow::bail!(message);
         }
         Err(_) => raw_root,
     };
@@ -276,23 +303,6 @@ pub fn run() -> Result<()> {
         cli.verbose,
         stderr_logging,
     );
-
-    let out = if cli.json {
-        crate::output::Output::Json
-    } else {
-        crate::output::Output::Human
-    };
-    let name = command_name(&cli.command);
-    // sh/strict-run hand stdout and the exit code to the wrapped command;
-    // wrapping either would corrupt the child stream, so a harness that sets
-    // --json globally must hear a loud refusal, not trust garbage.
-    if out.is_json() && matches!(cli.command, Command::Sh { .. } | Command::StrictRun { .. }) {
-        eprintln!(
-            "--json is not supported for {name}: stdout and the exit code \
-             belong to the wrapped command"
-        );
-        std::process::exit(64);
-    }
 
     match dispatch(cli.command, &root, out) {
         Ok(()) => Ok(()),

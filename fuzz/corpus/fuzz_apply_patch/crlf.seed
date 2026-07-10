@@ -1,0 +1,9 @@
+line one
+line two
+%%%
+--- a/src/crlf.rs
++++ b/src/crlf.rs
+@@ -1,2 +1,2 @@
+ line one
+-line two
++line 2

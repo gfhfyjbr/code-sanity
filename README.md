@@ -12,7 +12,7 @@ Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 ```bash
 # pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
 #                     x86_64-apple-darwin, aarch64-apple-darwin
-version=v0.2.0
+version=v0.3.0
 target=aarch64-apple-darwin
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz"
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz.sha256"
@@ -261,8 +261,9 @@ Exit codes are unchanged.
 - A clap usage error (exit 64) is reported before `--json` is parsed and is
   never JSON.
 - `read --json` wraps the file as `{"path","content"}` (byte-faithful inside
-  the JSON string); `sh`/`strict-run` refuse the flag (exit 64) because their
-  stdout and exit code belong to the wrapped command.
+  the JSON string); `sh`/`strict-run`/`serve` refuse the flag (exit 64)
+  because their stdout (and for the wrappers, the exit code) belongs to the
+  wrapped command or the MCP protocol stream.
 
 ### Crash safety and recover
 

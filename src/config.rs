@@ -89,16 +89,40 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub journal: JournalConfig,
+    #[serde(default)]
+    pub durability: DurabilityConfig,
+}
+
+/// Storage-trust knobs: how hard to push writes toward the physical medium
+/// and whether to tolerate filesystems where locking is unreliable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DurabilityConfig {
+    /// macOS only: route every durable-tier fsync through `F_FULLFSYNC`
+    /// (flushes the drive's own write cache; plain `fsync(2)` does not on
+    /// macOS). The journal `applying` entry always gets the full flush
+    /// regardless — this knob extends it to real-file writes, config saves,
+    /// and stashes for full power-loss durability at ~10-100x fsync cost.
+    #[serde(default)]
+    pub full_fsync: bool,
+    /// Permit exclusive (writer) workspace locks on a detected network
+    /// filesystem (NFS/SMB/…), where flock may be host-local or a no-op and
+    /// two hosts could silently corrupt the workspace. Off by default:
+    /// writers on a network FS fail with an actionable error instead.
+    #[serde(default)]
+    pub allow_network_fs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalConfig {
-    /// Terminal journal entries (success/conflict/rolled-back) kept on disk
-    /// and rows kept in the `patch_journal` table; the oldest beyond this are
-    /// pruned after each successful apply. Entries hold full before/after
-    /// file snapshots, so an unbounded journal grows without limit on a busy
-    /// workspace. `0` disables pruning. In-flight (`applying`) entries and
-    /// unparseable files are never pruned.
+    /// Retention for apply history: terminal journal entries
+    /// (success/conflict/rolled-back) on disk and in the `patch_journal`
+    /// table, `journal/discarded/` stashes of force-reset mirror edits, and
+    /// RESOLVED review-queue items — the oldest beyond this are pruned
+    /// best-effort after each apply / force-sync / review resolution.
+    /// Entries hold full before/after file snapshots, so unbounded history
+    /// grows without limit on a busy workspace. `0` disables pruning.
+    /// In-flight (`applying`) entries, pending review items, and unparseable
+    /// files are never pruned.
     #[serde(default = "default_journal_max_entries")]
     pub max_entries: u64,
 }
@@ -461,6 +485,7 @@ impl Default for Config {
             },
             embeddings: EmbeddingsConfig::default(),
             journal: JournalConfig::default(),
+            durability: DurabilityConfig::default(),
         }
     }
 }
@@ -480,12 +505,18 @@ impl Config {
     /// for `verify`, which reports violations as findings instead of dying,
     /// and for other paths that must observe a broken config to explain it.
     pub fn load_or_default_lenient(layout: &Layout) -> Result<Self> {
-        if !layout.config_path.exists() {
-            return Ok(Self::default());
-        }
-        let raw = fs::read_to_string(&layout.config_path)
-            .with_context(|| format!("read {}", layout.config_path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("parse {}", layout.config_path.display()))
+        let config = if layout.config_path.exists() {
+            let raw = fs::read_to_string(&layout.config_path)
+                .with_context(|| format!("read {}", layout.config_path.display()))?;
+            toml::from_str(&raw)
+                .with_context(|| format!("parse {}", layout.config_path.display()))?
+        } else {
+            Self::default()
+        };
+        // The write primitives are free functions far from any config; arm
+        // the process-wide full-fsync switch at the single load chokepoint.
+        crate::fsutil::set_full_fsync(config.durability.full_fsync);
+        Ok(config)
     }
 
     pub fn write_if_missing(&self, layout: &Layout) -> Result<()> {

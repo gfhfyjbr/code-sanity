@@ -12,18 +12,49 @@
 //!   fsyncs would dominate full-index time (macOS fsync is ~tens of ms).
 //!
 //! macOS caveat: `sync_all` maps to `fsync(2)`, which on macOS does not flush
-//! the drive's own write cache (`F_FULLFSYNC` would, at ~10-100x the cost).
-//! The write ORDERING the recovery protocol relies on (journal entry durable
-//! before real files change) still holds; a full power loss can lose the
-//! newest few writes as a unit — a documented trade-off, not a torn state.
+//! the drive's own write cache (`F_FULLFSYNC` would, at ~10-100x the cost),
+//! so a true power loss may reorder writes on the medium. The journal
+//! `applying` entry is therefore always written through
+//! [`atomic_write_sync_barrier`] (one `F_FULLFSYNC` per apply): a torn real
+//! file without its recovery record is the one state `recover` cannot fix.
+//! `durability.full_fsync` extends the full flush to every durable-tier write.
+//! Process crash / SIGKILL is unaffected either way — the page cache survives.
 
 use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether durable-tier fsyncs should flush the drive cache too (macOS
+/// `F_FULLFSYNC`). Process-wide because the write primitives are free
+/// functions called far from any config; armed at config load.
+static FULL_FSYNC: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_full_fsync(enabled: bool) {
+    FULL_FSYNC.store(enabled, Ordering::Relaxed);
+}
+
+/// Durable-tier fsync of a file or directory handle. With `barrier` (or the
+/// process-wide `durability.full_fsync` switch) on macOS, flush the drive's
+/// write cache via `F_FULLFSYNC`; some filesystems reject the fcntl, in which
+/// case plain `fsync` is the best available and we fall back to it.
+fn sync_handle(handle: &fs::File, barrier: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        if (barrier || FULL_FSYNC.load(Ordering::Relaxed))
+            && unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_FULLFSYNC) } == 0
+        {
+            return Ok(());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = barrier;
+    handle.sync_all()
+}
 
 fn temp_path_for(path: &Path, parent: &Path) -> PathBuf {
     let file_name = path
@@ -37,7 +68,7 @@ fn temp_path_for(path: &Path, parent: &Path) -> PathBuf {
     ))
 }
 
-fn atomic_write_impl(path: &Path, content: &str, durable: bool) -> Result<()> {
+fn atomic_write_impl(path: &Path, content: &str, durable: bool, barrier: bool) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
@@ -46,7 +77,7 @@ fn atomic_write_impl(path: &Path, content: &str, durable: bool) -> Result<()> {
         // if the directories themselves were just created, their entries in
         // the grandparent are volatile and power loss drops the whole subtree
         // — journal entry included.
-        create_dir_all_synced(parent)?;
+        create_dir_all_synced_impl(parent, barrier)?;
     } else {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -57,15 +88,14 @@ fn atomic_write_impl(path: &Path, content: &str, durable: bool) -> Result<()> {
         file.write_all(content.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
         if durable {
-            file.sync_all()
-                .with_context(|| format!("fsync {}", tmp.display()))?;
+            sync_handle(&file, barrier).with_context(|| format!("fsync {}", tmp.display()))?;
         }
         drop(file);
         fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
         if durable {
-            fs::File::open(parent)
-                .and_then(|dir| dir.sync_all())
-                .with_context(|| format!("fsync {}", parent.display()))?;
+            let dir =
+                fs::File::open(parent).with_context(|| format!("open {}", parent.display()))?;
+            sync_handle(&dir, barrier).with_context(|| format!("fsync {}", parent.display()))?;
         }
         Ok(())
     })();
@@ -78,13 +108,21 @@ fn atomic_write_impl(path: &Path, content: &str, durable: bool) -> Result<()> {
 /// Atomically replace `path` with `content` and make the replacement durable
 /// (file fsync + parent directory fsync). Creates missing parent directories.
 pub fn atomic_write_sync(path: &Path, content: &str) -> Result<()> {
-    atomic_write_impl(path, content, true)
+    atomic_write_impl(path, content, true, false)
+}
+
+/// [`atomic_write_sync`] that additionally flushes the drive's write cache on
+/// macOS (`F_FULLFSYNC`), regardless of `durability.full_fsync`. For the one
+/// write whose loss-after-reorder is unrecoverable: the journal `applying`
+/// entry, which must be on the medium before any real file changes.
+pub fn atomic_write_sync_barrier(path: &Path, content: &str) -> Result<()> {
+    atomic_write_impl(path, content, true, true)
 }
 
 /// Atomically replace `path` with `content` (temp + rename, no fsync). For
 /// derived state that `sync`/`verify` can rebuild after a power loss.
 pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    atomic_write_impl(path, content, false)
+    atomic_write_impl(path, content, false, false)
 }
 
 /// `atomic_write` unless the file already holds exactly `content`. Returns
@@ -95,6 +133,47 @@ pub fn atomic_write_if_changed(path: &Path, content: &str) -> Result<bool> {
     }
     atomic_write(path, content)?;
     Ok(true)
+}
+
+/// Guard for REAL repo file writes/removals: lexical rel validation cannot see
+/// a directory component that is an on-disk symlink pointing outside the repo
+/// (`src -> /etc` turns a create for `src/evil` into a write to `/etc/evil`).
+/// Resolve the deepest EXISTING ancestor of the target's parent through
+/// symlinks and require it to stay inside `root`; missing components below it
+/// are created fresh by the write itself and cannot be links. The final
+/// component needs no resolution: `rename` replaces a symlink inode instead of
+/// following it, and `remove_file` unlinks the link itself. Returns the joined
+/// (unresolved) path for the caller to write to.
+pub fn ensure_real_path_containment(root: &Path, rel: &Path) -> Result<PathBuf> {
+    let real_path = root.join(rel);
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalize repo root {}", root.display()))?;
+    let mut anchor = real_path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", real_path.display()))?;
+    // symlink_metadata (not exists()): a dangling symlink component must be
+    // treated as present so canonicalize fails loudly instead of the walk
+    // skipping past it.
+    while fs::symlink_metadata(anchor).is_err() {
+        anchor = match anchor.parent() {
+            Some(parent) => parent,
+            None => break,
+        };
+    }
+    let canonical_anchor = anchor
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", anchor.display()))?;
+    if !canonical_anchor.starts_with(&canonical_root) {
+        anyhow::bail!(
+            "refusing to write {}: {} resolves to {} outside the repo root \
+             (a symlinked directory inside the repo points elsewhere)",
+            rel.display(),
+            anchor.display(),
+            canonical_anchor.display()
+        );
+    }
+    Ok(real_path)
 }
 
 /// Atomic durable write that first preserves existing, different content in a
@@ -116,6 +195,10 @@ pub fn write_with_backup_sync(path: &Path, content: &str) -> Result<()> {
 /// the deepest pre-existing ancestor (whose entry list changed). Durable-tier
 /// only. A racing concurrent creator merely causes an extra fsync.
 pub(crate) fn create_dir_all_synced(dir: &Path) -> Result<()> {
+    create_dir_all_synced_impl(dir, false)
+}
+
+fn create_dir_all_synced_impl(dir: &Path, barrier: bool) -> Result<()> {
     let mut missing = Vec::new();
     let mut probe = dir;
     let existing_ancestor = loop {
@@ -138,9 +221,9 @@ pub(crate) fn create_dir_all_synced(dir: &Path) -> Result<()> {
         if created.as_os_str().is_empty() {
             continue;
         }
-        fs::File::open(created)
-            .and_then(|handle| handle.sync_all())
-            .with_context(|| format!("fsync {}", created.display()))?;
+        let handle =
+            fs::File::open(created).with_context(|| format!("open {}", created.display()))?;
+        sync_handle(&handle, barrier).with_context(|| format!("fsync {}", created.display()))?;
     }
     Ok(())
 }
@@ -155,9 +238,8 @@ pub(crate) fn remove_file_sync(path: &Path) -> Result<bool> {
         Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
     }
     if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .with_context(|| format!("fsync {}", parent.display()))?;
+        let dir = fs::File::open(parent).with_context(|| format!("open {}", parent.display()))?;
+        sync_handle(&dir, false).with_context(|| format!("fsync {}", parent.display()))?;
     }
     Ok(true)
 }
@@ -232,6 +314,23 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
         atomic_write_sync(&path, "world").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "world");
+    }
+
+    #[test]
+    fn barrier_and_full_fsync_writes_roundtrip() {
+        // Behavioral power-loss durability is untestable in-process; this
+        // pins that the F_FULLFSYNC paths (fresh subtree included) succeed
+        // and fall back cleanly where the fcntl is unsupported.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal/fresh/entry.json");
+        atomic_write_sync_barrier(&path, "{}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
+        set_full_fsync(true);
+        let flagged = dir.path().join("flagged/real.rs");
+        let result = atomic_write_sync(&flagged, "fn x() {}");
+        set_full_fsync(false);
+        result.unwrap();
+        assert_eq!(fs::read_to_string(&flagged).unwrap(), "fn x() {}");
     }
 
     #[test]

@@ -358,7 +358,9 @@ fn provider_for(config: &Config, allow: ProviderAllow) -> Result<Box<dyn Proposa
             }
             Ok(Box::new(ExternalProposalProvider {
                 command: command.clone(),
-                timeout: std::time::Duration::from_secs(timeout_secs.unwrap_or(60)),
+                // Same floor as the LLM client: a configured 0 must not
+                // become a zero-duration deadline that kills every child.
+                timeout: std::time::Duration::from_secs(timeout_secs.unwrap_or(60).max(1)),
             }))
         }
         _ => Ok(Box::new(HeuristicProposalProvider)),
@@ -649,7 +651,58 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
     let updated = serde_json::to_string_pretty(&item).context("serialize review item")?;
     crate::fsutil::atomic_write(&path, &updated)
         .with_context(|| format!("write {}", path.display()))?;
+    // Best-effort retention of the resolved history (same knob as the
+    // journal); the resolution itself already landed. Lenient config load: a
+    // sanitizer policy violation must not fail a reject.
+    let keep = Config::load_or_default_lenient(&layout)
+        .map(|config| config.journal.max_entries)
+        .unwrap_or(0);
+    if let Err(err) = prune_resolved_reviews(&layout, keep) {
+        log::warn!("review-queue pruning failed: {err:#}");
+    }
     Ok(item)
+}
+
+/// Delete the oldest RESOLVED review items beyond `keep` (0 = unlimited).
+/// Pending items are the actionable queue and are never touched; unparseable
+/// files are kept for a human to inspect. Item ids start with a sortable UTC
+/// timestamp, so lexicographic order is age order.
+fn prune_resolved_reviews(layout: &Layout, keep: u64) -> Result<usize> {
+    if keep == 0 {
+        return Ok(0);
+    }
+    let read_dir = match std::fs::read_dir(&layout.review_dir) {
+        Ok(read_dir) => read_dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read {}", layout.review_dir.display()));
+        }
+    };
+    let mut resolved: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for entry in read_dir {
+        let path = entry.context("read review dir entry")?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(item) = serde_json::from_str::<ReviewItem>(&raw) else {
+            continue;
+        };
+        if item.status != ReviewStatus::Pending {
+            resolved.push((item.id, path));
+        }
+    }
+    resolved.sort();
+    let excess = resolved.len().saturating_sub(keep as usize);
+    let mut removed = 0usize;
+    for (_, path) in resolved.into_iter().take(excess) {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("prune review item {}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// One applied replacement, for the audit report.
@@ -787,6 +840,46 @@ mod tests {
             rationale: None,
         };
         assert!(validate_proposal(&proposal, "// widget here", &config).is_err());
+    }
+
+    #[test]
+    fn prune_resolved_reviews_never_touches_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        std::fs::create_dir_all(&layout.review_dir).unwrap();
+        let write_item = |id: &str, status: ReviewStatus| {
+            let item = ReviewItem {
+                id: id.to_string(),
+                file: "src/a.rs".to_string(),
+                proposal: Proposal {
+                    category: "identifier".to_string(),
+                    original_text: "helper".to_string(),
+                    sanitized_text: "assistant".to_string(),
+                    confidence: 1.0,
+                    rationale: None,
+                },
+                status,
+                flag: "clean".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            };
+            std::fs::write(
+                layout.review_dir.join(format!("{id}.json")),
+                serde_json::to_string(&item).unwrap(),
+            )
+            .unwrap();
+        };
+        write_item("01", ReviewStatus::Pending);
+        write_item("02", ReviewStatus::Approved);
+        write_item("03", ReviewStatus::Rejected);
+        write_item("04", ReviewStatus::Approved);
+
+        assert_eq!(prune_resolved_reviews(&layout, 0).unwrap(), 0);
+        assert_eq!(prune_resolved_reviews(&layout, 1).unwrap(), 2);
+        // The oldest resolved items went; the pending one stays regardless.
+        assert!(layout.review_dir.join("01.json").exists());
+        assert!(!layout.review_dir.join("02.json").exists());
+        assert!(!layout.review_dir.join("03.json").exists());
+        assert!(layout.review_dir.join("04.json").exists());
     }
 
     #[test]

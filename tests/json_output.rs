@@ -269,6 +269,42 @@ fn sh_and_strict_run_reject_json_as_usage_error() {
 }
 
 #[test]
+fn serve_rejects_json_as_usage_error() {
+    // serve's stdout is the MCP stream (or the --once manifest), never the
+    // envelope; the doc comment on --json promises the refusal.
+    let repo = copy_fixture("basic-rust");
+    for args in [vec!["serve"], vec!["serve", "--once"]] {
+        let assert = cli(repo.path()).args(&args).assert().code(64);
+        let output = assert.get_output();
+        assert!(
+            output.stdout.is_empty(),
+            "{args:?}: stdout must stay empty (protocol stream is not wrapped)"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--json is not supported"));
+    }
+}
+
+#[test]
+fn bad_explicit_root_still_emits_the_error_envelope() {
+    // Pre-dispatch failures are still post-clap: the machine contract holds.
+    let assert = Command::cargo_bin("code-sanity")
+        .unwrap()
+        .args(["--root", "/nonexistent-code-sanity-root", "--json", "index"])
+        .assert()
+        .code(1);
+    let value = envelope(&assert.get_output().stdout);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["command"], "index");
+    assert_eq!(value["error"]["kind"], "error");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--root")
+    );
+}
+
+#[test]
 fn human_output_is_unchanged_without_the_flag() {
     let repo = copy_fixture("basic-rust");
     let assert = Command::cargo_bin("code-sanity")

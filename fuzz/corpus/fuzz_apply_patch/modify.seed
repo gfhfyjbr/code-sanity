@@ -1,0 +1,11 @@
+fn neutral_parser() {
+    1
+}
+%%%
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+ fn neutral_parser() {
+-    1
++    2
+ }

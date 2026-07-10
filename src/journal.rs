@@ -74,14 +74,20 @@ fn inflight_marker(layout: &Layout, id: &str) -> PathBuf {
 pub fn write_journal(layout: &Layout, entry: &JournalEntry) -> Result<PathBuf> {
     let path = layout.journal_dir.join(format!("{}.patch.json", entry.id));
     let raw = serde_json::to_string_pretty(entry).context("serialize journal entry")?;
-    crate::fsutil::atomic_write_sync(&path, &raw)
-        .with_context(|| format!("persist journal entry {}", entry.id))?;
-    let marker = inflight_marker(layout, &entry.id);
     if entry.status == JournalStatus::Applying {
-        crate::fsutil::atomic_write_sync(&marker, "")
+        // Barrier (macOS F_FULLFSYNC): the applying entry and its marker are
+        // the recovery record — they must reach the physical medium before
+        // any real file changes, or a power loss can leave a torn file with
+        // nothing to recover from. Terminal states below are self-healing and
+        // keep the plain durable tier.
+        crate::fsutil::atomic_write_sync_barrier(&path, &raw)
+            .with_context(|| format!("persist journal entry {}", entry.id))?;
+        crate::fsutil::atomic_write_sync_barrier(&inflight_marker(layout, &entry.id), "")
             .with_context(|| format!("persist in-flight marker for {}", entry.id))?;
     } else {
-        crate::fsutil::remove_file_sync(&marker)
+        crate::fsutil::atomic_write_sync(&path, &raw)
+            .with_context(|| format!("persist journal entry {}", entry.id))?;
+        crate::fsutil::remove_file_sync(&inflight_marker(layout, &entry.id))
             .with_context(|| format!("clear in-flight marker for {}", entry.id))?;
     }
     Ok(path)
@@ -227,6 +233,39 @@ pub fn prune_terminal_entries(layout: &Layout, keep: u64) -> Result<usize> {
     Ok(removed)
 }
 
+/// Delete the oldest `journal/discarded/<id>/` stash directories beyond
+/// `keep` (0 = unlimited). Stash ids are the sortable UTC journal ids, so
+/// lexicographic order is age order. Governed by the same
+/// `journal.max_entries` knob as entries: stashes are recovery copies of
+/// force-reset mirror edits and grow without bound on a busy workspace.
+pub fn prune_discarded_stashes(layout: &Layout, keep: u64) -> Result<usize> {
+    if keep == 0 {
+        return Ok(0);
+    }
+    let dir = layout.journal_dir.join("discarded");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
+    };
+    let mut stashes: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+        if entry.file_type().is_ok_and(|ty| ty.is_dir()) {
+            stashes.push(entry.path());
+        }
+    }
+    stashes.sort();
+    let excess = stashes.len().saturating_sub(keep as usize);
+    let mut removed = 0usize;
+    for stash in stashes.into_iter().take(excess) {
+        fs::remove_dir_all(&stash)
+            .with_context(|| format!("prune discarded stash {}", stash.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn bail_interrupted(id: &str, count: usize) -> Result<()> {
     bail!(
         "interrupted apply {id} found ({count} pending); run `code-sanity recover` to replay \
@@ -291,5 +330,25 @@ mod tests {
         assert_eq!(prune_terminal_entries(&layout, 0).unwrap(), 0);
         // Under the limit: nothing to do.
         assert_eq!(prune_terminal_entries(&layout, 10).unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_discarded_stashes_keeps_newest_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.ensure_dirs().unwrap();
+        // No discarded/ dir yet: a clean no-op, not an error.
+        assert_eq!(prune_discarded_stashes(&layout, 2).unwrap(), 0);
+        for id in ["01", "02", "03", "04"] {
+            let stash = layout.journal_dir.join("discarded").join(id).join("a.rs");
+            crate::fsutil::atomic_write_sync(&stash, "stashed edit").unwrap();
+        }
+        assert_eq!(prune_discarded_stashes(&layout, 0).unwrap(), 0);
+        assert_eq!(prune_discarded_stashes(&layout, 2).unwrap(), 2);
+        let discarded = layout.journal_dir.join("discarded");
+        assert!(!discarded.join("01").exists());
+        assert!(!discarded.join("02").exists());
+        assert!(discarded.join("03/a.rs").exists());
+        assert!(discarded.join("04/a.rs").exists());
     }
 }

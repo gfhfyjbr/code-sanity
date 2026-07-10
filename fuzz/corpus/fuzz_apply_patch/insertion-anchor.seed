@@ -1,0 +1,5 @@
+%%%
+--- a/src/ins.rs
++++ b/src/ins.rs
+@@ -0,0 +1,1 @@
++inserted line

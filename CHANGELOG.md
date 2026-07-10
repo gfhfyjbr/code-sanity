@@ -5,6 +5,59 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Follow-up hardening from the v0.3.0 production-readiness audit: the two
+remaining medium findings on the repo-boundary and no-leak promises, plus
+power-loss durability, network-FS locking, and retention/contract cleanups.
+
+### Breaking
+
+- **Hyphenated sanitizer terms are rejected at validation.** A term like
+  `acme-corp` normalized to a clean-looking needle but spans two word runs,
+  so it never matched anywhere — the mirror, the MCP redactor, and `verify`'s
+  leak backstop all silently missed it while `sh` output redaction caught it.
+  Terms whose raw form is not exactly one `[A-Za-z0-9_]+` word run now fail
+  load/save/verify with the existing split-it fix-it message
+  (underscore-joined terms are unaffected).
+- **Writers refuse to run on a detected network filesystem** (NFS/SMB/CIFS/
+  AFP/WebDAV), where flock may be host-local and two hosts could silently
+  corrupt the workspace; previously this only logged a warning. Readers still
+  only warn. Opt back in with `durability.allow_network_fs = true`. Unknown
+  filesystems are treated as local — detection is an allowlist, never a guess.
+- `serve` now refuses `--json` with exit 64 like `sh`/`strict-run` (its
+  stdout is the MCP protocol stream / `--once` manifest), matching the
+  documented contract.
+
+### Fixed
+
+- **Real-file writes no longer follow symlinked directories out of the repo.**
+  A pre-planted `src -> /outside` symlink let a create patch (or a tampered
+  journal replay) write outside the root despite lexical path validation;
+  apply, rollback, and recover now resolve the target's existing ancestors
+  and refuse anything that escapes the canonical root.
+- **macOS power-loss durability:** the journal `applying` entry (and its
+  in-flight marker) are now written through `F_FULLFSYNC` — plain `fsync(2)`
+  does not flush the drive cache on macOS, so a power loss could reorder a
+  real-file write ahead of its recovery record. One full flush per apply;
+  `durability.full_fsync = true` extends it to every durable-tier write.
+- A configured `timeout_secs = 0` for the external proposal provider became a
+  zero-duration deadline that killed every child; it is now floored to 1s
+  (like the LLM client) and flagged by config validation, along with
+  `embeddings.timeout_secs = 0`.
+- Post-clap errors that fired before dispatch (e.g. a bad explicit `--root`)
+  escaped the `--json` envelope; they now emit the standard error envelope.
+
+### Added
+
+- Retention for the remaining unbounded history: `journal/discarded/` stashes
+  and RESOLVED review-queue items are pruned to `journal.max_entries` (same
+  knob as journal entries; pending items are never touched).
+- `[durability]` config section: `full_fsync`, `allow_network_fs`.
+- Seed corpus and stable-toolchain replay for the `fuzz_apply_patch` target
+  (hand-writable `content %%% patch` byte format); apply-side fuzz findings
+  now become permanent regression tests like parse-side ones.
+
 ## [0.3.0] - 2026-07-09
 
 Production-hardening release: every finding from the v0.2.0 readiness audit

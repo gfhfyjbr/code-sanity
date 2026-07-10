@@ -111,6 +111,73 @@ fn cli_sync_path_outside_repo_exits_zero_with_skip() {
 }
 
 #[test]
+fn create_patch_through_symlinked_dir_is_refused() {
+    let (outer, repo) = outer_with_repo();
+    // A directory component inside the repo that points outside: lexical rel
+    // validation cannot see it, so containment must catch it at write time.
+    std::os::unix::fs::symlink(outer.path(), repo.join("lib")).unwrap();
+
+    let patch = "--- /dev/null\n\
+                 +++ b/lib/evil.rs\n\
+                 @@ -0,0 +1 @@\n\
+                 +OWNED\n";
+    let err = code_sanity::apply_patch_text(&repo, patch).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("outside the repo"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        !outer.path().join("evil.rs").exists(),
+        "create patch escaped through the symlinked directory"
+    );
+}
+
+#[test]
+fn recover_refuses_pending_file_behind_symlinked_dir() {
+    let (outer, repo) = outer_with_repo();
+    std::os::unix::fs::symlink(outer.path(), repo.join("lib")).unwrap();
+    // The rel is lexically clean; only symlink resolution reveals the escape.
+    let layout = Layout::new(&repo);
+    let entry = serde_json::json!({
+        "id": "2099-01-01T00-00-00.000000001Z",
+        "status": "applying",
+        "session_id": null,
+        "agent": null,
+        "files": ["lib/evil.rs"],
+        "sanitized_patch": "",
+        "original_patch": "",
+        "error": null,
+        "created_at": "2099-01-01T00:00:00Z",
+        "pending": [{
+            "rel": "lib/evil.rs",
+            "before": null,
+            "after": "OWNED=1\n"
+        }]
+    });
+    fs::write(
+        layout
+            .journal_dir
+            .join("2099-01-01T00-00-00.000000001Z.patch.json"),
+        serde_json::to_string_pretty(&entry).unwrap(),
+    )
+    .unwrap();
+
+    let report = code_sanity::recover_workspace(&repo, false, false).unwrap();
+    assert!(
+        report
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.contains("outside the repo")),
+        "conflicts: {:?}",
+        report.conflicts
+    );
+    assert!(
+        !outer.path().join("evil.rs").exists(),
+        "recover wrote through the symlinked directory"
+    );
+}
+
+#[test]
 fn recover_refuses_journal_entry_with_escaping_path() {
     let (outer, repo) = outer_with_repo();
     // Hand-tamper a Applying journal entry whose pending rel escapes the repo.

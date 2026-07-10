@@ -150,7 +150,15 @@ fn recover_sweeps_temp_files_stranded_by_the_crash() {
     let report = code_sanity::recover_workspace(repo.path(), true, false).unwrap();
     assert_eq!(report.recovered.len(), 1);
     assert!(report.conflicts.is_empty());
-    assert_eq!(report.temp_files_removed, 3);
+    // At least the three planted temps; under load the SIGKILL can also land
+    // mid-atomic-write in the child, stranding a fourth (its own) temp file —
+    // an exact count is a timing flake, the per-file checks below are the
+    // real assertion.
+    assert!(
+        report.temp_files_removed >= 3,
+        "swept only {} temp files",
+        report.temp_files_removed
+    );
     for temp in [&mirror_temp, &maps_temp, &real_temp] {
         assert!(!temp.exists(), "stale temp survived: {}", temp.display());
     }

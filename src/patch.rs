@@ -955,6 +955,23 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
             ));
             continue;
         }
+        // Same fail-closed rule for a symlinked directory component resolving
+        // outside the repo — lexical checks cannot see it, and both the temp
+        // sweep and the writes below would otherwise follow it.
+        if let Some((bad, err)) = pending.iter().find_map(|file| {
+            crate::fsutil::ensure_real_path_containment(root, Path::new(&file.rel))
+                .err()
+                .map(|err| (file, err))
+        }) {
+            report.conflicts.push(format!(
+                "{}: journal entry {}: {err:#}; refusing to recover it \
+                 (inspect {} manually)",
+                bad.rel,
+                entry.id,
+                path.display()
+            ));
+            continue;
+        }
         for pending_file in &pending {
             let real_dir = root
                 .join(&pending_file.rel)
@@ -1181,6 +1198,7 @@ fn commit_planned_apply(
             // Best-effort retention sweep under the already-held lock: a
             // pruning failure must never fail an apply that already landed.
             if let Err(err) = crate::journal::prune_terminal_entries(layout, journal_max_entries)
+                .and_then(|_| crate::journal::prune_discarded_stashes(layout, journal_max_entries))
                 .and_then(|_| db::prune_journal_rows(conn, journal_max_entries))
             {
                 log::warn!("journal pruning failed: {err:#}");
@@ -1239,7 +1257,9 @@ fn set_file_state(
     rel: &Path,
     target: Option<&str>,
 ) -> Result<bool> {
-    let real_path = root.join(rel);
+    // Lexical rel validation upstream cannot see a symlinked directory
+    // component escaping the repo; resolve-and-contain before any mutation.
+    let real_path = crate::fsutil::ensure_real_path_containment(root, rel)?;
     match target {
         Some(content) => {
             crate::fsutil::atomic_write_sync(&real_path, content)
@@ -2364,6 +2384,23 @@ pub mod fuzz_api {
             let _ = super::apply_file_patch_to_content(content, file_patch);
         }
     }
+
+    /// Split a `fuzz_apply_patch` seed into (content, patch) at the first
+    /// line holding exactly `%%%`. Byte-level seeds stay hand-writable and
+    /// replayable (an Arbitrary-encoded tuple would be neither); input
+    /// without the marker fuzzes the applier against empty content.
+    pub fn split_apply_seed(data: &[u8]) -> (String, String) {
+        let text = String::from_utf8_lossy(data);
+        // A seed that STARTS with the marker is an empty-content seed (the
+        // `\n%%%\n` form needs a preceding content line).
+        if let Some(patch) = text.strip_prefix("%%%\n") {
+            return (String::new(), patch.to_string());
+        }
+        match text.split_once("\n%%%\n") {
+            Some((content, patch)) => (format!("{content}\n"), patch.to_string()),
+            None => (String::new(), text.into_owned()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2386,6 +2423,22 @@ mod tests {
             seeds += 1;
         }
         assert!(seeds >= 8, "corpus seeds missing (found {seeds})");
+
+        // The apply corpus replays through the exact split the fuzz target
+        // uses, so apply-side findings become permanent regressions too.
+        let apply_corpus =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/fuzz_apply_patch");
+        let mut apply_seeds = 0;
+        for entry in std::fs::read_dir(&apply_corpus).expect("apply corpus directory is missing") {
+            let data = std::fs::read(entry.unwrap().path()).unwrap();
+            let (content, patch) = fuzz_api::split_apply_seed(&data);
+            fuzz_api::parse_and_apply(&content, &patch);
+            apply_seeds += 1;
+        }
+        assert!(
+            apply_seeds >= 8,
+            "apply corpus seeds missing (found {apply_seeds})"
+        );
     }
 
     #[test]

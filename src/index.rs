@@ -653,6 +653,13 @@ fn render_and_store(
             stash_path.display()
         );
         stashed = Some(stash_path);
+        // Best-effort retention (same knob as journal entries): force-sync
+        // heavy workspaces must not accumulate stash dirs without bound.
+        if let Err(err) =
+            crate::journal::prune_discarded_stashes(layout, config.journal.max_entries)
+        {
+            log::warn!("discarded-stash pruning failed: {err:#}");
+        }
     }
 
     let old_map_raw = fs::read_to_string(&map_path).ok();
