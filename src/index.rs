@@ -251,6 +251,15 @@ fn index_workspace_locked_inner(
         .iter()
         .flat_map(|candidate| candidate.protected.iter().cloned())
         .collect();
+    let mut declared_in: BTreeMap<String, String> = BTreeMap::new();
+    for candidate in &candidates {
+        for name in &candidate.protected {
+            declared_in
+                .entry(name.clone())
+                .or_insert_with(|| candidate.rel_string.clone());
+        }
+    }
+    refuse_denylist_protected_conflicts(&config, &union, &declared_in)?;
     let logic = logic_fingerprint(&config, &union);
 
     for candidate in &candidates {
@@ -482,6 +491,20 @@ pub(crate) fn index_single_file_locked(
         .flat_map(|state| state.protected())
         .collect();
     union.extend(fresh_protected.iter().cloned());
+    let mut declared_in: BTreeMap<String, String> = BTreeMap::new();
+    for state in states.iter().filter(|state| state.rel_path != rel_string) {
+        for name in state.protected() {
+            declared_in
+                .entry(name)
+                .or_insert_with(|| state.rel_path.clone());
+        }
+    }
+    for name in &fresh_protected {
+        declared_in
+            .entry(name.clone())
+            .or_insert_with(|| rel_string.clone());
+    }
+    refuse_denylist_protected_conflicts(&config, &union, &declared_in)?;
     let logic = logic_fingerprint(&config, &union);
 
     let state_row = IndexState {
@@ -540,6 +563,34 @@ pub(crate) fn reconverge_workspace(root: &Path, layout: &Layout) -> Result<Index
 }
 
 /// The repo-wide protected identifier union as last indexed.
+/// A denylisted term kept alive by a protected identifier is an unsatisfiable
+/// policy: the protected set exists so public symbols stay real, the denylist
+/// so a term never reaches the agent. Refuse loudly instead of silently
+/// leaking — `verify` cannot catch this, because it sanctions protected runs
+/// by construction. Same treatment as an alias collision.
+fn refuse_denylist_protected_conflicts(
+    config: &Config,
+    union: &BTreeSet<String>,
+    declared_in: &BTreeMap<String, String>,
+) -> Result<()> {
+    let terms = crate::sanitize::term_table(config);
+    if let Some(conflict) = crate::sanitize::denylist_protected_conflicts(&terms, union).first() {
+        let origin = declared_in
+            .get(&conflict.protected_name)
+            .map(|rel| format!(" (declared in {rel})"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "denylist term {:?} is protected as public identifier {:?}{origin}; the mirror \
+             must keep public names real, so the term would survive verbatim. Remove it from \
+             the denylist, add it to sanitizer.allowlist, or rename the public symbol in the \
+             real repo, then run `code-sanity sync`",
+            conflict.term,
+            conflict.protected_name,
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn stored_protected_union(conn: &rusqlite::Connection) -> Result<BTreeSet<String>> {
     Ok(db::all_index_states(conn)?
         .iter()

@@ -63,6 +63,74 @@ fn prose_and_comments_never_leak_a_denylisted_term_into_the_mirror() {
 }
 
 #[test]
+fn denylist_term_that_is_a_public_name_is_refused_not_leaked() {
+    // The protected set keeps public symbols real; the denylist keeps a term
+    // away from the agent. When they collide, one promise must break silently
+    // — so refuse both and let the human decide.
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("src/api.rs"),
+        "pub fn shadowfax_client() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.denylist = vec!["shadowfax".to_string()];
+    config.save(&layout).unwrap();
+
+    let err = index_workspace(repo.path()).unwrap_err().to_string();
+    assert!(err.contains("shadowfax"), "{err}");
+    assert!(err.contains("shadowfax_client"), "{err}");
+    assert!(err.contains("src/api.rs"), "{err}");
+    assert!(
+        err.contains("allowlist"),
+        "remedy must be actionable: {err}"
+    );
+
+    // verify reports it too, rather than sanctioning the residue.
+    let verify_err = verify_workspace(repo.path()).unwrap_err();
+    let failed = verify_err
+        .downcast_ref::<code_sanity::verify::VerifyFailed>()
+        .expect("must fail with the typed exit-3 error");
+    assert!(
+        failed
+            .report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("shadowfax_client")),
+        "{:?}",
+        failed.report.failures
+    );
+
+    // Allowlisting the term is the documented way out.
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.allowlist.push("shadowfax".to_string());
+    config.save(&layout).unwrap();
+    index_workspace(repo.path()).unwrap();
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn dictionary_terms_in_public_names_stay_sanctioned_residues() {
+    // Unlike the denylist, the default dictionary must never brick a repo
+    // whose public API happens to contain one of its words.
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("src/api.rs"),
+        "pub fn dangerous_parser() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+    let mirror = fs::read_to_string(repo.path().join(".code-sanity/mirror/src/api.rs")).unwrap();
+    assert!(mirror.contains("dangerous_parser"), "{mirror}");
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
 fn code_declarations_in_unknown_extensions_stay_protected() {
     let repo = repo_with_denylisted_term();
     let deploy =

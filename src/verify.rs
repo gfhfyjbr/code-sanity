@@ -82,13 +82,34 @@ pub fn verify_workspace(root: &Path) -> Result<VerifyReport> {
     // files are reported per-file below.
     let mut real_contents: BTreeMap<String, String> = BTreeMap::new();
     let mut protected_union: BTreeSet<String> = BTreeSet::new();
+    let mut declared_in: BTreeMap<String, String> = BTreeMap::new();
     for rel in &tracked {
         if let Ok(real) = fs::read_to_string(root.join(rel)) {
-            protected_union.extend(collect_protected_identifiers(Path::new(rel), &real));
+            for name in collect_protected_identifiers(Path::new(rel), &real) {
+                declared_in
+                    .entry(name.clone())
+                    .or_insert_with(|| rel.clone());
+                protected_union.insert(name);
+            }
             real_contents.insert(rel.clone(), real);
         }
     }
     let terms = term_table(&config);
+
+    // A denylisted term kept alive by a protected identifier: index refuses to
+    // render it, so verify must report it rather than silently sanction the
+    // residue (find_leaks skips protected runs by construction).
+    for conflict in crate::sanitize::denylist_protected_conflicts(&terms, &protected_union) {
+        let origin = declared_in
+            .get(&conflict.protected_name)
+            .map(|rel| format!(" (declared in {rel})"))
+            .unwrap_or_default();
+        report.failures.push(format!(
+            "denylist term {:?} is protected as public identifier {:?}{origin}; it would \
+             survive verbatim in the mirror — allowlist it or rename the public symbol",
+            conflict.term, conflict.protected_name,
+        ));
+    }
 
     // Injectivity against content: an alias occurring naturally in a REAL
     // file makes the mirror ambiguous (the word survives rendering verbatim,

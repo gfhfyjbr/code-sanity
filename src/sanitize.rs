@@ -326,6 +326,54 @@ pub fn alias_collisions(content: &str, terms: &[Term]) -> Vec<AliasCollision> {
     collisions
 }
 
+/// A denylisted term that a protected identifier would keep in the mirror.
+#[derive(Debug, Clone)]
+pub struct ProtectedTermConflict {
+    /// Raw denylist spelling.
+    pub term: String,
+    /// The protected word run that contains it.
+    pub protected_name: String,
+}
+
+/// Denylisted terms that survive because a protected identifier contains them.
+///
+/// The protected set exists so public symbols stay real; the denylist exists
+/// so a term NEVER reaches the agent. When they collide, one promise must
+/// break silently — so instead both are refused and the human decides. Only
+/// `denylist-auto` terms qualify: dictionary terms in public names
+/// (`pub fn is_dangerous()`) must remain sanctioned residues, or the default
+/// dictionary would brick ordinary repos, and registry terms already pass
+/// through human review.
+///
+/// Uses `hits_in_run`, so `pub fn shadowfax_client()` is caught, not just an
+/// exact `shadowfax`.
+pub fn denylist_protected_conflicts(
+    terms: &[Term],
+    protected: &BTreeSet<String>,
+) -> Vec<ProtectedTermConflict> {
+    let denylist: Vec<Term> = terms
+        .iter()
+        .filter(|term| term.policy_source == "denylist-auto")
+        .cloned()
+        .collect();
+    if denylist.is_empty() {
+        return Vec::new();
+    }
+    let mut conflicts = Vec::new();
+    let mut hits = Vec::new();
+    for name in protected {
+        hits.clear();
+        hits_in_run(name, 0, &denylist, &mut hits);
+        for hit in &hits {
+            conflicts.push(ProtectedTermConflict {
+                term: denylist[hit.term_index].raw.clone(),
+                protected_name: name.clone(),
+            });
+        }
+    }
+    conflicts
+}
+
 /// A term occurrence inside a word run.
 #[derive(Debug, Clone)]
 pub struct TermHit {
