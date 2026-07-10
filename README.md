@@ -137,9 +137,13 @@ file re-renders exactly one file.
 
 Mirror files holding a **pending agent edit** (mirror on disk differs from the
 last indexed sanitized hash) are never clobbered by `sync`/`index`; only the
-patch bridge resets them after projecting the edit. `sync --force` is the
-recovery path: it re-renders everything and resets pending (or tampered)
-mirror files back to `sanitize(real)`.
+patch bridge resets them after projecting the edit. A mirror file with **no
+database row at all** (a deleted `db.sqlite`, or a crash before its first
+commit) counts as pending too — the row's absence cannot prove the on-disk
+mirror is our render. `sync --force` is the recovery path: it re-renders
+everything and resets pending (or tampered) mirror files back to
+`sanitize(real)`, stashing each discarded edit under
+`.code-sanity/journal/discarded/` first.
 
 ## Model-based sanitizer
 

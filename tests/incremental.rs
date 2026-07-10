@@ -215,6 +215,65 @@ fn sync_force_stashes_the_discarded_pending_edit() {
 }
 
 #[test]
+fn missing_db_row_treats_diverged_mirror_as_pending() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("lib.rs"),
+        "// dangerous comment\nfn calc() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // The agent edited the mirror, then the db was lost (the documented
+    // corruption remedy is deleting db.sqlite). With no row, plain sync
+    // cannot prove the mirror is our render — it must NOT clobber the edit.
+    let mirror_path = repo.path().join(".code-sanity/mirror/lib.rs");
+    let mirror = fs::read_to_string(&mirror_path).unwrap();
+    let edited = mirror.replace("    1\n", "    6\n");
+    assert_ne!(mirror, edited);
+    fs::write(&mirror_path, &edited).unwrap();
+    for db_file in ["db.sqlite", "db.sqlite-wal", "db.sqlite-shm"] {
+        let _ = fs::remove_file(repo.path().join(".code-sanity").join(db_file));
+    }
+
+    let report = index_workspace(repo.path()).unwrap();
+    assert!(report.pending >= 1, "edit clobbered: pending == 0");
+    assert!(report.stashed.is_empty());
+    assert_eq!(
+        fs::read_to_string(&mirror_path).unwrap(),
+        edited,
+        "plain sync destroyed an un-projected agent edit"
+    );
+
+    // The stashing force pass is the convergence path.
+    let forced = code_sanity::index::index_workspace_force(repo.path()).unwrap();
+    assert_eq!(forced.stashed.len(), 1, "{:?}", forced.stashed);
+    assert_eq!(fs::read_to_string(&forced.stashed[0]).unwrap(), edited);
+    assert_eq!(fs::read_to_string(&mirror_path).unwrap(), mirror);
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn deleted_db_converges_without_force_when_mirror_is_clean() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("lib.rs"),
+        "// dangerous comment\nfn calc() -> usize {\n    1\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    // db.sqlite deleted on a converged workspace: every mirror equals its
+    // fresh render, so a plain sync rebuilds the db without any force.
+    for db_file in ["db.sqlite", "db.sqlite-wal", "db.sqlite-shm"] {
+        let _ = fs::remove_file(repo.path().join(".code-sanity").join(db_file));
+    }
+    let report = index_workspace(repo.path()).unwrap();
+    assert_eq!(report.pending, 0);
+    assert!(verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
 fn one_undecodable_file_does_not_abort_the_index() {
     let repo = tempfile::tempdir().unwrap();
     fs::create_dir_all(repo.path().join("src")).unwrap();

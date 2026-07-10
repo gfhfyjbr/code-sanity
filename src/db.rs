@@ -108,7 +108,8 @@ fn refuse_newer_schema(version: i64) -> Result<()> {
         bail!(
             "db.sqlite has schema version {version}, newer than this build's \
              {SCHEMA_VERSION}; upgrade code-sanity or delete .code-sanity/db.sqlite \
-             (the database is derived state, `index` rebuilds it)"
+             (the database is derived state; `code-sanity sync --force` rebuilds it \
+             and stashes pending mirror edits under .code-sanity/journal/discarded/)"
         );
     }
     Ok(())

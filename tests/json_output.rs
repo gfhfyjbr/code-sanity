@@ -248,6 +248,11 @@ fn corrupt_db_error_names_the_remedy() {
         message.contains("delete .code-sanity/db.sqlite"),
         "corruption must name the remedy, got: {message}"
     );
+    assert!(
+        message.contains("sync --force"),
+        "the remedy must be the stashing force sync (a plain sync treats \
+         diverged mirrors without a db row as pending), got: {message}"
+    );
     assert!(String::from_utf8_lossy(&output.stderr).contains("db.sqlite"));
 }
 

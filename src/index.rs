@@ -617,14 +617,20 @@ fn render_and_store(
     // sanitized hash). Sync must not clobber it; only the patch bridge (force)
     // may reset the mirror to sanitize(real).
     //
+    // A missing db row (deleted db.sqlite — the documented corruption remedy —
+    // or a crash before the first upsert) cannot PROVE the on-disk mirror is
+    // our render, so it counts as pending too: fail safe, exactly like the
+    // force path below. Only `sync --force` may reset it, and that stashes.
+    //
     // Self-heal: a mirror that already equals the fresh render is converged
     // content with a stale db row (a crash between the mirror write and the db
     // commit), not a pending edit — fall through so the upsert repairs the row.
     if !force_mirror
         && let Some(old) = old_mirror.as_deref()
         && old != rendered.sanitized
-        && let Some(hash) = db_sanitized_hash.as_deref()
-        && sha256_hex(old.as_bytes()) != hash
+        && db_sanitized_hash
+            .as_deref()
+            .is_none_or(|hash| sha256_hex(old.as_bytes()) != hash)
     {
         let previous = load_span_map(&map_path).unwrap_or(rendered.span_map);
         return Ok((FileOutcome::PendingSkipped, previous, None));

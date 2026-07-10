@@ -348,7 +348,9 @@ pub fn run() -> Result<()> {
             let err = if crate::db::is_corruption_error(&err) {
                 err.context(
                     "db.sqlite appears corrupt; the database is derived state — \
-                     delete .code-sanity/db.sqlite and run `code-sanity index` to rebuild",
+                     delete .code-sanity/db.sqlite and run `code-sanity sync --force` to \
+                     rebuild (pending mirror edits are stashed under \
+                     .code-sanity/journal/discarded/)",
                 )
             } else {
                 err
