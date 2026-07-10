@@ -26,12 +26,20 @@ pub struct JournalEntry {
 
 /// One file's transition captured for crash recovery. `before`/`after` are the
 /// full file contents (`None` means the file did not / must not exist, i.e.
-/// create and delete respectively).
+/// create and delete respectively). `before_mode`/`after_mode` carry the
+/// file's permission bits so a rollback or roll-forward that must re-CREATE a
+/// file (nothing on disk to preserve from) restores them too; entries written
+/// by older binaries deserialize with `None` and fall back to the default
+/// create mode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingFile {
     pub rel: String,
     pub before: Option<String>,
     pub after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -2,3 +2,4 @@
 .code-sanity/
 fuzz/target/
 fuzz/artifacts/
+.DS_Store

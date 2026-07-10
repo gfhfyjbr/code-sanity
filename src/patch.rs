@@ -986,14 +986,16 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
         let mut entry_conflicts = Vec::new();
         for pending_file in &pending {
             let rel = PathBuf::from(&pending_file.rel);
-            let (target, precondition) = if rollback {
+            let (target, target_mode, precondition) = if rollback {
                 (
                     pending_file.before.as_deref(),
+                    pending_file.before_mode,
                     pending_file.after.as_deref(),
                 )
             } else {
                 (
                     pending_file.after.as_deref(),
+                    pending_file.after_mode,
                     pending_file.before.as_deref(),
                 )
             };
@@ -1009,7 +1011,7 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
                 entry_conflicts.push(pending_file.rel.clone());
                 continue;
             }
-            protected_drift |= set_file_state(root, &layout, &conn, &rel, target)
+            protected_drift |= set_file_state(root, &layout, &conn, &rel, target, target_mode)
                 .with_context(|| format!("recover {}", pending_file.rel))?;
         }
         if !entry_conflicts.is_empty() {
@@ -1131,12 +1133,22 @@ fn commit_planned_apply(
     // Record the full intent (before/after per file) BEFORE touching any real
     // file. If the process dies mid-apply, this durable `applying` entry lets
     // `code-sanity recover` replay or roll back the half-finished apply.
+    // Permission bits ride along: a modify keeps the file's current mode, a
+    // create has none to keep (default mode; diffs carry no mode channel from
+    // the mirror), and recovery re-creating a deleted file needs before_mode.
+    let modes: Vec<Option<u32>> = planned
+        .iter()
+        .map(|planned_file| current_file_mode(&root.join(&planned_file.rel)))
+        .collect();
     let pending: Vec<PendingFile> = planned
         .iter()
-        .map(|planned_file| PendingFile {
+        .zip(&modes)
+        .map(|(planned_file, mode)| PendingFile {
             rel: normalize_rel_path(&planned_file.rel),
             before: planned_file.before.clone(),
             after: planned_file.after().map(ToOwned::to_owned),
+            before_mode: planned_file.before.as_ref().and(*mode),
+            after_mode: planned_file.after().and(*mode),
         })
         .collect();
     let id = new_journal_id();
@@ -1159,9 +1171,15 @@ fn commit_planned_apply(
     let mut protected_drift = false;
     let commit_result = (|| -> Result<()> {
         for (idx, planned_file) in planned.iter().enumerate() {
-            protected_drift |=
-                set_file_state(root, layout, conn, &planned_file.rel, planned_file.after())
-                    .with_context(|| format!("apply {}", planned_file.rel.display()))?;
+            protected_drift |= set_file_state(
+                root,
+                layout,
+                conn,
+                &planned_file.rel,
+                planned_file.after(),
+                planned_file.after().and(modes[idx]),
+            )
+            .with_context(|| format!("apply {}", planned_file.rel.display()))?;
             applied.push(idx);
             // Crash-test hook: pause after the first write so a test harness
             // can SIGKILL this process deterministically mid-apply.
@@ -1215,6 +1233,7 @@ fn commit_planned_apply(
                         conn,
                         &planned_file.rel,
                         planned_file.before.as_deref(),
+                        planned_file.before.as_ref().and(modes[idx]),
                     )?;
                 }
                 if protected_drift {
@@ -1244,18 +1263,36 @@ fn commit_planned_apply(
     }
 }
 
+/// Current permission bits of a regular file, or `None` when it does not
+/// exist (or is not a regular file — a symlink's own mode is meaningless).
+fn current_file_mode(path: &Path) -> Option<u32> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map(|meta| {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o7777
+        })
+}
+
 /// Drive `rel` to a target state: `Some(content)` writes the real file and
 /// reindexes its mirror/map/db; `None` deletes the real file plus its mirror,
 /// map, and db row. This is the single primitive shared by apply, rollback,
 /// and recover so every path is create/delete/modify aware. The caller must
 /// hold the workspace lock. Returns whether the repo-wide protected symbol
 /// set changed (the caller then owes a full reindex).
+///
+/// `mode`, when recorded, is authoritative for the written file's permission
+/// bits: the atomic write only preserves an EXISTING target's mode, so a
+/// rollback or recovery that re-creates a deleted file must restore the
+/// journaled bits explicitly.
 fn set_file_state(
     root: &Path,
     layout: &Layout,
     conn: &rusqlite::Connection,
     rel: &Path,
     target: Option<&str>,
+    mode: Option<u32>,
 ) -> Result<bool> {
     // Lexical rel validation upstream cannot see a symlinked directory
     // component escaping the repo; resolve-and-contain before any mutation.
@@ -1264,6 +1301,11 @@ fn set_file_state(
         Some(content) => {
             crate::fsutil::atomic_write_sync(&real_path, content)
                 .with_context(|| format!("write {}", real_path.display()))?;
+            if let Some(mode) = mode {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&real_path, fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("chmod {}", real_path.display()))?;
+            }
             let indexed = index_single_file_locked(root, layout, rel, true)
                 .with_context(|| format!("reindex {}", rel.display()))?;
             Ok(indexed.protected_changed)

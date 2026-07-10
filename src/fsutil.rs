@@ -81,12 +81,31 @@ fn atomic_write_impl(path: &Path, content: &str, durable: bool, barrier: bool) -
     } else {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
+    // rename replaces the target inode, which would silently reset its
+    // permission bits to the temp file's fresh default (0644 minus umask) —
+    // stripping the executable bit from a back-projected script. Carry the
+    // existing mode over via fchmod on the still-private temp, before the
+    // rename, so the target never observably changes mode. When the final
+    // component is a symlink the rename replaces the LINK inode, so the link
+    // target's mode is deliberately not consulted.
+    let existing_mode = fs::symlink_metadata(path)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .map(|meta| {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o7777
+        });
     let tmp = temp_path_for(path, parent);
     let result = (|| -> Result<()> {
         let mut file =
             fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(content.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
+        if let Some(mode) = existing_mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(mode))
+                .with_context(|| format!("chmod {}", tmp.display()))?;
+        }
         if durable {
             sync_handle(&file, barrier).with_context(|| format!("fsync {}", tmp.display()))?;
         }
@@ -314,6 +333,31 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
         atomic_write_sync(&path, "world").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "world");
+    }
+
+    #[test]
+    fn atomic_replace_preserves_target_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool.sh");
+        atomic_write(&path, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        for write in [atomic_write, atomic_write_sync] {
+            write(&path, "#!/bin/sh\necho ok\n").unwrap();
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o755, "replace must keep the executable bit");
+        }
+    }
+
+    #[test]
+    fn fresh_create_has_no_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        atomic_write_sync(&path, "data").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        // Umask-proof: whatever the default is, it must not be executable.
+        assert_eq!(mode & 0o111, 0);
     }
 
     #[test]

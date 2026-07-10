@@ -628,6 +628,8 @@ fn recover_replays_interrupted_apply() {
             rel: "src/lib.rs".to_string(),
             before: Some(before.clone()),
             after: Some(after.clone()),
+            before_mode: None,
+            after_mode: None,
         }]),
     };
     code_sanity::journal::write_journal(&layout, &entry).unwrap();
@@ -664,6 +666,8 @@ fn recover_rolls_back_interrupted_apply() {
             rel: "src/lib.rs".to_string(),
             before: Some(before.clone()),
             after: Some(after.clone()),
+            before_mode: None,
+            after_mode: None,
         }]),
     };
     code_sanity::journal::write_journal(&layout, &entry).unwrap();
