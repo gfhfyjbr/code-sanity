@@ -593,15 +593,27 @@ pub fn sanitize_content(
 }
 
 pub fn detect_language(rel_path: &Path, _content: &str) -> String {
+    // Extension-less code files are named, not suffixed.
+    let file_name = rel_path.file_name().and_then(|name| name.to_str());
+    if matches!(file_name, Some("Dockerfile" | "Makefile" | "makefile")) {
+        return "shell".to_string();
+    }
     match rel_path.extension().and_then(|ext| ext.to_str()) {
         Some("rs") => "rust",
         Some("py") => "python",
         Some("ts") | Some("tsx") => "typescript",
         Some("js") | Some("jsx") => "javascript",
         Some("md") | Some("markdown") => "markdown",
+        Some("txt") | Some("rst") | Some("adoc") => "plaintext",
         Some("toml") => "toml",
         Some("json") => "json",
         Some("go") => "go",
+        Some("sh") | Some("bash") | Some("zsh") => "shell",
+        Some("yml") | Some("yaml") => "yaml",
+        // Unknown extensions are CODE (.java, .rb, .php, ...): when in doubt
+        // treat a file as code — over-protection there is caught by the
+        // denylist∩protected check, while classifying code as prose would
+        // rename import-position names and break the mirror.
         _ => "text",
     }
     .to_string()
@@ -689,7 +701,7 @@ pub(crate) fn comment_ranges(
     content: &str,
     string_ranges: &[ByteRange],
 ) -> Vec<ByteRange> {
-    if language == "markdown" {
+    if matches!(language, "markdown" | "plaintext") {
         return vec![ByteRange {
             start: 0,
             end: content.len(),
@@ -704,7 +716,10 @@ pub(crate) fn comment_ranges(
             cursor += 1;
             continue;
         }
-        if matches!(language, "rust" | "typescript" | "javascript" | "go") {
+        if matches!(
+            language,
+            "rust" | "typescript" | "javascript" | "go" | "text"
+        ) {
             if bytes[cursor..].starts_with(b"//") {
                 let end = find_byte(bytes, cursor, b'\n').unwrap_or(content.len());
                 ranges.push(ByteRange {
@@ -714,7 +729,7 @@ pub(crate) fn comment_ranges(
                 cursor = end;
                 continue;
             }
-            if bytes[cursor..].starts_with(b"/*") {
+            if language != "text" && bytes[cursor..].starts_with(b"/*") {
                 let end = find_bytes(bytes, cursor + 2, b"*/").unwrap_or(content.len());
                 ranges.push(ByteRange {
                     start: cursor + 2,
@@ -724,7 +739,11 @@ pub(crate) fn comment_ranges(
                 continue;
             }
         }
-        if language == "python" && bytes[cursor] == b'#' {
+        // "text" (unknown extension = code) gets BOTH line-comment styles:
+        // it approximates whatever language it really is, and misreading a
+        // code byte as a comment only ever leads to sanitizing, never to
+        // protecting — the fail-safe direction.
+        if matches!(language, "python" | "shell" | "yaml" | "text") && bytes[cursor] == b'#' {
             let end = find_byte(bytes, cursor, b'\n').unwrap_or(content.len());
             ranges.push(ByteRange {
                 start: cursor + 1,
@@ -748,7 +767,7 @@ pub(crate) struct ByteRange {
 /// depends on zone detection). `'` is not a string delimiter in Rust or Go —
 /// lifetimes (`&'a str`) and runes would otherwise open phantom strings.
 pub(crate) fn string_ranges(language: &str, content: &str) -> Vec<ByteRange> {
-    if matches!(language, "markdown" | "text") {
+    if matches!(language, "markdown" | "plaintext" | "text") {
         return Vec::new();
     }
 
