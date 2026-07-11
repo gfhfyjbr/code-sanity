@@ -217,9 +217,9 @@ impl App {
         self.reviews.get(index)
     }
 
-    pub fn source_context(&self) -> Vec<SourceLine> {
+    pub fn source_context(&self, max_lines: usize) -> Vec<SourceLine> {
         self.selected_review()
-            .map(|item| source_context(&self.root, item, 5))
+            .map(|item| source_context(&self.root, item, max_lines))
             .unwrap_or_default()
     }
 
@@ -828,7 +828,10 @@ fn confirmation_copy(root: &Path, action: &Action) -> (String, String) {
     }
 }
 
-pub fn source_context(root: &Path, item: &ReviewItem, radius: usize) -> Vec<SourceLine> {
+pub fn source_context(root: &Path, item: &ReviewItem, max_lines: usize) -> Vec<SourceLine> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
     let Ok(content) = std::fs::read_to_string(root.join(&item.file)) else {
         return Vec::new();
     };
@@ -837,8 +840,11 @@ pub fn source_context(root: &Path, item: &ReviewItem, radius: usize) -> Vec<Sour
         .iter()
         .position(|line| line.contains(&item.proposal.original_text))
         .unwrap_or(0);
-    let start = first.saturating_sub(radius);
-    let end = (first + radius + 1).min(lines.len());
+    let window = max_lines.min(lines.len());
+    let start = first
+        .saturating_sub(window / 2)
+        .min(lines.len().saturating_sub(window));
+    let end = start + window;
     lines[start..end]
         .iter()
         .enumerate()
@@ -883,12 +889,44 @@ mod tests {
             flag: "clean".to_string(),
             created_at: String::new(),
         };
-        let context = source_context(temp.path(), &item, 1);
+        let context = source_context(temp.path(), &item, 3);
         assert_eq!(
             context.iter().map(|line| line.number).collect::<Vec<_>>(),
             vec![2, 3, 4]
         );
         assert!(context[1].matched);
+    }
+
+    #[test]
+    fn source_context_fills_the_requested_window_at_file_edges() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("main.rs"),
+            "one\ntwo\nthree\nfour\nlet hwid = 3;\nsix\n",
+        )
+        .unwrap();
+        let item = ReviewItem {
+            id: "id".to_string(),
+            file: "main.rs".to_string(),
+            proposal: Proposal {
+                target: None,
+                category: "identifier".to_string(),
+                original_text: "hwid".to_string(),
+                sanitized_text: "device_id".to_string(),
+                confidence: 0.9,
+                rationale: None,
+            },
+            status: ReviewStatus::Pending,
+            flag: "clean".to_string(),
+            created_at: String::new(),
+        };
+
+        let context = source_context(temp.path(), &item, 4);
+        assert_eq!(
+            context.iter().map(|line| line.number).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+        assert!(source_context(temp.path(), &item, 0).is_empty());
     }
 
     #[test]

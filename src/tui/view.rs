@@ -1,4 +1,5 @@
 use super::app::{App, HitAction, LogLevel, Tab, ToolbarAction, is_pending};
+use super::change_preview;
 use super::components::{
     ACCENT, BG, BORDER, ButtonHit, ButtonVariant, DANGER, FG, MUTED, PANEL, PANEL_HOVER, PRIMARY,
     SUCCESS, WARNING, centered, contains, draw_button, panel, popup,
@@ -164,19 +165,25 @@ fn render_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_review(frame: &mut Frame, app: &mut App, area: Rect) {
-    let areas = if area.width >= 78 {
+    let areas = if area.width >= 96 {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(43), Constraint::Percentage(57)])
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
             .split(area)
     } else {
+        let queue_height = area
+            .height
+            .saturating_mul(3)
+            .div_ceil(10)
+            .clamp(3, 8)
+            .min(area.height.saturating_sub(3));
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .constraints([Constraint::Length(queue_height), Constraint::Min(3)])
             .split(area)
     };
     render_review_list(frame, app, areas[0]);
-    render_review_detail(frame, app, areas[1]);
+    change_preview::render(frame, app, areas[1]);
 }
 
 fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -277,105 +284,6 @@ fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
             row_area,
         );
     }
-}
-
-fn render_review_detail(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(3)])
-        .split(area);
-    let Some(item) = app.selected_review() else {
-        frame.render_widget(panel("Proposal", false), area);
-        return;
-    };
-    let flagged = item.flag != "clean";
-    let status_color = if is_pending(item) { WARNING } else { MUTED };
-    let metadata = vec![
-        Line::from(vec![
-            Span::styled(
-                &item.proposal.original_text,
-                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  ->  ", Style::default().fg(MUTED)),
-            Span::styled(
-                &item.proposal.sanitized_text,
-                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                format!("{}  ", item.proposal.category),
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                format!("{:.0}% confidence  ", item.proposal.confidence * 100.0),
-                Style::default().fg(PRIMARY),
-            ),
-            Span::styled(
-                format!("{:?}", item.status).to_lowercase(),
-                Style::default().fg(status_color),
-            ),
-        ]),
-        Line::from(Span::styled(
-            if flagged {
-                format!("WARNING: {} | {}", item.flag, item.file)
-            } else {
-                format!("CHECK: clean | {}", item.file)
-            },
-            Style::default()
-                .fg(if flagged { WARNING } else { SUCCESS })
-                .add_modifier(if flagged {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        )),
-        Line::from(format!(
-            "REASON: {}",
-            item.proposal
-                .rationale
-                .as_deref()
-                .unwrap_or("No provider rationale.")
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(metadata)
-            .wrap(Wrap { trim: true })
-            .block(panel("Proposal", false)),
-        chunks[0],
-    );
-
-    let source = app.source_context();
-    let lines = if source.is_empty() {
-        vec![Line::from(Span::styled(
-            "Source context unavailable",
-            Style::default().fg(MUTED),
-        ))]
-    } else {
-        source
-            .iter()
-            .map(|line| {
-                source_line(
-                    line.number,
-                    &line.text,
-                    &item.proposal.original_text,
-                    line.matched,
-                )
-            })
-            .collect()
-    };
-    let visible_source_rows = chunks[1].height.saturating_sub(2) as usize;
-    let source_scroll = source
-        .iter()
-        .position(|line| line.matched)
-        .map(|matched| matched.saturating_sub(visible_source_rows / 2))
-        .unwrap_or(0);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((source_scroll as u16, 0))
-            .block(panel("Source context", false)),
-        chunks[1],
-    );
 }
 
 fn render_activity(frame: &mut Frame, app: &App, area: Rect) {
@@ -777,31 +685,6 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
 fn render_modal_backdrop(frame: &mut Frame, area: Rect) {
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
-}
-
-fn source_line(number: usize, text: &str, needle: &str, matched: bool) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        format!("{number:>5}  "),
-        Style::default().fg(MUTED),
-    )];
-    if let Some(start) = text.find(needle) {
-        let end = start + needle.len();
-        spans.push(Span::styled(
-            text[..start].to_string(),
-            Style::default().fg(if matched { FG } else { MUTED }),
-        ));
-        spans.push(Span::styled(
-            needle.to_string(),
-            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            text[end..].to_string(),
-            Style::default().fg(if matched { FG } else { MUTED }),
-        ));
-    } else {
-        spans.push(Span::styled(text.to_string(), Style::default().fg(MUTED)));
-    }
-    Line::from(spans).style(Style::default().bg(if matched { PANEL_HOVER } else { PANEL }))
 }
 
 fn pending_count(app: &App) -> usize {
