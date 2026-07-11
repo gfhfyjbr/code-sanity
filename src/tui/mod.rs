@@ -1,5 +1,7 @@
 mod app;
+mod change_preview;
 mod components;
+mod syntax;
 mod view;
 
 use anyhow::{Context, Result, bail};
