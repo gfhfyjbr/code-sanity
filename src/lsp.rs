@@ -99,19 +99,20 @@ pub fn rename(
         .with_context(|| format!("canonicalize workspace root {}", root.display()))?;
     let target = root.join(rel_path);
     let uri = file_uri(&target);
+    let position = json!({
+        "line": declaration.start_line.saturating_sub(1),
+        "character": byte_column_to_utf16(
+            source,
+            declaration.start_line.saturating_sub(1),
+            declaration.start_column.saturating_sub(1),
+        )?,
+    });
     let params = json!({
         "textDocument": { "uri": file_uri(&target) },
-        "position": {
-            "line": declaration.start_line.saturating_sub(1),
-            "character": byte_column_to_utf16(
-                source,
-                declaration.start_line.saturating_sub(1),
-                declaration.start_column.saturating_sub(1),
-            )?,
-        },
+        "position": position,
         "newName": new_name,
     });
-    let result = with_client(server, &root, |client| {
+    let (references, result) = with_client(server, &root, |client| {
         client.notify(
             "textDocument/didOpen",
             json!({
@@ -124,6 +125,14 @@ pub fn rename(
             }),
         )?;
         client.wait_for_document(&file_uri(&target))?;
+        let references = client.request_retry_content_modified(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": file_uri(&target) },
+                "position": position,
+                "context": { "includeDeclaration": true }
+            }),
+        )?;
         let mut result = None;
         for attempt in 0..3 {
             match client.request("textDocument/rename", params.clone()) {
@@ -141,9 +150,18 @@ pub fn rename(
             "textDocument/didClose",
             json!({ "textDocument": { "uri": file_uri(&target) } }),
         );
-        result.context("language server did not return a rename result")
+        Ok((
+            references,
+            result.context("language server did not return a rename result")?,
+        ))
     })?;
-    parse_workspace_edit(&root, &result)
+    let mut edits = parse_workspace_edit(&root, &result)?;
+    let references = parse_locations(&root, &references)?;
+    let original_name = source
+        .get(declaration.start_byte..declaration.end_byte)
+        .context("symbol declaration range is not valid UTF-8")?;
+    complete_rename_edits(&root, &references, &mut edits, original_name, new_name)?;
+    Ok(edits)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -562,6 +580,57 @@ fn parse_locations(root: &Path, value: &Value) -> Result<Vec<LspLocation>> {
     Ok(out)
 }
 
+fn complete_rename_edits(
+    root: &Path,
+    references: &[LspLocation],
+    edits: &mut Vec<WorkspaceTextEdit>,
+    original_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    for reference in references {
+        let covered = edits.iter().any(|edit| {
+            edit.rel_path == reference.rel_path
+                && edit.start_byte <= reference.range.start_byte
+                && edit.end_byte >= reference.range.end_byte
+        });
+        if covered {
+            continue;
+        }
+        let rel = normalize_safe_rel_path(Path::new(&reference.rel_path), "LSP reference path")?;
+        let source = fs::read_to_string(root.join(&rel))
+            .with_context(|| format!("read uncovered LSP reference {}", reference.rel_path))?;
+        let referenced_text = source
+            .get(reference.range.start_byte..reference.range.end_byte)
+            .context("LSP reference range is not valid UTF-8")?;
+        if referenced_text != original_name {
+            bail!(
+                "language server omitted a non-trivial rename edit for {}:{}; refusing partial rename",
+                reference.rel_path,
+                reference.range.start_line
+            );
+        }
+        edits.push(WorkspaceTextEdit {
+            rel_path: reference.rel_path.clone(),
+            start_byte: reference.range.start_byte,
+            end_byte: reference.range.end_byte,
+            new_text: new_name.to_string(),
+        });
+    }
+    edits.sort_by(|left, right| {
+        left.rel_path
+            .cmp(&right.rel_path)
+            .then(left.start_byte.cmp(&right.start_byte))
+            .then(left.end_byte.cmp(&right.end_byte))
+    });
+    edits.dedup();
+    for pair in edits.windows(2) {
+        if pair[0].rel_path == pair[1].rel_path && pair[0].end_byte > pair[1].start_byte {
+            bail!("completed language-server rename edits overlap");
+        }
+    }
+    Ok(())
+}
+
 fn byte_column_to_utf16(source: &str, zero_line: usize, byte_column: usize) -> Result<usize> {
     let line = source
         .lines()
@@ -706,5 +775,48 @@ mod tests {
         let edits = parse_workspace_edit(root.path(), &value).unwrap();
         assert_eq!(edits[0].rel_path, "main.rs");
         assert_eq!((edits[0].start_byte, edits[0].end_byte), (3, 6));
+    }
+
+    #[test]
+    fn rename_completion_adds_only_exact_compiler_references() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("main.rs"),
+            "let hwid = get();\nuse_it(hwid);\n",
+        )
+        .unwrap();
+        let references = vec![
+            LspLocation {
+                rel_path: "main.rs".to_string(),
+                range: TextRange {
+                    start_byte: 4,
+                    end_byte: 8,
+                    start_line: 1,
+                    start_column: 5,
+                    end_line: 1,
+                    end_column: 9,
+                },
+            },
+            LspLocation {
+                rel_path: "main.rs".to_string(),
+                range: TextRange {
+                    start_byte: 25,
+                    end_byte: 29,
+                    start_line: 2,
+                    start_column: 8,
+                    end_line: 2,
+                    end_column: 12,
+                },
+            },
+        ];
+        let mut edits = vec![WorkspaceTextEdit {
+            rel_path: "main.rs".to_string(),
+            start_byte: 4,
+            end_byte: 8,
+            new_text: "device_id".to_string(),
+        }];
+        complete_rename_edits(root.path(), &references, &mut edits, "hwid", "device_id").unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!((edits[1].start_byte, edits[1].end_byte), (25, 29));
     }
 }
