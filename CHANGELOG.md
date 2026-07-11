@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-11
+
 ### Added
 
 - Running `code-sanity` without a subcommand now opens a full-screen,
@@ -385,6 +387,7 @@ Source-only baseline; never released as a binary.
 - Strict mode (`sh` / `strict-run`) with sanitized command output.
 - Proposal review queue with human approval (`propose-sanitize`, `review`).
 
+[0.4.0]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.0
 [0.3.2]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.3.2
 [0.3.1]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.3.1
 [0.2.0]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.2.0
