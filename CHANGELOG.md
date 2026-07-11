@@ -109,6 +109,10 @@ edits, and a lost `config.toml` no longer silently voids the policy.
 
 ### Fixed
 
+- Workspaces initialized by v0.2 transparently upgrade the exact legacy default
+  dictionary to salted aliases in memory. This prevents common words such as
+  `client` from blocking the first v0.3 index, while any user-customized
+  dictionary remains untouched and the config file is never silently rewritten.
 - **File permission bits survive the patch bridge.** Every real-file write went
   through a fresh 0644 temp file renamed over the target, so back-projecting an
   agent edit onto `deploy.sh` silently stripped its executable bit. The atomic

@@ -445,24 +445,33 @@ pub struct IgnoreConfig {
 /// makes the mirror ambiguous and reverse-maps agent-typed words into real
 /// terms. The stem keeps the mirror readable; the salted suffix makes natural
 /// occurrence practically impossible.
+const DEFAULT_DICTIONARY_STEMS: [(&str, &str); 7] = [
+    ("acme", "client"),
+    ("attack", "exercise"),
+    ("dangerous", "neutral"),
+    ("evil", "sample"),
+    ("exfiltrate", "transfer"),
+    ("malware", "diagnostic"),
+    ("privatecorp", "examplecorp"),
+];
+
 pub fn default_dictionary(salt: &str) -> BTreeMap<String, String> {
-    [
-        ("acme", "client"),
-        ("attack", "exercise"),
-        ("dangerous", "neutral"),
-        ("evil", "sample"),
-        ("exfiltrate", "transfer"),
-        ("malware", "diagnostic"),
-        ("privatecorp", "examplecorp"),
-    ]
-    .into_iter()
-    .map(|(term, stem)| {
-        (
-            term.to_string(),
-            crate::sanitize::derive_stemmed_alias(salt, term, stem),
-        )
-    })
-    .collect()
+    DEFAULT_DICTIONARY_STEMS
+        .into_iter()
+        .map(|(term, stem)| {
+            (
+                term.to_string(),
+                crate::sanitize::derive_stemmed_alias(salt, term, stem),
+            )
+        })
+        .collect()
+}
+
+fn legacy_default_dictionary() -> BTreeMap<String, String> {
+    DEFAULT_DICTIONARY_STEMS
+        .into_iter()
+        .map(|(term, replacement)| (term.to_string(), replacement.to_string()))
+        .collect()
 }
 
 impl Default for Config {
@@ -548,7 +557,7 @@ impl Config {
     /// re-render the mirror without the user's sanitization policy —
     /// previously hidden terms would surface in the agent-facing view.
     pub fn load_or_default_lenient(layout: &Layout) -> Result<Self> {
-        let config = if layout.config_path.exists() {
+        let mut config = if layout.config_path.exists() {
             let raw = fs::read_to_string(&layout.config_path)
                 .with_context(|| format!("read {}", layout.config_path.display()))?;
             toml::from_str(&raw)
@@ -558,6 +567,12 @@ impl Config {
         } else {
             Self::default()
         };
+        if config.sanitizer.dictionary == legacy_default_dictionary() {
+            config.sanitizer.dictionary = default_dictionary(&config.salt);
+            log::warn!(
+                "using salted aliases for the legacy v0.2 default dictionary; custom dictionary entries are unchanged"
+            );
+        }
         // The write primitives are free functions far from any config; arm
         // the process-wide full-fsync switch at the single load chokepoint.
         crate::fsutil::set_full_fsync(config.durability.full_fsync);
@@ -747,6 +762,51 @@ mod tests {
         std::fs::write(&layout.config_path, "version = [not toml").unwrap();
         let err = Config::load_or_default(&layout).unwrap_err();
         assert!(err.to_string().contains("config.toml"));
+    }
+
+    #[test]
+    fn legacy_default_dictionary_is_upgraded_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.ensure_dirs().unwrap();
+        let mut config = Config {
+            salt: "legacy-workspace-salt".to_string(),
+            ..Config::default()
+        };
+        config.sanitizer.dictionary = legacy_default_dictionary();
+        let raw = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&layout.config_path, &raw).unwrap();
+
+        let loaded = Config::load_or_default(&layout).unwrap();
+        assert_eq!(
+            loaded.sanitizer.dictionary,
+            default_dictionary("legacy-workspace-salt")
+        );
+        assert_eq!(std::fs::read_to_string(&layout.config_path).unwrap(), raw);
+    }
+
+    #[test]
+    fn customized_legacy_dictionary_is_not_upgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        layout.ensure_dirs().unwrap();
+        let mut config = Config {
+            salt: "legacy-workspace-salt".to_string(),
+            ..Config::default()
+        };
+        config.sanitizer.dictionary = legacy_default_dictionary();
+        config
+            .sanitizer
+            .dictionary
+            .insert("acme".to_string(), "my_client_alias".to_string());
+        std::fs::write(
+            &layout.config_path,
+            toml::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = Config::load_or_default(&layout).unwrap();
+        assert_eq!(loaded.sanitizer.dictionary, config.sanitizer.dictionary);
     }
 
     #[test]
