@@ -138,6 +138,7 @@ pub fn verify_workspace(root: &Path) -> Result<VerifyReport> {
         )
         .with_context(|| format!("verify {rel}"))?;
     }
+    verify_semantic_index(root, &conn, &tracked_set, &mut report)?;
 
     // Independent mirror sweep: a mirror file nobody tracks is either drift or
     // a plant; both are failures.
@@ -162,6 +163,117 @@ pub fn verify_workspace(root: &Path) -> Result<VerifyReport> {
         }));
     }
     Ok(report)
+}
+
+fn verify_semantic_index(
+    root: &Path,
+    conn: &rusqlite::Connection,
+    tracked: &BTreeSet<String>,
+    report: &mut VerifyReport,
+) -> Result<()> {
+    let mut semantic_paths = BTreeSet::new();
+    let mut statement = conn
+        .prepare(
+            "select rel_path, content_hash, parse_errors from semantic_documents order by rel_path",
+        )
+        .context("prepare semantic verification query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as usize,
+            ))
+        })
+        .context("query semantic documents for verification")?;
+    for row in rows {
+        let (rel, indexed_hash, indexed_errors) = row.context("read semantic document")?;
+        semantic_paths.insert(rel.clone());
+        if !tracked.contains(&rel) {
+            report
+                .failures
+                .push(format!("{rel}: untracked semantic document"));
+            continue;
+        }
+        let source = match fs::read_to_string(root.join(&rel)) {
+            Ok(source) => source,
+            Err(err) => {
+                report
+                    .failures
+                    .push(format!("{rel}: semantic source unreadable ({err})"));
+                continue;
+            }
+        };
+        if sha256_hex(source.as_bytes()) != indexed_hash {
+            report.failures.push(format!(
+                "{rel}: semantic document hash differs from real file"
+            ));
+            continue;
+        }
+        let parsed = crate::semantic::parse_document(Path::new(&rel), &source)?;
+        if parsed.parse_errors != indexed_errors {
+            report.failures.push(format!(
+                "{rel}: semantic parse error count differs (db={indexed_errors}, current={})",
+                parsed.parse_errors
+            ));
+        }
+        for (table, expected) in [
+            ("semantic_nodes", parsed.nodes.len()),
+            ("semantic_symbols", parsed.symbols.len()),
+            ("semantic_occurrences", parsed.occurrences.len()),
+        ] {
+            let sql = format!("select count(*) from {table} where rel_path = ?1");
+            let actual =
+                conn.query_row(&sql, [rel.as_str()], |row| row.get::<_, i64>(0))
+                    .with_context(|| format!("count {table} for {rel}"))? as usize;
+            if actual != expected {
+                report.failures.push(format!(
+                    "{rel}: {table} count differs (db={actual}, current={expected})"
+                ));
+            }
+        }
+    }
+    for missing in tracked.difference(&semantic_paths) {
+        report.failures.push(format!(
+            "{missing}: missing semantic document; run code-sanity index"
+        ));
+    }
+
+    let orphan_aliases: i64 = conn
+        .query_row(
+            r#"
+            select count(*) from semantic_aliases a
+            left join semantic_symbols s on s.symbol_id = a.symbol_id
+            where s.symbol_id is null or s.origin != 'owned'
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .context("count orphan semantic aliases")?;
+    if orphan_aliases != 0 {
+        report.failures.push(format!(
+            "semantic index has {orphan_aliases} orphan or non-owned alias(es)"
+        ));
+    }
+    let orphan_proposals: i64 = conn
+        .query_row(
+            r#"
+            select count(*) from semantic_proposals p
+            left join semantic_symbols s on s.symbol_id = p.symbol_id
+            left join semantic_occurrences o on o.occurrence_id = p.occurrence_id
+            where p.status = 'pending'
+              and (s.symbol_id is null or o.occurrence_id is null or o.symbol_id != p.symbol_id)
+            "#,
+            [],
+            |row| row.get(0),
+        )
+        .context("count orphan semantic proposals")?;
+    if orphan_proposals != 0 {
+        report.failures.push(format!(
+            "semantic index has {orphan_proposals} proposal(s) with missing target IDs"
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

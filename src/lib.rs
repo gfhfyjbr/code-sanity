@@ -13,6 +13,7 @@ pub mod journal;
 pub mod llm;
 pub mod lock;
 pub mod logging;
+pub mod lsp;
 pub mod map;
 pub mod mcp;
 pub mod output;
@@ -22,7 +23,10 @@ pub mod proposal;
 pub mod redact;
 pub mod sanitize;
 pub mod search;
+pub mod semantic;
+pub mod semantic_store;
 pub mod strict;
+pub mod transaction;
 pub mod tui;
 pub mod verify;
 

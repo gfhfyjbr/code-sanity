@@ -1,9 +1,17 @@
 # Connecting agents to the code-sanity MCP server
 
-`code-sanity serve` speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio (JSON-RPC 2.0, one message per line). It exposes six tools, all backed by the same bridge the CLI uses:
+`code-sanity serve` speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio (JSON-RPC 2.0, one message per line). V2 tools return both text content and `structuredContent`; the v1 tools remain for compatibility.
 
 | Tool | Input | Returns |
 | --- | --- | --- |
+| `workspace_snapshot` | `{}` | semantic revision and index counts |
+| `find_code` | `{ "query": "...", "limit"? }` | owned symbols with stable IDs and ranges |
+| `read_code` | `{ "path": "src/lib.rs" }` | symbol-scoped projection, AST nodes, occurrences, capabilities, revision |
+| `references` | `{ "symbol_id": "sym_..." }` | compiler/LSP reference locations |
+| `edit_node` | `{ "node_id", "replacement", "expected_revision" }` | persisted single-intent preview |
+| `rename_symbol` | `{ "symbol_id", "new_name", "expected_revision" }` | compiler/LSP rename preview |
+| `preview_transaction` | `{ "expected_revision", "intents": [...] }` | validated multi-intent preview and transaction ID |
+| `commit_transaction` | `{ "transaction_id", "expected_revision", "agent"?, "session_id"? }` | committed revision, files, journal |
 | `read_file` | `{ "path": "src/lib.rs" }` | sanitized file content |
 | `search` | `{ "query": "...", "glob": "*.rs"?, "max_results"? }` | `path:line:column:text` lines (sanitized, capped) |
 | `list_files` | `{ "glob": "src/**"? }` | repo-relative mirror paths |
@@ -11,7 +19,9 @@
 | `apply_patch` | `{ "patch": "<unified diff>", "agent"?, "session_id"?, "dry_run"? }` | applied files + workspace-relative journal path (`dry_run: true` plans/validates only) |
 | `verify` | `{}` | tracked-file consistency check |
 
-`read_file`, `search`, and `list_files` only ever read `.code-sanity/mirror`, so file **content** the model sees is sanitized. File and directory **names** are the real repo-relative paths by design — module paths and filenames are deliberately not hidden (see THREAT_MODEL.md "Deliberately not hidden"); a sensitive term in a directory or file name is visible to the model. Glob parameters use gitignore-style dispatch: without `/` they match file names at any depth (`*.rs`); with `/` they match the repo-relative path (`src/**/*.rs`). Tool output never carries host-absolute paths (journal references are workspace-relative; errors are redacted and root-scrubbed). `apply_patch` accepts a diff written against sanitized mirror paths (`a/src/lib.rs`, `b/src/lib.rs`, or `.code-sanity/mirror/src/lib.rs`) and projects it back onto the real repo through the span-aware, conflict-safe bridge.
+`read_code` is the preferred read path. It projects aliases only at AST occurrences bound to one `symbol_id`; comments, strings, external APIs, and same-spelling unrelated symbols remain unchanged. Mutation is a two-step preview/commit protocol with revision CAS. `edit_node` cannot touch a declaration-containing range, while `rename_symbol` accepts only a compiler/LSP `WorkspaceEdit` contained by the repository.
+
+The legacy `read_file`, `search`, and `list_files` read `.code-sanity/mirror`. File and directory names remain real repo-relative paths by design. Glob parameters use gitignore-style dispatch: without `/` they match file names at any depth (`*.rs`); with `/` they match the repo-relative path (`src/**/*.rs`). Tool output never carries host-absolute paths. `apply_patch` remains the v1 span bridge; new integrations should use v2 structured transactions. See [SEMANTIC_V2.md](SEMANTIC_V2.md) for invariants and capability boundaries.
 
 Inspect the manifest without starting a session:
 
@@ -31,7 +41,7 @@ command = "code-sanity"
 args = ["--root", ".", "serve"]
 ```
 
-Codex then offers `read_file`, `search`, `list_files`, `semantic_search`, `apply_patch`, and `verify`. Pair this with `code-sanity install-hooks --agent codex` to deny raw real-repo edits in strict mode and steer reads toward these tools.
+Codex then offers the AST/semantic v2 tools plus the legacy mirror tools. In the agent system prompt, require `workspace_snapshot` before reads or edits, `read_code`/`find_code` for context, and `preview_transaction` followed by `commit_transaction` for mutation. Pair this with strict-mode filesystem isolation when raw filesystem tools must be unavailable.
 
 ## Claude Code
 

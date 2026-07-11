@@ -18,6 +18,13 @@ semantics from a reviewer or scanner is an explicit non-goal.
 The real repository is always the source of truth. The mirror is a derived,
 regenerable view.
 
+There are now two explicit projection contracts. Legacy v1 mirror tools apply
+the lexical privacy policy described below, including prose. Semantic v2
+`read_code` changes only identifier occurrences bound to an accepted
+`symbol_id`; it deliberately leaves comments and string literals unchanged so
+an edit agent never mistakes prose replacement for a code symbol. Do not use
+v2 alone when raw comment/string privacy is the primary requirement.
+
 ## Assets
 
 Protected (kept out of the agent-facing mirror where policy allows):
@@ -243,14 +250,18 @@ term visible.
   byte-for-byte — or it conflicts (exit code 2) and leaves the real file
   untouched. Aliases in newly added lines are reverse-mapped to their real
   originals; an ambiguous alias is a conflict.
-- One symbol, one decision: a protected name stays real everywhere; a term maps
-  to one alias everywhere (including case/underscore variants).
+- V2 aliases are scoped to one `symbol_id`; same-spelling symbols can have
+  independent decisions, and comments/strings never become references.
+- V1 keeps its legacy global term decision for mirror compatibility.
 - No dictionary/denylist/registry term survives into the mirror outside a
   protected identifier — enforced independently by the `verify` leak backstop.
   Protected identifiers come only from code positions, so no amount of prose,
   comments, or string literals can create one; a **denylisted** term can never
   be a sanctioned residue at all (it is a hard error instead).
 - The model never writes the mirror; only the deterministic engine does.
+- V2 proposal output must reference existing owned symbol/occurrence IDs;
+  invented, ambiguous, external, generated, dependency, and API-boundary
+  targets are rejected locally.
 - Apply intent is journaled (fsync'd) before any real write, and every writer
   holds the workspace flock. A back-projected write preserves the real file's
   permission bits.

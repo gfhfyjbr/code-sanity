@@ -872,6 +872,7 @@ mod tests {
             id: "id".to_string(),
             file: "main.rs".to_string(),
             proposal: Proposal {
+                target: None,
                 category: "identifier".to_string(),
                 original_text: "hwid".to_string(),
                 sanitized_text: "device_id".to_string(),

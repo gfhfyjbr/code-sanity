@@ -195,10 +195,10 @@ pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
         if let Some(reason) = matchability_error(term) {
             violations.push(format!("{source} {reason}"));
         }
-        if let Some(alias) = alias
-            && let Some(reason) = matchability_error(alias)
-        {
-            violations.push(format!("{source} alias for {term:?}: {reason}"));
+        if let Some(alias) = alias {
+            if let Some(reason) = matchability_error(alias) {
+                violations.push(format!("{source} alias for {term:?}: {reason}"));
+            }
         }
     }
     for item in &config.sanitizer.allowlist {

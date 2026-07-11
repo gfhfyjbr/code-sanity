@@ -28,6 +28,10 @@ use std::time::Instant;
 /// returns these, the engine validates and (on approval) records them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Proposal {
+    /// Stable semantic target. LLM v2 proposals must provide it; legacy local
+    /// providers are resolved to one exact owned symbol before review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ProposalTarget>,
     pub category: String,
     pub original_text: String,
     pub sanitized_text: String,
@@ -39,6 +43,12 @@ pub struct Proposal {
     pub confidence: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalTarget {
+    pub symbol_id: String,
+    pub occurrence_id: String,
 }
 
 /// What an external provider returns on stdout.
@@ -183,9 +193,31 @@ impl ProposalChunkMeta {
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct ProposalRequestContext {
     pub already_proposed_originals: Vec<String>,
+    pub already_decided_symbol_ids: Vec<String>,
     /// External framework, SDK, package, and `extern` identifiers derived by
     /// the repository index and relevant to this source chunk.
     pub indexed_external_identifiers: Vec<String>,
+    /// Existing owned symbols are the only legal identifier proposal targets.
+    pub semantic_candidates: Vec<SemanticCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticCandidate {
+    pub symbol_id: String,
+    pub occurrence_id: String,
+    pub name: String,
+    pub kind: String,
+    pub qualified_name: String,
+    pub declaration_line: usize,
+    pub reference_count: usize,
+    pub references_complete: bool,
+    pub occurrence_lines: Vec<usize>,
+    pub call_lines: Vec<usize>,
+    pub signature: String,
+    pub enclosing_code: String,
+    pub api_boundary: bool,
+    pub origin: String,
+    pub existing_alias: Option<String>,
 }
 
 /// A provider of sanitization proposals (the model interface).
@@ -302,10 +334,10 @@ impl ProposalProvider for ExternalProposalProvider {
         if !status.success() {
             bail!("external provider failed: {}", stderr.trim());
         }
-        if let Err(err) = write_result
-            && err.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            return Err(err).context("write external provider stdin");
+        if let Err(err) = write_result {
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(err).context("write external provider stdin");
+            }
         }
         parse_proposals(&stdout)
     }
@@ -336,6 +368,7 @@ impl ProposalProvider for HeuristicProposalProvider {
                 continue;
             }
             proposals.push(Proposal {
+                target: None,
                 category: "identifier".to_string(),
                 original_text: term.clone(),
                 sanitized_text: derive_alias(&config.salt, term),
@@ -413,23 +446,26 @@ impl ProposalProvider for LlmProposalProvider {
         let core_offset = proposal_core_offset(&provider_content, chunk);
         let (context_before, provider_content) = provider_content.split_at(core_offset);
         let user = serde_json::to_string(&serde_json::json!({
-            "task": "Review this source file for two independent classes of lexical normalization candidates: (1) non-public names owned by this repository or its operator, such as an internal organization, project, customer, or private product codename; (2) genuinely security- or abuse-adjacent vocabulary used in a benign developer context that could be misclassified by an automated safety filter when read without context. Suggest clear context-neutral replacement terms while preserving the code's meaning.",
+            "task": "Review only the owned symbols listed in context.semantic_candidates for private repository-owned names or genuinely security/abuse-adjacent vocabulary used benignly. Propose context-neutral whole-symbol aliases without changing meaning.",
             "rules": [
-                "original_text must be copied byte-for-byte from one contiguous case-sensitive substring of file.content",
+                "Every proposal must copy target.symbol_id and target.occurrence_id from one context.semantic_candidates entry; IDs not present in that list are forbidden",
+                "original_text must equal that candidate's complete name byte-for-byte and must occur in file.content",
                 "Never change original_text capitalization, spelling, inflection, plurality, or separators; never join source tokens separated by whitespace or punctuation",
                 "Never invent a label for a concept merely implied by the code; if the exact candidate is not present, omit it",
                 "For security- or abuse-adjacent vocabulary, include terms associated with offensive-security behavior, credential or device identity abuse, evasion, injection, unauthorized automation, harmful payloads, or similar risk-loaded concepts when the file uses them benignly",
                 "Do not suggest ordinary technical terms unless their standalone or compound meaning is plausibly risk-loaded and could be misclassified without context",
                 "A named entity is private only when it is non-public and owned by this repository or its operator; public third-party companies, products, services, integrations, standards, and vendor names are not private candidates",
+                "Never propose a semantic candidate whose api_boundary is true",
+                "Never propose a semantic candidate whose references_complete is false",
                 "Never propose operating-system components, framework or library APIs, imported packages, SDK symbols, browser names, hardware vendor names, protocol vocabulary, or other public external identifiers, even when they occur in strings or comments",
                 "Treat context.indexed_external_identifiers as authoritative API ownership evidence; never propose one of those identifiers or a vendor/API fragment embedded in one",
                 "Do not suggest changes to imports, public APIs, protocol constants, SQL, or shell syntax",
                 "Source comments are masked from file.content and are out of scope; never propose comment vocabulary",
                 "Do not suggest any term listed in policy.allowlist",
-                "Both original_text and sanitized_text must each be exactly one ASCII word run matching [A-Za-z0-9_]+; never return spaces, hyphens, dots, slashes, or punctuation",
-                "For a candidate embedded in a larger identifier, return the smallest meaningful risk-loaded or private-name substring rather than the entire identifier",
+                "Only identifier proposals are allowed; comments, strings, imports, external APIs, and partial identifier substrings are forbidden",
+                "Both original_text and sanitized_text must each be exactly one ASCII identifier word matching [A-Za-z_][A-Za-z0-9_]*",
                 "Treat file.context_before only as read-only context; original_text must occur in file.content, which is the current chunk's owned analysis region",
-                "Do not return an original_text already represented in context.already_proposed_originals, including capitalization or separator variants",
+                "Do not return a symbol listed in context.already_decided_symbol_ids",
                 "When category is identifier, sanitized_text must additionally match [A-Za-z_][A-Za-z0-9_]*",
                 "Replacement text must not contain a term listed in policy.denylist",
                 "Return strict JSON only, without prose or markdown"
@@ -442,7 +478,8 @@ impl ProposalProvider for LlmProposalProvider {
             ],
             "output_schema": {
                 "proposals": [{
-                    "category": "identifier|string",
+                    "target": { "symbol_id": "existing ID", "occurrence_id": "existing declaration occurrence ID" },
+                    "category": "identifier",
                     "original_text": "string",
                     "sanitized_text": "string",
                     "confidence": "number from 0 to 1",
@@ -670,6 +707,7 @@ struct ProposalPolicyContext<'a> {
     config: &'a Config,
     indexed_external: &'a BTreeSet<String>,
     indexed_words: &'a BTreeMap<String, (String, String)>,
+    semantic_candidates: &'a BTreeMap<String, Vec<SemanticCandidate>>,
 }
 
 /// Run the proposal provider with bounded concurrency and publish progress from
@@ -691,13 +729,14 @@ pub fn propose_sanitize_with_progress(
     // One short shared-lock snapshot supplies both the file set and the
     // ownership evidence produced by `index`. Provider calls happen after the
     // lock is dropped.
-    let (tracked_files, index_states) = {
+    let (tracked_files, index_states, semantic_candidates) = {
         let _lock = WorkspaceLock::acquire_shared(&layout)?;
         let conn = db::connect(&layout)?;
         db::check_schema(&conn)?;
         let files = db::tracked_files(&conn)?;
         let states = db::all_index_states(&conn)?;
-        (files, states)
+        let candidates = semantic_candidates_by_file(root, &conn)?;
+        (files, states, candidates)
     };
     let indexed_words = indexed_word_owners(root, &tracked_files);
     let files = match rel {
@@ -734,12 +773,12 @@ pub fn propose_sanitize_with_progress(
     let pending_items = list_review(root, false)?;
     let mut pending_keys: BTreeSet<String> = pending_items
         .iter()
-        .map(|item| normalize_term(&item.proposal.original_text))
+        .map(|item| proposal_identity(&item.proposal))
         .collect();
     let mut already_proposed = BTreeMap::<String, String>::new();
     for item in pending_items {
         already_proposed
-            .entry(normalize_term(&item.proposal.original_text))
+            .entry(proposal_identity(&item.proposal))
             .or_insert(item.proposal.original_text);
     }
     let total = files.len();
@@ -856,10 +895,26 @@ pub fn propose_sanitize_with_progress(
             .iter()
             .map(|item| ProposalRequestContext {
                 already_proposed_originals: already_proposed.values().cloned().collect(),
+                already_decided_symbol_ids: already_proposed.keys().cloned().collect(),
                 indexed_external_identifiers: relevant_external_identifiers(
                     &item.chunk.content,
                     &indexed_external,
                 ),
+                semantic_candidates: semantic_candidates
+                    .get(&item.file)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| {
+                        !candidate.api_boundary
+                            && candidate.references_complete
+                            && candidate.existing_alias.is_none()
+                            && candidate.occurrence_lines.iter().any(|line| {
+                                *line >= item.chunk.meta.start_line
+                                    && *line <= item.chunk.meta.end_line
+                            })
+                    })
+                    .cloned()
+                    .collect(),
             })
             .collect::<Vec<_>>();
 
@@ -950,7 +1005,6 @@ pub fn propose_sanitize_with_progress(
             let WorkerEvent::ChunkFinished {
                 wave_index,
                 file_index,
-                file,
                 meta,
                 result,
                 ..
@@ -960,17 +1014,24 @@ pub fn propose_sanitize_with_progress(
                 WorkerResult::Proposals(proposals) => {
                     state.proposed += proposals.len();
                     let context_keys = contexts[wave_index]
-                        .already_proposed_originals
+                        .already_decided_symbol_ids
                         .iter()
-                        .map(|item| normalize_term(item))
+                        .cloned()
                         .collect::<BTreeSet<_>>();
                     let chunk = &wave[wave_index].chunk;
                     let core_content = proposal_core_content(&chunk.content, meta);
-                    for proposal in proposals {
-                        let normalized = normalize_term(&proposal.original_text);
-                        if context_keys
-                            .iter()
-                            .any(|seen| normalized_terms_overlap(seen, &normalized))
+                    for mut proposal in proposals {
+                        if let Err(reason) = attach_semantic_target(
+                            &mut proposal,
+                            &contexts[wave_index].semantic_candidates,
+                        ) {
+                            state
+                                .rejected
+                                .push(format!("{}: {reason}", proposal.original_text));
+                            continue;
+                        }
+                        let identity = proposal_identity(&proposal);
+                        if context_keys.contains(&identity)
                             || (!core_content.contains(&proposal.original_text)
                                 && chunk.content.contains(&proposal.original_text))
                         {
@@ -984,20 +1045,12 @@ pub fn propose_sanitize_with_progress(
                             ));
                             continue;
                         }
-                        if validate_proposal_with_index(
-                            Path::new(&file),
-                            &proposal,
-                            &state.real,
-                            &config,
-                            &indexed_external,
-                            &indexed_words,
-                        )
-                        .is_ok()
-                        {
-                            already_proposed
-                                .entry(normalized)
-                                .or_insert_with(|| proposal.original_text.clone());
-                        }
+                        // Carry both accepted and later-rejected symbol
+                        // decisions into subsequent waves. A later chunk must
+                        // not spend another request proposing the same symbol.
+                        already_proposed
+                            .entry(identity)
+                            .or_insert_with(|| proposal.original_text.clone());
                         state.proposals.push(proposal);
                     }
                 }
@@ -1030,6 +1083,7 @@ pub fn propose_sanitize_with_progress(
                     config: &config,
                     indexed_external: &indexed_external,
                     indexed_words: &indexed_words,
+                    semantic_candidates: &semantic_candidates,
                 },
                 &mut pending_keys,
                 &mut report,
@@ -1092,7 +1146,7 @@ fn commit_file_proposals(
     let mut unique = std::collections::BTreeMap::<(String, String), Proposal>::new();
     for proposal in proposals {
         let key = (
-            normalize_term(&proposal.original_text),
+            proposal_identity(&proposal),
             normalize_term(&proposal.sanitized_text),
         );
         match unique.entry(key) {
@@ -1116,7 +1170,19 @@ fn commit_file_proposals(
     let mut file_queued = 0usize;
     let mut file_rejected = pre_rejected.len();
     report.rejected.extend(pre_rejected);
-    for proposal in unique.into_values() {
+    for mut proposal in unique.into_values() {
+        let candidates = policy
+            .semantic_candidates
+            .get(file)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if let Err(reason) = attach_semantic_target(&mut proposal, candidates) {
+            report
+                .rejected
+                .push(format!("{}: {reason}", proposal.original_text));
+            file_rejected += 1;
+            continue;
+        }
         match validate_proposal_with_index(
             Path::new(file),
             &proposal,
@@ -1126,11 +1192,8 @@ fn commit_file_proposals(
             policy.indexed_words,
         ) {
             Ok(flag) => {
-                let key = normalize_term(&proposal.original_text);
-                if pending_keys
-                    .iter()
-                    .any(|seen| normalized_terms_overlap(seen, &key))
-                {
+                let key = proposal_identity(&proposal);
+                if pending_keys.contains(&key) {
                     report.duplicates += 1;
                     file_duplicates += 1;
                 } else {
@@ -1278,6 +1341,100 @@ fn relevant_external_identifiers(
         .collect()
 }
 
+fn semantic_candidates_by_file(
+    root: &Path,
+    conn: &rusqlite::Connection,
+) -> Result<BTreeMap<String, Vec<SemanticCandidate>>> {
+    let mut statement = conn
+        .prepare(
+            r#"
+            select s.rel_path, s.symbol_id, declaration.occurrence_id, s.name, s.kind,
+                   s.qualified_name, declaration.start_line,
+                   (select count(*) from semantic_occurrences refs
+                    where refs.symbol_id = s.symbol_id and refs.role = 'reference'),
+                   (select group_concat(ordered_occ.start_line, ',') from
+                     (select all_occ.start_line from semantic_occurrences all_occ
+                      where all_occ.symbol_id = s.symbol_id order by all_occ.start_line) ordered_occ),
+                   not exists(select 1 from semantic_occurrences unresolved
+                              where unresolved.role = 'unresolved' and unresolved.name = s.name),
+                   (select group_concat(call_occ.start_line, ',') from semantic_occurrences call_occ
+                    join semantic_nodes call_node on call_node.node_id = call_occ.node_id
+                    join semantic_nodes call_parent on call_parent.node_id = call_node.parent_node_id
+                    where call_occ.symbol_id = s.symbol_id
+                      and call_parent.kind in ('call_expression', 'macro_invocation')),
+                   s.origin, a.sanitized_name
+            from semantic_symbols s
+            join semantic_occurrences declaration
+              on declaration.symbol_id = s.symbol_id and declaration.role = 'declaration'
+            left join semantic_aliases a
+              on a.symbol_id = s.symbol_id and a.status = 'accepted'
+            where s.origin = 'owned'
+            order by s.rel_path, declaration.start_byte
+            "#,
+        )
+        .context("prepare semantic proposal candidates")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SemanticCandidate {
+                    symbol_id: row.get(1)?,
+                    occurrence_id: row.get(2)?,
+                    name: row.get(3)?,
+                    kind: row.get(4)?,
+                    qualified_name: row.get(5)?,
+                    declaration_line: row.get::<_, i64>(6)? as usize,
+                    reference_count: row.get::<_, i64>(7)? as usize,
+                    references_complete: row.get::<_, i64>(9)? != 0,
+                    occurrence_lines: row
+                        .get::<_, Option<String>>(8)?
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|line| line.parse().ok())
+                        .collect(),
+                    call_lines: row
+                        .get::<_, Option<String>>(10)?
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|line| line.parse().ok())
+                        .collect(),
+                    signature: String::new(),
+                    enclosing_code: String::new(),
+                    api_boundary: false,
+                    origin: row.get(11)?,
+                    existing_alias: row.get(12)?,
+                },
+            ))
+        })
+        .context("query semantic proposal candidates")?;
+    let mut by_file = BTreeMap::<String, Vec<SemanticCandidate>>::new();
+    for row in rows {
+        let (file, candidate) = row.context("read semantic proposal candidate")?;
+        by_file.entry(file).or_default().push(candidate);
+    }
+    for (file, candidates) in &mut by_file {
+        let source = std::fs::read_to_string(root.join(file.as_str()))
+            .with_context(|| format!("read semantic proposal source {file}"))?;
+        let model_source = mask_comments_for_proposal(Path::new(file.as_str()), &source);
+        let lines = model_source.lines().collect::<Vec<_>>();
+        let protected = collect_protected_identifiers(Path::new(file.as_str()), &source);
+        for candidate in candidates {
+            candidate.signature = lines
+                .get(candidate.declaration_line.saturating_sub(1))
+                .map(|line| line.trim().to_string())
+                .unwrap_or_default();
+            let start = candidate
+                .declaration_line
+                .saturating_sub(2)
+                .min(lines.len());
+            let end = (candidate.declaration_line + 1).min(lines.len());
+            candidate.enclosing_code = lines[start..end].join("\n");
+            candidate.api_boundary = protected.contains(&candidate.name);
+        }
+    }
+    Ok(by_file)
+}
+
 fn indexed_word_owners(root: &Path, files: &[String]) -> BTreeMap<String, (String, String)> {
     let mut words = BTreeMap::new();
     for rel in files {
@@ -1315,6 +1472,52 @@ fn validate_proposal_with_index(
         ));
     }
     Ok(flag)
+}
+
+fn attach_semantic_target(
+    proposal: &mut Proposal,
+    candidates: &[SemanticCandidate],
+) -> std::result::Result<(), String> {
+    if proposal.category != "identifier" {
+        return Err("v2 proposals may target owned identifiers only".to_string());
+    }
+    let candidate = match &proposal.target {
+        Some(target) => candidates.iter().find(|candidate| {
+            candidate.symbol_id == target.symbol_id
+                && candidate.occurrence_id == target.occurrence_id
+        }),
+        None => {
+            let mut matching = candidates
+                .iter()
+                .filter(|candidate| candidate.name == proposal.original_text);
+            let first = matching.next();
+            if matching.next().is_some() {
+                return Err(
+                    "multiple semantic symbols share this name; provider must return exact target IDs"
+                        .to_string(),
+                );
+            }
+            first
+        }
+    }
+    .ok_or_else(|| "target IDs do not identify an existing owned symbol".to_string())?;
+    if candidate.name != proposal.original_text {
+        return Err("original_text must equal the target symbol's complete name".to_string());
+    }
+    if candidate.existing_alias.is_some() {
+        return Err("target symbol already has an accepted alias".to_string());
+    }
+    if candidate.api_boundary {
+        return Err("target is a public/API boundary and is not eligible for sanitization".into());
+    }
+    if !candidate.references_complete {
+        return Err("target has unresolved references and cannot be projected safely".into());
+    }
+    proposal.target = Some(ProposalTarget {
+        symbol_id: candidate.symbol_id.clone(),
+        occurrence_id: candidate.occurrence_id.clone(),
+    });
+    Ok(())
 }
 
 fn mask_comments_for_proposal(rel_path: &Path, content: &str) -> String {
@@ -1365,9 +1568,12 @@ fn external_api_owner<'a>(
     })
 }
 
-fn normalized_terms_overlap(left: &str, right: &str) -> bool {
-    left == right
-        || (left.len().min(right.len()) >= 4 && (left.contains(right) || right.contains(left)))
+fn proposal_identity(proposal: &Proposal) -> String {
+    proposal
+        .target
+        .as_ref()
+        .map(|target| target.symbol_id.clone())
+        .unwrap_or_else(|| format!("legacy:{}", normalize_term(&proposal.original_text)))
 }
 
 fn elapsed_ms(started_at: Instant) -> u64 {
@@ -1481,7 +1687,7 @@ fn enqueue_review(layout: &Layout, file: &str, proposal: &Proposal, flag: &str) 
     let id = format!(
         "{}-{}",
         Utc::now().format("%Y-%m-%dT%H-%M-%S%.9fZ"),
-        short_hash(&format!("{file}:{}", proposal.original_text))
+        short_hash(&format!("{file}:{}", proposal_identity(proposal)))
     );
     let item = ReviewItem {
         id: id.clone(),
@@ -1495,7 +1701,25 @@ fn enqueue_review(layout: &Layout, file: &str, proposal: &Proposal, flag: &str) 
     let raw = serde_json::to_string_pretty(&item).context("serialize review item")?;
     // Atomic: a crash mid-write must not leave a truncated item that breaks
     // `list_review` for the whole queue.
-    crate::fsutil::atomic_write(&path, &raw).with_context(|| format!("write {}", path.display()))
+    crate::fsutil::atomic_write(&path, &raw)
+        .with_context(|| format!("write {}", path.display()))?;
+    if let Some(target) = &proposal.target {
+        let conn = db::connect(layout)?;
+        db::check_schema(&conn)?;
+        crate::semantic_store::record_proposal(
+            &conn,
+            &id,
+            &target.symbol_id,
+            &target.occurrence_id,
+            &proposal.sanitized_text,
+            &proposal.category,
+            proposal.confidence,
+            proposal.rationale.as_deref().unwrap_or(""),
+            "pending",
+            &item.created_at,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn list_review(root: &Path, include_resolved: bool) -> Result<Vec<ReviewItem>> {
@@ -1559,7 +1783,7 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
             replacement: item.proposal.sanitized_text.clone(),
             policy_source: "alias-registry",
         }];
-        let conn = db::connect(&layout)?;
+        let mut conn = db::connect(&layout)?;
         db::check_schema(&conn)?;
         for rel in db::tracked_files(&conn)? {
             let Ok(content) = std::fs::read_to_string(root.join(&rel)) else {
@@ -1577,16 +1801,38 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
                 );
             }
         }
-        config.sanitizer.alias_registry.insert(
-            item.proposal.original_text.clone(),
-            item.proposal.sanitized_text.clone(),
-        );
-        config.save(&layout)?;
-        // A registry change alters the rendering policy for the whole repo,
-        // not just the proposal's file: reconverge everything before agents
-        // (MCP readers) can observe a half-registered term.
-        reconverge_workspace(root, &layout)
-            .with_context(|| format!("reindex after approving {}", item.id))?;
+        if let Some(target) = &item.proposal.target {
+            let (target_file, symbol) =
+                crate::semantic_store::load_symbol_with_path(&conn, &target.symbol_id)?
+                    .ok_or_else(|| anyhow!("proposal target symbol no longer exists"))?;
+            if target_file != item.file || symbol.name != item.proposal.original_text {
+                bail!("proposal target no longer matches its indexed symbol");
+            }
+            let occurrence_matches =
+                crate::semantic_store::occurrences_for_symbol(&conn, &target.symbol_id)?
+                    .iter()
+                    .any(|(_, occurrence)| occurrence.occurrence_id == target.occurrence_id);
+            if !occurrence_matches {
+                bail!("proposal target occurrence no longer exists");
+            }
+            crate::semantic_store::accept_symbol_alias(
+                &mut conn,
+                &target.symbol_id,
+                &item.proposal.sanitized_text,
+                &item.proposal.category,
+                item.proposal.confidence,
+                item.proposal.rationale.as_deref(),
+            )?;
+        } else {
+            config.sanitizer.alias_registry.insert(
+                item.proposal.original_text.clone(),
+                item.proposal.sanitized_text.clone(),
+            );
+            config.save(&layout)?;
+            // Legacy review items preserve the v1 global registry behavior.
+            reconverge_workspace(root, &layout)
+                .with_context(|| format!("reindex after approving {}", item.id))?;
+        }
         item.status = ReviewStatus::Approved;
     } else {
         item.status = ReviewStatus::Rejected;
@@ -1594,6 +1840,19 @@ pub fn resolve_review(root: &Path, id: &str, approve: bool) -> Result<ReviewItem
     let updated = serde_json::to_string_pretty(&item).context("serialize review item")?;
     crate::fsutil::atomic_write(&path, &updated)
         .with_context(|| format!("write {}", path.display()))?;
+    if item.proposal.target.is_some() {
+        let conn = db::connect(&layout)?;
+        db::check_schema(&conn)?;
+        crate::semantic_store::update_proposal_status(
+            &conn,
+            &item.id,
+            match item.status {
+                ReviewStatus::Approved => "approved",
+                ReviewStatus::Rejected => "rejected",
+                ReviewStatus::Pending => "pending",
+            },
+        )?;
+    }
     // Best-effort retention of the resolved history (same knob as the
     // journal); the resolution itself already landed. Lenient config load: a
     // sanitizer policy violation must not fail a reject.
@@ -1839,9 +2098,50 @@ mod tests {
     }
 
     #[test]
+    fn invented_or_ambiguous_semantic_targets_are_rejected() {
+        let candidates = ["sym_a", "sym_b"]
+            .into_iter()
+            .map(|symbol_id| SemanticCandidate {
+                symbol_id: symbol_id.to_string(),
+                occurrence_id: format!("occ_{symbol_id}"),
+                name: "hwid".to_string(),
+                kind: "variable".to_string(),
+                qualified_name: format!("scope::{symbol_id}"),
+                declaration_line: 1,
+                reference_count: 1,
+                references_complete: true,
+                occurrence_lines: vec![1],
+                call_lines: Vec::new(),
+                signature: "let hwid = 1;".to_string(),
+                enclosing_code: "let hwid = 1;".to_string(),
+                api_boundary: false,
+                origin: "owned".to_string(),
+                existing_alias: None,
+            })
+            .collect::<Vec<_>>();
+        let mut invented = Proposal {
+            target: Some(ProposalTarget {
+                symbol_id: "sym_missing".to_string(),
+                occurrence_id: "occ_missing".to_string(),
+            }),
+            category: "identifier".to_string(),
+            original_text: "hwid".to_string(),
+            sanitized_text: "device_id".to_string(),
+            confidence: 1.0,
+            rationale: None,
+        };
+        assert!(attach_semantic_target(&mut invented, &candidates).is_err());
+
+        invented.target = None;
+        let reason = attach_semantic_target(&mut invented, &candidates).unwrap_err();
+        assert!(reason.contains("multiple semantic symbols"), "{reason}");
+    }
+
+    #[test]
     fn rejects_invalid_identifier_alias() {
         let config = Config::default();
         let proposal = Proposal {
+            target: None,
             category: "identifier".to_string(),
             original_text: "helper".to_string(),
             sanitized_text: "1bad-name".to_string(),
@@ -1875,6 +2175,7 @@ mod tests {
     fn rejects_comment_only_terms_regardless_of_claimed_category() {
         let config = Config::default();
         let mut proposal = Proposal {
+            target: None,
             category: "identifier".to_string(),
             original_text: "TOCTOU".to_string(),
             sanitized_text: "race_guard".to_string(),
@@ -1900,6 +2201,7 @@ mod tests {
     #[test]
     fn allows_terms_that_also_occur_outside_comments() {
         let proposal = Proposal {
+            target: None,
             category: "identifier".to_string(),
             original_text: "TOCTOU".to_string(),
             sanitized_text: "race_guard".to_string(),
@@ -1919,6 +2221,7 @@ mod tests {
     fn rejects_alias_containing_denylisted_term() {
         let config = config_with_denylist(&["secret"]);
         let proposal = Proposal {
+            target: None,
             category: "comment".to_string(),
             original_text: "widget".to_string(),
             sanitized_text: "secret_widget".to_string(),
@@ -1940,6 +2243,7 @@ mod tests {
     fn rejects_terms_that_already_have_a_deterministic_mapping() {
         let config = Config::default();
         let proposal = Proposal {
+            target: None,
             category: "identifier".to_string(),
             original_text: "dangerous".to_string(),
             sanitized_text: "another_alias".to_string(),
@@ -1970,6 +2274,7 @@ mod tests {
             ("Trezor", "const char* vendor = \"Trezor\";"),
         ] {
             let proposal = Proposal {
+                target: None,
                 category: "string".to_string(),
                 original_text: candidate.to_string(),
                 sanitized_text: "ExternalComponent".to_string(),
@@ -1993,6 +2298,7 @@ mod tests {
     fn indexed_repo_words_reject_cross_file_alias_collisions() {
         let config = Config::default();
         let proposal = Proposal {
+            target: None,
             category: "identifier".to_string(),
             original_text: "shadowfax".to_string(),
             sanitized_text: "gadget".to_string(),
@@ -2019,18 +2325,6 @@ mod tests {
     }
 
     #[test]
-    fn proposal_dedup_collapses_identifier_variants_not_short_fragments() {
-        assert!(normalized_terms_overlap("payload", "deploypayload"));
-        assert!(normalized_terms_overlap("bomb", "bombs"));
-        assert!(normalized_terms_overlap(
-            "inputmonitor",
-            "inputmonitoractive"
-        ));
-        assert!(!normalized_terms_overlap("key", "keylogger"));
-        assert!(!normalized_terms_overlap("inputblocker", "inputblocking"));
-    }
-
-    #[test]
     fn proposal_path_can_select_an_indexed_directory() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
@@ -2050,11 +2344,12 @@ mod tests {
             ProviderAllow::default(),
         )
         .unwrap();
-        assert_eq!(report.queued, 1);
-        assert_eq!(report.duplicates, 1);
+        assert_eq!(report.queued, 2);
+        assert_eq!(report.duplicates, 0);
         let items = list_review(repo.path(), false).unwrap();
-        assert_eq!(items.len(), 1);
+        assert_eq!(items.len(), 2);
         assert_eq!(items[0].file, "src/a.rs");
+        assert_eq!(items[1].file, "src/b.rs");
     }
 
     #[test]
@@ -2067,6 +2362,7 @@ mod tests {
                 id: id.to_string(),
                 file: "src/a.rs".to_string(),
                 proposal: Proposal {
+                    target: None,
                     category: "identifier".to_string(),
                     original_text: "helper".to_string(),
                     sanitized_text: "assistant".to_string(),
@@ -2101,6 +2397,7 @@ mod tests {
     fn low_confidence_is_queued_with_flag_not_rejected() {
         let config = Config::default();
         let proposal = Proposal {
+            target: None,
             category: "identifier".to_string(),
             original_text: "helper".to_string(),
             sanitized_text: "assistant".to_string(),

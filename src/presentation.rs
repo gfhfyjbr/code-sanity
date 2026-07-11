@@ -341,6 +341,7 @@ mod tests {
             id: "2026-07-11T02-48-35.382110000Z-573f7bc8".to_string(),
             file: "src/client/api.mm".to_string(),
             proposal: Proposal {
+                target: None,
                 category: "identifier".to_string(),
                 original_text: "Trezor".to_string(),
                 sanitized_text: "HardwareWallet".to_string(),

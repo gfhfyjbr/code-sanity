@@ -114,6 +114,32 @@ fn chat_response(content: &str) -> Value {
     })
 }
 
+fn targeted_chat_response(request: &Value, proposals: &[(&str, &str, f64)]) -> Value {
+    let user: Value =
+        serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let candidates = user["context"]["semantic_candidates"].as_array().unwrap();
+    let proposals = proposals
+        .iter()
+        .map(|(original, replacement, confidence)| {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate["name"].as_str() == Some(original))
+                .unwrap_or_else(|| panic!("missing semantic candidate {original}: {candidates:?}"));
+            json!({
+                "target": {
+                    "symbol_id": candidate["symbol_id"],
+                    "occurrence_id": candidate["occurrence_id"],
+                },
+                "category": "identifier",
+                "original_text": original,
+                "sanitized_text": replacement,
+                "confidence": confidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    chat_response(&json!({ "proposals": proposals }).to_string())
+}
+
 #[test]
 fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
     let repo = tempfile::tempdir().unwrap();
@@ -125,16 +151,8 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
     .unwrap();
     index_workspace(repo.path()).unwrap();
 
-    // The reply is fenced on purpose: providers often ignore "no markdown".
-    // One proposal is valid, one references a term absent from the file.
-    let reply = "```json\n{\"proposals\":[\
-        {\"category\":\"identifier\",\"original_text\":\"megacorp\",\"sanitized_text\":\"examplefirm\",\"confidence\":0.95},\
-        {\"category\":\"identifier\",\"original_text\":\"COMMENT_ONLY_TRIGGER\",\"sanitized_text\":\"documentation_note\",\"confidence\":0.95},\
-        {\"category\":\"identifier\",\"original_text\":\"ghost_term\",\"sanitized_text\":\"nothing\",\"confidence\":0.9}\
-    ]}\n```";
     let chat_requests = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&chat_requests);
-    let reply_owned = reply.to_string();
     let base_url = spawn_mock_server(Arc::new(move |path: &str, request: &Value| {
         assert!(
             path.ends_with("/chat/completions"),
@@ -160,13 +178,13 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
                 .unwrap()
                 .contains("COMMENT_ONLY_TRIGGER")
         );
-        assert!(task["task"].as_str().unwrap().contains("security-"));
+        assert!(task["task"].as_str().unwrap().contains("security/abuse"));
         assert!(
             task["rules"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|rule| rule.as_str().unwrap().contains("[A-Za-z0-9_]+"))
+                .any(|rule| rule.as_str().unwrap().contains("[A-Za-z_][A-Za-z0-9_]*"))
         );
         assert!(
             task["rules"]
@@ -183,7 +201,41 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
                 .any(|rule| rule.as_str().unwrap().contains("case-sensitive substring"))
         );
         counter.fetch_add(1, Ordering::SeqCst);
-        chat_response(&reply_owned)
+        let candidate = task["context"]["semantic_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["name"] == "megacorp_client")
+            .unwrap();
+        chat_response(
+            &json!({
+                "proposals": [
+                    {
+                        "target": {
+                            "symbol_id": candidate["symbol_id"],
+                            "occurrence_id": candidate["occurrence_id"]
+                        },
+                        "category": "identifier",
+                        "original_text": "megacorp_client",
+                        "sanitized_text": "examplefirm_client",
+                        "confidence": 0.95
+                    },
+                    {
+                        "category": "identifier",
+                        "original_text": "COMMENT_ONLY_TRIGGER",
+                        "sanitized_text": "documentation_note",
+                        "confidence": 0.95
+                    },
+                    {
+                        "category": "identifier",
+                        "original_text": "ghost_term",
+                        "sanitized_text": "nothing",
+                        "confidence": 0.9
+                    }
+                ]
+            })
+            .to_string(),
+        )
     }));
 
     let layout = Layout::new(repo.path());
@@ -227,12 +279,19 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
 
     let items = code_sanity::proposal::list_review(repo.path(), false).unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].proposal.original_text, "megacorp");
+    assert_eq!(items[0].proposal.original_text, "megacorp_client");
     code_sanity::proposal::resolve_review(repo.path(), &items[0].id, true).unwrap();
 
+    let conn = code_sanity::db::connect(&layout).unwrap();
+    let projected =
+        code_sanity::semantic_store::project_document(&conn, repo.path(), "src/lib.rs").unwrap();
+    assert!(projected.content.contains("examplefirm_client"));
+    assert!(!projected.content.contains("megacorp_client"));
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror.contains("examplefirm_client"));
-    assert!(!mirror.contains("megacorp"));
+    assert!(
+        mirror.contains("megacorp_client"),
+        "v1 mirror remains compatible"
+    );
     assert!(code_sanity::verify_workspace(repo.path()).is_ok());
 }
 
@@ -286,13 +345,10 @@ fn openrouter_preset_routes_through_the_same_gate_and_client() {
 
     let chat_requests = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&chat_requests);
-    let base_url = spawn_mock_server(Arc::new(move |path: &str, _request: &Value| {
+    let base_url = spawn_mock_server(Arc::new(move |path: &str, request: &Value| {
         assert!(path.ends_with("/chat/completions"));
         counter.fetch_add(1, Ordering::SeqCst);
-        chat_response(
-            "{\"proposals\":[{\"category\":\"identifier\",\"original_text\":\"megacorp\",\
-             \"sanitized_text\":\"examplefirm\",\"confidence\":0.95}]}",
-        )
+        targeted_chat_response(request, &[("megacorp_helper", "examplefirm_helper", 0.95)])
     }));
 
     let layout = Layout::new(repo.path());
@@ -572,14 +628,13 @@ fn provider_error_on_one_file_does_not_abort_the_run() {
         let user = request["messages"][1]["content"].as_str().unwrap_or("");
         if user.contains("bad.rs") {
             (400, json!({ "error": "context overflow" }))
-        } else {
+        } else if user.contains("good.rs") {
             (
                 200,
-                chat_response(
-                    "{\"proposals\":[{\"category\":\"identifier\",\"original_text\":\"megacorp\",\
-                     \"sanitized_text\":\"examplefirm\",\"confidence\":0.95}]}",
-                ),
+                targeted_chat_response(request, &[("megacorp_b", "examplefirm_b", 0.95)]),
             )
+        } else {
+            (200, chat_response("{\"proposals\":[]}"))
         }
     }));
     let layout = Layout::new(repo.path());
@@ -690,9 +745,12 @@ fn proposal_provider_runs_with_bounded_concurrency_and_reports_progress() {
 #[test]
 fn one_large_file_is_chunked_parallel_and_overlap_findings_are_deduplicated() {
     let repo = tempfile::tempdir().unwrap();
-    let content = (0..40)
-        .map(|index| format!("fn helper_{index}() {{ let hwid_{index} = {index}; }}\n"))
-        .collect::<String>();
+    let content = format!(
+        "fn hwid() {{}}\n{}",
+        (0..40)
+            .map(|index| format!("fn helper_{index}() {{ hwid(); }}\n"))
+            .collect::<String>()
+    );
     std::fs::write(repo.path().join("large.rs"), content).unwrap();
     index_workspace(repo.path()).unwrap();
 
@@ -712,11 +770,12 @@ fn one_large_file_is_chunked_parallel_and_overlap_findings_are_deduplicated() {
             serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert!(user["file"]["chunk"]["total"].as_u64().unwrap() > 1);
         assert!(user["file"]["content"].as_str().unwrap().contains("hwid"));
-        let already_seen = user["context"]["already_proposed_originals"]
+        let already_seen = user["context"]["already_decided_symbol_ids"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item.as_str() == Some("hwid"));
+            .next()
+            .is_some();
         if already_seen {
             seen_for_handler.fetch_add(1, Ordering::SeqCst);
         }
@@ -725,10 +784,7 @@ fn one_large_file_is_chunked_parallel_and_overlap_findings_are_deduplicated() {
         if already_seen {
             chat_response("{\"proposals\":[]}")
         } else {
-            chat_response(
-                "{\"proposals\":[{\"category\":\"identifier\",\"original_text\":\"hwid\",\
-                 \"sanitized_text\":\"device_ref\",\"confidence\":0.9}]}",
-            )
+            targeted_chat_response(request, &[("hwid", "device_ref", 0.9)])
         }
     }));
 
@@ -841,18 +897,16 @@ fn repeated_provider_scan_deduplicates_pending_review_items() {
     let base_url = spawn_mock_server(Arc::new(|_path: &str, request: &Value| {
         let user: Value =
             serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
-        let already_seen = user["context"]["already_proposed_originals"]
+        let already_seen = user["context"]["already_decided_symbol_ids"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item.as_str() == Some("megacorp"));
+            .next()
+            .is_some();
         if already_seen {
             chat_response("{\"proposals\":[]}")
         } else {
-            chat_response(
-                "{\"proposals\":[{\"category\":\"identifier\",\"original_text\":\"megacorp\",\
-                 \"sanitized_text\":\"examplefirm\",\"confidence\":0.95}]}",
-            )
+            targeted_chat_response(request, &[("megacorp_helper", "examplefirm_helper", 0.95)])
         }
     }));
     let layout = Layout::new(repo.path());
@@ -902,11 +956,12 @@ fn security_adjacent_terms_can_be_proposed_for_review() {
         assert!(user.contains("launcher"));
         assert!(user.contains("public third-party companies"));
         assert!(user.contains("indexed_external_identifiers"));
-        chat_response(
-            "{\"proposals\":[\
-             {\"category\":\"identifier\",\"original_text\":\"hwid\",\"sanitized_text\":\"device_ref\",\"confidence\":0.9},\
-             {\"category\":\"identifier\",\"original_text\":\"launcher\",\"sanitized_text\":\"starter\",\"confidence\":0.85}\
-             ]}",
+        targeted_chat_response(
+            request,
+            &[
+                ("collect_hwid", "collect_device_ref", 0.9),
+                ("launcher", "starter", 0.85),
+            ],
         )
     }));
     let layout = Layout::new(repo.path());

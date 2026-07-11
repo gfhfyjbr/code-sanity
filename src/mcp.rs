@@ -26,6 +26,27 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025
 /// that never sends a newline cannot grow the buffer without bound.
 const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
+struct ToolOutput {
+    text: String,
+    structured: Option<Value>,
+}
+
+impl ToolOutput {
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            structured: None,
+        }
+    }
+
+    fn structured(value: Value) -> Result<Self> {
+        Ok(Self {
+            text: serde_json::to_string_pretty(&value).context("serialize tool output")?,
+            structured: Some(value),
+        })
+    }
+}
+
 /// Serve MCP over the process stdio, blocking until stdin reaches EOF.
 pub fn serve_stdio(root: &Path) -> Result<()> {
     let stdin = io::stdin();
@@ -175,10 +196,16 @@ fn handle_message(root: &Path, raw: &str) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             let result = match call_tool(root, name, &args) {
-                Ok(text) => json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "isError": false,
-                }),
+                Ok(output) => {
+                    let mut result = json!({
+                        "content": [{ "type": "text", "text": output.text }],
+                        "isError": false,
+                    });
+                    if let Some(structured) = output.structured {
+                        result["structuredContent"] = structured;
+                    }
+                    result
+                }
                 Err(err) => json!({
                     "content": [{ "type": "text", "text": redact_error(root, &format!("error: {err:#}")) }],
                     "isError": true,
@@ -237,12 +264,133 @@ fn initialize_result(message: &Value) -> Value {
         "protocolVersion": requested,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "code-sanity", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": "Sanitized mirror tools. read_file/search/list_files return sanitized content only; apply_patch projects a sanitized patch back onto the real repo through the bridge.",
+        "instructions": "Use workspace_snapshot, find_code, and read_code for AST/symbol context. Mutate only through edit_node/rename_symbol or preview_transaction followed by commit_transaction with expected_revision. Legacy mirror tools remain available for v1 clients.",
     })
 }
 
 fn tools_manifest() -> Value {
     json!([
+        {
+            "name": "workspace_snapshot",
+            "description": "Return the semantic workspace revision and index counts used for optimistic concurrency.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "find_code",
+            "description": "Find indexed symbols by name or qualified name. Returns stable symbol_id/node_id values.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "read_code",
+            "description": "Read a semantic projection with stable symbols, occurrences, capabilities, and revision.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "references",
+            "description": "List occurrences bound to one stable symbol_id; unresolved text matches are never included.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "symbol_id": { "type": "string" } },
+                "required": ["symbol_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "edit_node",
+            "description": "Preview one AST-node edit. Declaration-containing nodes are rejected; use rename_symbol.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string" },
+                    "replacement": { "type": "string" },
+                    "expected_revision": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["node_id", "replacement", "expected_revision"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "rename_symbol",
+            "description": "Preview a compiler/LSP-backed semantic rename for one symbol_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbol_id": { "type": "string" },
+                    "new_name": { "type": "string" },
+                    "expected_revision": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["symbol_id", "new_name", "expected_revision"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "preview_transaction",
+            "description": "Validate and persist a multi-intent AST/LSP transaction without writing source files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "expected_revision": { "type": "integer", "minimum": 0 },
+                    "intents": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "const": "edit_node" },
+                                        "node_id": { "type": "string" },
+                                        "replacement": { "type": "string" }
+                                    },
+                                    "required": ["kind", "node_id", "replacement"],
+                                    "additionalProperties": false
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "const": "rename_symbol" },
+                                        "symbol_id": { "type": "string" },
+                                        "new_name": { "type": "string" }
+                                    },
+                                    "required": ["kind", "symbol_id", "new_name"],
+                                    "additionalProperties": false
+                                }
+                            ]
+                        }
+                    }
+                },
+                "required": ["expected_revision", "intents"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "commit_transaction",
+            "description": "Atomically commit a previously previewed transaction using revision CAS and crash-safe rollback.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "transaction_id": { "type": "string" },
+                    "expected_revision": { "type": "integer", "minimum": 0 },
+                    "agent": { "type": "string" },
+                    "session_id": { "type": "string" }
+                },
+                "required": ["transaction_id", "expected_revision"],
+                "additionalProperties": false
+            }
+        },
         {
             "name": "read_file",
             "description": "Read a file from the sanitized mirror. Returns sanitized content only.",
@@ -321,11 +469,14 @@ fn tools_manifest() -> Value {
     ])
 }
 
-fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
+fn call_tool(root: &Path, name: &str, args: &Value) -> Result<ToolOutput> {
     match name {
         "read_file" => {
             let path = required_str(args, "path")?;
-            read_sanitized_file(root, Path::new(&path))
+            Ok(ToolOutput::text(read_sanitized_file(
+                root,
+                Path::new(&path),
+            )?))
         }
         "search" => {
             let query = required_str(args, "query")?;
@@ -352,11 +503,13 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
                     hits.len()
                 ));
             }
-            Ok(out)
+            Ok(ToolOutput::text(out))
         }
         "list_files" => {
             let glob = optional_str(args, "glob");
-            Ok(list_mirror_files(root, glob.as_deref())?.join("\n"))
+            Ok(ToolOutput::text(
+                list_mirror_files(root, glob.as_deref())?.join("\n"),
+            ))
         }
         "semantic_search" => {
             let query = required_str(args, "query")?;
@@ -366,16 +519,17 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
                 .map(|value| (value as usize).clamp(1, 100))
                 .unwrap_or(10);
             let hits = crate::embed::semantic_search(root, &query, k)?;
-            Ok(hits
-                .iter()
-                .map(|hit| {
-                    format!(
-                        "{}:{}-{}\t{:.3}\t{}",
-                        hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"))
+            Ok(ToolOutput::text(
+                hits.iter()
+                    .map(|hit| {
+                        format!(
+                            "{}:{}-{}\t{:.3}\t{}",
+                            hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ))
         }
         "apply_patch" => {
             let patch = required_str(args, "patch")?;
@@ -395,23 +549,159 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<String> {
                 // Workspace-relative: the absolute root path (directory names
                 // the dictionary redactor cannot know about) must never reach
                 // the agent, success or not.
-                Some(journal) => Ok(format!(
+                Some(journal) => Ok(ToolOutput::text(format!(
                     "applied files={} journal={}",
                     report.files.join(","),
                     relative_journal(root, journal)
-                )),
-                None => Ok(format!(
+                ))),
+                None => Ok(ToolOutput::text(format!(
                     "dry-run ok: would apply files={} (no changes written)",
                     report.files.join(",")
-                )),
+                ))),
             }
+        }
+        "workspace_snapshot" => with_semantic_read(root, |conn| {
+            ToolOutput::structured(serde_json::to_value(crate::semantic_store::snapshot(
+                conn,
+            )?)?)
+        }),
+        "find_code" => {
+            let query = required_str(args, "query")?;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+            with_semantic_read(root, |conn| {
+                let symbols = crate::semantic_store::find_symbols(conn, &query, limit)?;
+                ToolOutput::structured(json!({
+                    "revision": crate::semantic_store::current_revision(conn)?,
+                    "symbols": symbols.into_iter().map(|(path, symbol)| json!({
+                        "path": path,
+                        "symbol": symbol,
+                    })).collect::<Vec<_>>()
+                }))
+            })
+        }
+        "read_code" => {
+            let path = required_str(args, "path")?;
+            with_semantic_read(root, |conn| {
+                let projected = crate::semantic_store::project_document(conn, root, &path)?;
+                ToolOutput::structured(serde_json::to_value(projected)?)
+            })
+        }
+        "references" => {
+            let symbol_id = required_str(args, "symbol_id")?;
+            semantic_references(root, &symbol_id)
+        }
+        "edit_node" => {
+            let node_id = required_str(args, "node_id")?;
+            let replacement = required_str(args, "replacement")?;
+            let expected_revision = required_u64(args, "expected_revision")?;
+            let preview = crate::transaction::preview_transaction(
+                root,
+                expected_revision,
+                vec![crate::transaction::EditIntent::EditNode {
+                    node_id,
+                    replacement,
+                }],
+            )?;
+            ToolOutput::structured(serde_json::to_value(preview)?)
+        }
+        "rename_symbol" => {
+            let symbol_id = required_str(args, "symbol_id")?;
+            let new_name = required_str(args, "new_name")?;
+            let expected_revision = required_u64(args, "expected_revision")?;
+            let preview = crate::transaction::preview_transaction(
+                root,
+                expected_revision,
+                vec![crate::transaction::EditIntent::RenameSymbol {
+                    symbol_id,
+                    new_name,
+                }],
+            )?;
+            ToolOutput::structured(serde_json::to_value(preview)?)
+        }
+        "preview_transaction" => {
+            let expected_revision = required_u64(args, "expected_revision")?;
+            let intents = serde_json::from_value::<Vec<crate::transaction::EditIntent>>(
+                args.get("intents")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing intents"))?,
+            )
+            .context("parse structured edit intents")?;
+            let preview =
+                crate::transaction::preview_transaction(root, expected_revision, intents)?;
+            ToolOutput::structured(serde_json::to_value(preview)?)
+        }
+        "commit_transaction" => {
+            let transaction_id = required_str(args, "transaction_id")?;
+            let expected_revision = required_u64(args, "expected_revision")?;
+            let report = crate::transaction::commit_transaction(
+                root,
+                &transaction_id,
+                expected_revision,
+                optional_str(args, "agent"),
+                optional_str(args, "session_id"),
+            )?;
+            ToolOutput::structured(serde_json::to_value(report)?)
         }
         "verify" => {
             let report = verify_workspace(root)?;
-            Ok(format!("verified tracked_files={}", report.checked))
+            Ok(ToolOutput::text(format!(
+                "verified tracked_files={}",
+                report.checked
+            )))
         }
         other => bail!("unknown tool: {other}"),
     }
+}
+
+fn with_semantic_read(
+    root: &Path,
+    operation: impl FnOnce(&rusqlite::Connection) -> Result<ToolOutput>,
+) -> Result<ToolOutput> {
+    let layout = crate::config::Layout::new(root);
+    layout.require_initialized()?;
+    let _lock = crate::lock::WorkspaceLock::acquire_shared(&layout)?;
+    let conn = crate::db::connect(&layout)?;
+    crate::db::check_schema(&conn)?;
+    operation(&conn)
+}
+
+fn semantic_references(root: &Path, symbol_id: &str) -> Result<ToolOutput> {
+    let layout = crate::config::Layout::new(root);
+    layout.require_initialized()?;
+    let (revision, rel_path, symbol, document, source) = {
+        let _lock = crate::lock::WorkspaceLock::acquire_shared(&layout)?;
+        let conn = crate::db::connect(&layout)?;
+        crate::db::check_schema(&conn)?;
+        let revision = crate::semantic_store::current_revision(&conn)?;
+        let (rel_path, symbol) = crate::semantic_store::load_symbol_with_path(&conn, symbol_id)?
+            .ok_or_else(|| anyhow::anyhow!("unknown symbol_id {symbol_id}"))?;
+        let document = crate::semantic_store::load_document(&conn, &rel_path)?
+            .ok_or_else(|| anyhow::anyhow!("semantic document disappeared for {symbol_id}"))?;
+        if !document.capabilities.references {
+            bail!("compiler/LSP references are unavailable for {rel_path}");
+        }
+        let rel = crate::config::normalize_safe_rel_path(Path::new(&rel_path), "symbol path")?;
+        let source = std::fs::read_to_string(root.join(rel))?;
+        if crate::map::sha256_hex(source.as_bytes()) != document.content_hash {
+            bail!("{rel_path} changed since semantic index; run code-sanity index");
+        }
+        (revision, rel_path, symbol, document, source)
+    };
+    let rel = crate::config::normalize_safe_rel_path(Path::new(&rel_path), "symbol path")?;
+    let locations = crate::lsp::references(root, &rel, &source, document.language, &symbol.range)?;
+    {
+        let _lock = crate::lock::WorkspaceLock::acquire_shared(&layout)?;
+        let conn = crate::db::connect(&layout)?;
+        let current = crate::semantic_store::current_revision(&conn)?;
+        if current != revision {
+            bail!("stale semantic revision: expected {revision}, current {current}");
+        }
+    }
+    ToolOutput::structured(json!({
+        "revision": revision,
+        "symbol_id": symbol_id,
+        "locations": locations,
+    }))
 }
 
 /// Render a journal path workspace-relative for agent-facing output; fail
@@ -437,6 +727,12 @@ fn required_str(args: &Value, key: &str) -> Result<String> {
 
 fn optional_str(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
+}
+
+fn required_u64(args: &Value, key: &str) -> Result<u64> {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("missing required non-negative integer argument: {key}"))
 }
 
 fn result_response(id: Value, result: Value) -> Value {
@@ -486,6 +782,14 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "workspace_snapshot",
+                "find_code",
+                "read_code",
+                "references",
+                "edit_node",
+                "rename_symbol",
+                "preview_transaction",
+                "commit_transaction",
                 "read_file",
                 "search",
                 "list_files",
@@ -493,6 +797,84 @@ mod tests {
                 "apply_patch",
                 "verify"
             ]
+        );
+    }
+
+    #[test]
+    fn semantic_v2_tools_preview_and_commit_structured_edit() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "fn value() -> u32 {\n    1\n}\n",
+        )
+        .unwrap();
+        crate::index_workspace(repo.path()).unwrap();
+
+        let snapshot_request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "workspace_snapshot", "arguments": {} }
+        }))
+        .unwrap();
+        let read_request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "read_code", "arguments": { "path": "src/lib.rs" } }
+        }))
+        .unwrap();
+        let responses = call(repo.path(), &[&snapshot_request, &read_request]);
+        let revision = responses[0]["result"]["structuredContent"]["revision"]
+            .as_u64()
+            .unwrap();
+        let node_id = responses[1]["result"]["structuredContent"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["kind"] == "integer_literal")
+            .unwrap()["node_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let preview_request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "edit_node",
+                "arguments": {
+                    "node_id": node_id,
+                    "replacement": "2",
+                    "expected_revision": revision
+                }
+            }
+        }))
+        .unwrap();
+        let preview = call(repo.path(), &[&preview_request]);
+        let transaction_id = preview[0]["result"]["structuredContent"]["transaction_id"]
+            .as_str()
+            .unwrap();
+        let commit_request = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "commit_transaction",
+                "arguments": {
+                    "transaction_id": transaction_id,
+                    "expected_revision": revision
+                }
+            }
+        }))
+        .unwrap();
+        let committed = call(repo.path(), &[&commit_request]);
+        assert_eq!(committed[0]["result"]["isError"], false);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
+            "fn value() -> u32 {\n    2\n}\n"
         );
     }
 

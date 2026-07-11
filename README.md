@@ -353,6 +353,13 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `sync [--path <rel>] [--force]`
 - `embed-index`
 - `semantic-search <query> [--k <n>]`
+- `workspace-snapshot`
+- `find-code <query> [--limit <n>]`
+- `read-code <path>`
+- `edit-node --node-id <id> --replacement <text> --expected-revision <n>`
+- `rename-symbol --symbol-id <id> --new-name <name> --expected-revision <n>`
+- `preview-transaction --expected-revision <n> [--intents <json-file>]`
+- `commit-transaction <id> --expected-revision <n> [--agent <name>] [--session-id <id>]`
 - `verify`
 - `doctor [--agent codex|claude|opencode]`
 - `install-hooks --agent codex|claude|opencode [--force]`
@@ -365,7 +372,7 @@ Search results are capped (default 200, hard max 1000) with an explicit truncati
 
 ## MCP Server
 
-`code-sanity serve` runs a Model Context Protocol server over stdio with tools `read_file`, `search`, `list_files`, `semantic_search`, `apply_patch`, and `verify`. Reads and search return sanitized content only; `apply_patch` projects a sanitized diff back onto the real repo through the bridge. Inspect the manifest with `code-sanity serve --once`. See [docs/MCP.md](docs/MCP.md) for Codex, Claude Code, and opencode connection config.
+`code-sanity serve` runs a Model Context Protocol server over stdio. The preferred v2 surface is `workspace_snapshot`, `find_code`, `read_code`, `references`, `edit_node`, `rename_symbol`, `preview_transaction`, `commit_transaction`, and `verify`. These tools use stable AST/symbol IDs, compiler/LSP rename, and revision-checked transactions. Legacy mirror tools remain available for compatibility. Inspect the manifest with `code-sanity serve --once`; see [docs/MCP.md](docs/MCP.md) and [docs/SEMANTIC_V2.md](docs/SEMANTIC_V2.md).
 
 ## Agent Adapters
 
@@ -419,6 +426,7 @@ These are guardrails, not a hard sandbox: absolute paths, network, or escaping t
 ## Docs
 
 - [docs/MCP.md](docs/MCP.md) — connect Codex, Claude Code, and opencode to the MCP server.
+- [docs/SEMANTIC_V2.md](docs/SEMANTIC_V2.md) — AST identities, language capabilities, proposal schema, and transaction protocol.
 - [docs/HOOKS_MATRIX.md](docs/HOOKS_MATRIX.md) — per-adapter capability matrix and why hooks are guardrails.
 - [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) — assets, enforcement tiers, known bypasses, and guarantees.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — prioritized tasks to production readiness (release engineering, hardening, performance backlog).
@@ -443,11 +451,12 @@ printed one per line and the process exits with code `3`.
 
 ## Known Limitations
 
-- Tokenization is regex/byte-scanner based, not AST-aware.
+- Legacy v1 mirror commands still use the regex/byte scanner. V2 `read-code` and structured edit tools are AST-aware and import only exact bound identifier replacements.
 - Multi-file apply is journaled (fsync'd) before writes, serialized by `flock`, and recoverable via `recover`, but it is not a substitute for transactional filesystem commits.
 - Patch back-projection is span-aware for known replacement spans and reverse-maps aliases in added lines, but hunk coordinate remapping is line-oriented and edits *inside* an alias still conflict; use `rename` to change a symbol behind an alias.
-- `rename` is single-file scoped; it does not chase references across files.
+- Legacy `rename` is single-file scoped. V2 `rename-symbol` uses `rust-analyzer` or `clangd` and rejects edits outside the workspace.
 - Protected-identifier detection (public API, imports) is conservative lexical heuristics, not a language-aware symbol graph; matching is ASCII-oriented (non-ASCII terms are not matched).
+- Rust and C/C++/Objective-C family have Tree-sitter structure plus compiler/LSP references and rename when the server is installed. JS/TS, Python, and Go have Tree-sitter AST edits but no semantic rename; unknown languages are read-only. No text-edit fallback is attempted.
 - Term matching is deliberately aggressive (case- and underscore-insensitive substrings inside word runs), so a term embedded in an unrelated word is also replaced; keep the allowlist current.
 - `.gitignore` support is delegated to the `ignore` crate (full gitignore language, `require_git(false)`); the walker does not follow parent-directory or global gitignores, for determinism.
 - The opencode plugin, MCP server, and Codex/Claude hooks are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
