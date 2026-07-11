@@ -777,6 +777,19 @@ fn gitignore_full_syntax_is_respected() {
 }
 
 #[test]
+fn dotenv_secrets_are_ignored_even_before_gitignore_exists() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join(".env"), "BYESU_API_KEY=secret-value\n").unwrap();
+    fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+    index_workspace(repo.path()).unwrap();
+
+    assert!(!repo.path().join(".code-sanity/mirror/.env").exists());
+    let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|line| line.trim() == ".env"));
+}
+
+#[test]
 fn opencode_install_generates_working_plugin() {
     let repo = copy_fixture("basic-rust");
     Command::cargo_bin("code-sanity")

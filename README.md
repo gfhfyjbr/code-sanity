@@ -50,6 +50,11 @@ cargo install --git https://github.com/gfhfyjbr/code-sanity --locked
 cargo install --path . --locked
 ```
 
+Provider keys can be exported normally or placed in `<workspace>/.env`, for
+example `OPENROUTER_API_KEY=...`. Existing process environment variables take
+precedence over the file. The exact `.env` file is added to `.gitignore` by
+`code-sanity init` and is always excluded from indexing and provider payloads.
+
 Linux and macOS only — workspace locking is `flock`-based and the build refuses
 other platforms.
 

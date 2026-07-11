@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The CLI loads provider credentials from the selected workspace's `.env`
+  without overriding exported variables. Dotenv files are added to
+  `.gitignore` and excluded from the sanitized index and model payloads.
+
 ## [0.4.4] - 2026-07-11
 
 ### Added
