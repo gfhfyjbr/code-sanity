@@ -1,10 +1,9 @@
-use super::components::{ButtonHit, contains};
+use super::components::ButtonHit;
 use crate::config::{Config, Layout, Mode, ProviderConfig};
 use crate::proposal::{ProposeProgress, ProviderAllow, ReviewItem, ReviewStatus};
 use anyhow::{Result, anyhow};
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -136,6 +135,7 @@ pub struct SourceLine {
 #[derive(Debug, Clone, Copy)]
 pub enum HitAction {
     Tab(Tab),
+    Review(usize),
     CommandFocus,
     Toolbar(ToolbarAction),
     Confirm,
@@ -174,7 +174,6 @@ pub struct App {
     pub tick: usize,
     pub mouse: (u16, u16),
     pub hits: Vec<ButtonHit<HitAction>>,
-    pub review_area: Option<Rect>,
     tx: Sender<WorkerEvent>,
     rx: Receiver<WorkerEvent>,
 }
@@ -205,7 +204,6 @@ impl App {
             tick: 0,
             mouse: (0, 0),
             hits: Vec::new(),
-            review_area: None,
             tx,
             rx,
         };
@@ -363,16 +361,6 @@ impl App {
                     .find_map(|hit| hit.action_at(mouse.column, mouse.row))
                 {
                     self.handle_hit(action);
-                    return;
-                }
-                if let Some(area) = self.review_area
-                    && contains(area, mouse.column, mouse.row)
-                {
-                    let row = mouse.row.saturating_sub(area.y) as usize;
-                    let selected = self.list_offset + row;
-                    if selected < self.filtered.len() {
-                        self.selected = selected;
-                    }
                 }
             }
             MouseEventKind::ScrollDown => self.select_next(),
@@ -384,6 +372,8 @@ impl App {
     fn handle_hit(&mut self, action: HitAction) {
         match action {
             HitAction::Tab(tab) => self.tab = tab,
+            HitAction::Review(index) if index < self.filtered.len() => self.selected = index,
+            HitAction::Review(_) => {}
             HitAction::CommandFocus => self.focus_command(""),
             HitAction::Toolbar(action) => match action {
                 ToolbarAction::Index => self.request_action(Action::Index),
@@ -868,6 +858,7 @@ pub fn is_pending(item: &ReviewItem) -> bool {
 mod tests {
     use super::*;
     use crate::proposal::Proposal;
+    use ratatui::layout::Rect;
 
     #[test]
     fn source_context_centers_the_matching_line() {
@@ -908,6 +899,26 @@ mod tests {
         assert!(hit.action_at(2, 3).is_some());
         assert!(hit.action_at(5, 4).is_some());
         assert!(hit.action_at(6, 4).is_none());
+    }
+
+    #[test]
+    fn mouse_selects_review_row_hit_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(temp.path());
+        app.filtered = vec![0, 1, 2];
+        app.hits.push(ButtonHit {
+            area: Rect::new(10, 7, 40, 2),
+            action: HitAction::Review(1),
+        });
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.selected, 1);
     }
 
     #[test]

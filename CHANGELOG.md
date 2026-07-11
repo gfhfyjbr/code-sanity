@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- TUI review rows now use the available panel width and move long renames onto
+  complete multi-line rows instead of truncating both identifiers to 18
+  characters. Mouse selection accounts for the adaptive row height.
+
 ## [0.4.1] - 2026-07-11
 
 ### Fixed
