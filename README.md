@@ -10,22 +10,38 @@ Sanitization is deterministic and local (dictionary + human-approved alias regis
 
 The installer detects macOS/Linux and x86_64/aarch64, downloads the matching
 binary from the latest GitHub Release, verifies its SHA-256 checksum, and places
-it in `${CARGO_HOME:-$HOME/.cargo}/bin` without `sudo` or a Rust toolchain:
+it in `${CARGO_HOME:-$HOME/.cargo}/bin` without `sudo` or a Rust toolchain. If
+zsh is available, it also generates `_code-sanity` from the installed binary,
+places it in `${ZDOTDIR:-$HOME}/.zfunc`, and idempotently adds that directory to
+`fpath` in `.zshrc`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.sh | bash
 
 # Pin a release or customize installation:
 curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.sh | \
-  bash -s -- --version v0.4.4 --bin-dir "$HOME/.local/bin" --add-to-path
+  bash -s -- --version v0.4.6 --bin-dir "$HOME/.local/bin" --add-to-path
 ```
 
 Download and inspect `install.sh` first if piping a remote script is outside
 your trust policy. From a checkout, `./install.sh --from-source` performs the
 old optimized Cargo build; `--no-build` installs an existing
-`target/release/code-sanity`. Run `./install.sh --help` for uninstall and
-environment overrides. Installation is atomic and verifies both the release
-archive and installed binary before returning success.
+`target/release/code-sanity`. Use `--zsh-completions-dir <dir>` to select a
+completion directory or `--no-zsh-completions` to leave shell configuration
+untouched. Uninstall removes both the generated completion and the installer's
+managed `.zshrc` block. Run `./install.sh --help` for all environment overrides.
+Installation is atomic and verifies both the release archive and installed
+binary before returning success.
+
+The same completion can be generated without the installer:
+
+```bash
+mkdir -p ~/.zfunc
+code-sanity completions zsh > ~/.zfunc/_code-sanity
+```
+
+For a manual setup, ensure `~/.zfunc` is added to `fpath` before `compinit` is
+called. The installer manages that ordering and registration automatically.
 
 Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 [GitHub Release](https://github.com/gfhfyjbr/code-sanity/releases):
@@ -33,7 +49,7 @@ Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 ```bash
 # pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
 #                     x86_64-apple-darwin, aarch64-apple-darwin
-version=v0.4.4
+version=v0.4.6
 target=aarch64-apple-darwin
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz"
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz.sha256"
@@ -369,6 +385,7 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `doctor [--agent codex|claude|opencode]`
 - `install-hooks --agent codex|claude|opencode [--force]`
 - `uninstall-hooks --agent codex|claude|opencode`
+- `completions zsh`
 - `serve [--once]`
 
 Search results are capped (default 200, hard max 1000) with an explicit truncation notice.

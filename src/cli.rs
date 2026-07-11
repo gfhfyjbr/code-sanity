@@ -6,7 +6,8 @@ use crate::patch::{
 use crate::search::read_sanitized_file;
 use crate::verify::verify_workspace;
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, shells::Zsh};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -26,7 +27,8 @@ pub struct Cli {
     verbose: u8,
 
     /// Emit exactly one machine-readable JSON object on stdout (stderr and
-    /// exit codes are unchanged). Not supported for sh/strict-run/serve.
+    /// exit codes are unchanged). Not supported for
+    /// sh/strict-run/completions/serve.
     #[arg(long, global = true)]
     json: bool,
 
@@ -67,6 +69,7 @@ fn command_name(command: Option<&Command>) -> &'static str {
         Some(Command::Doctor { .. }) => "doctor",
         Some(Command::InstallHooks { .. }) => "install-hooks",
         Some(Command::UninstallHooks { .. }) => "uninstall-hooks",
+        Some(Command::Completions { .. }) => "completions",
         Some(Command::Serve { .. }) => "serve",
     }
 }
@@ -284,6 +287,11 @@ enum Command {
         #[arg(long)]
         agent: Agent,
     },
+    /// Generate shell completion definitions on stdout.
+    Completions {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
     /// Run the MCP server over stdio.
     Serve {
         /// Print the tool manifest and exit (wiring check).
@@ -297,6 +305,23 @@ enum Agent {
     Codex,
     Claude,
     Opencode,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CompletionShell {
+    Zsh,
+}
+
+fn write_completions(shell: CompletionShell) -> Result<()> {
+    let mut command = Cli::command();
+    let name = command.get_name().to_string();
+    let mut output = Vec::new();
+    match shell {
+        CompletionShell::Zsh => generate(Zsh, &mut command, name, &mut output),
+    }
+    io::stdout()
+        .write_all(&output)
+        .context("write shell completions")
 }
 
 pub fn run() -> Result<()> {
@@ -315,6 +340,16 @@ pub fn run() -> Result<()> {
             std::process::exit(code);
         }
     };
+    // Completion generation is workspace-independent. Keep it ahead of root
+    // canonicalization, dotenv loading, and logging so installers can invoke
+    // it reliably from any directory.
+    if let Some(Command::Completions { shell }) = cli.command.as_ref() {
+        if cli.json {
+            eprintln!("--json is not supported for completions: stdout is the shell script");
+            std::process::exit(64);
+        }
+        return write_completions(*shell);
+    }
     let out = if cli.json {
         crate::output::Output::Json
     } else {
@@ -1450,6 +1485,7 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
         Command::UninstallHooks { agent } => {
             uninstall_hooks(&root, agent, out)?;
         }
+        Command::Completions { .. } => unreachable!("completions are handled before dispatch"),
         Command::Serve { once } => {
             if once {
                 // Inspection mode: print the tool manifest and exit without

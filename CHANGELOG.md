@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `code-sanity completions zsh` generates completion definitions directly
+  from the Clap command tree without reading workspace state or `.env`.
+- `install.sh` installs and configures zsh completions idempotently, supports a
+  custom completion directory and opt-out, and removes its completion state on
+  uninstall.
+
 ## [0.4.6] - 2026-07-12
 
 ### Added
