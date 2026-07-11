@@ -1,5 +1,6 @@
 /target
 .code-sanity/
+.env
 fuzz/target/
 fuzz/artifacts/
 .DS_Store

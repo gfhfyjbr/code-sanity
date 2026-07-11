@@ -357,6 +357,12 @@ pub fn run() -> Result<()> {
         }
         Err(_) => raw_root,
     };
+    if let Err(err) = crate::envfile::load_workspace_env(&root) {
+        if out.is_json() {
+            crate::output::emit_error(name, "error", &format!("{err:#}"), serde_json::json!({}));
+        }
+        return Err(err);
+    }
     // The stdio MCP server logs file-only: hosts capture server stderr into
     // their own logs, and warn/error lines can carry unredacted real terms.
     let stderr_logging = !matches!(cli.command, Some(Command::Serve { once: false }));

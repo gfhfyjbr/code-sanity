@@ -94,6 +94,7 @@ pub(crate) fn init_workspace_locked(root: &Path) -> Result<(Layout, WorkspaceLoc
         config.save(&layout)?;
     }
     ensure_gitignore_entry(root, ".code-sanity/")?;
+    ensure_gitignore_entry(root, ".env")?;
     let conn = db::connect(&layout)?;
     db::ensure_schema(&conn)?;
     Ok((layout, lock))
@@ -854,6 +855,12 @@ fn should_skip_file(
     let Some(file_name) = rel.file_name().and_then(|name| name.to_str()) else {
         return Ok(true);
     };
+    // Workspace-local dotenv may contain provider credentials. It is loaded
+    // before dispatch and must never enter the mirror or a model payload even
+    // when the repository's existing ignore rules forgot it.
+    if file_name == ".env" {
+        return Ok(true);
+    }
     if config.ignore.lockfiles.iter().any(|lock| lock == file_name) {
         return Ok(true);
     }

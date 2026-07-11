@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod embed;
+pub(crate) mod envfile;
 pub mod fsutil;
 pub mod index;
 pub mod journal;
