@@ -44,6 +44,10 @@ pub struct IndexReport {
     /// Symlinked entries encountered; never followed (following could escape
     /// the repo boundary), never indexed.
     pub skipped_symlinks: usize,
+    /// Versioned AST/semantic index refreshed from the same real-file
+    /// snapshot. Unsupported languages are recorded as explicit read-only
+    /// documents instead of being rewritten lexically.
+    pub semantic: crate::semantic_store::SemanticIndexReport,
 }
 
 fn serialize_path_reason_pairs<S: serde::Serializer>(
@@ -207,21 +211,21 @@ fn index_workspace_locked_inner(
         let mtime = mtime_ns(&metadata);
         let size = metadata.len() as i64;
 
-        if let Some(state) = states.get(&rel_string)
-            && fast_path_matches(state, mtime, size)
-        {
-            candidates.push(Candidate {
-                rel,
-                rel_string,
-                mtime_ns: mtime,
-                size,
-                content: None,
-                sha: None,
-                protected: state.protected(),
-                external: state.external(),
-                fast: true,
-            });
-            continue;
+        if let Some(state) = states.get(&rel_string) {
+            if fast_path_matches(state, mtime, size) {
+                candidates.push(Candidate {
+                    rel,
+                    rel_string,
+                    mtime_ns: mtime,
+                    size,
+                    content: None,
+                    sha: None,
+                    protected: state.protected(),
+                    external: state.external(),
+                    fast: true,
+                });
+                continue;
+            }
         }
 
         // Invalid UTF-8 past the 8 KiB binary probe (or a permission flip
@@ -271,13 +275,14 @@ fn index_workspace_locked_inner(
         seen.insert(candidate.rel_string.clone());
         let state = states.get(&candidate.rel_string);
 
-        if !force_mirror
-            && candidate.fast
-            && let Some(state) = state
-            && state.logic_fingerprint == logic
-            && layout.mirror_dir.join(&candidate.rel).exists()
-            && layout.map_path(&candidate.rel).exists()
-        {
+        let fast_unchanged = state.is_some_and(|state| {
+            !force_mirror
+                && candidate.fast
+                && state.logic_fingerprint == logic
+                && layout.mirror_dir.join(&candidate.rel).exists()
+                && layout.map_path(&candidate.rel).exists()
+        });
+        if fast_unchanged {
             report.unchanged += 1;
             continue;
         }
@@ -313,13 +318,14 @@ fn index_workspace_locked_inner(
 
         // Content proved unchanged by hash and logic matches: refresh the
         // mtime/size pre-check columns without re-rendering.
-        if !force_mirror
-            && let Some(state) = state
-            && state.input_sha256 == sha
-            && state.logic_fingerprint == logic
-            && layout.mirror_dir.join(&candidate.rel).exists()
-            && layout.map_path(&candidate.rel).exists()
-        {
+        let hash_unchanged = state.is_some_and(|state| {
+            !force_mirror
+                && state.input_sha256 == sha
+                && state.logic_fingerprint == logic
+                && layout.mirror_dir.join(&candidate.rel).exists()
+                && layout.map_path(&candidate.rel).exists()
+        });
+        if hash_unchanged {
             db::touch_index_state(
                 &conn,
                 &candidate.rel_string,
@@ -381,6 +387,7 @@ fn index_workspace_locked_inner(
         }
     }
 
+    report.semantic = crate::semantic_store::index_workspace_locked(root, layout)?;
     Ok(report)
 }
 
@@ -417,6 +424,7 @@ pub fn index_single_file(root: &Path, rel: &Path) -> Result<SpanMap> {
     let rel = resolve_repo_rel(root, &layout, rel)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     let indexed = index_single_file_locked(root, &layout, &rel, true)?;
+    crate::semantic_store::index_workspace_locked(root, &layout)?;
     Ok(indexed.span_map)
 }
 
@@ -444,6 +452,7 @@ pub fn sync_single_file(root: &Path, rel: &Path) -> Result<IndexReport> {
         remove_if_exists(layout.mirror_dir.join(&rel))?;
         remove_if_exists(layout.map_path(&rel))?;
         report.removed += 1;
+        report.semantic = crate::semantic_store::index_workspace_locked(root, &layout)?;
         return Ok(report);
     }
     match index_single_file_locked(root, &layout, &rel, false)?.outcome {
@@ -451,6 +460,7 @@ pub fn sync_single_file(root: &Path, rel: &Path) -> Result<IndexReport> {
         FileOutcome::Unchanged => report.unchanged += 1,
         FileOutcome::PendingSkipped => report.pending += 1,
     }
+    report.semantic = crate::semantic_store::index_workspace_locked(root, &layout)?;
     Ok(report)
 }
 
@@ -700,46 +710,50 @@ fn render_and_store(
     // Self-heal: a mirror that already equals the fresh render is converged
     // content with a stale db row (a crash between the mirror write and the db
     // commit), not a pending edit — fall through so the upsert repairs the row.
-    if !force_mirror
-        && let Some(old) = old_mirror.as_deref()
-        && old != rendered.sanitized
-        && db_sanitized_hash
-            .as_deref()
-            .is_none_or(|hash| sha256_hex(old.as_bytes()) != hash)
-    {
-        let previous = load_span_map(&map_path).unwrap_or(rendered.span_map);
-        return Ok((FileOutcome::PendingSkipped, previous, None));
+    if !force_mirror {
+        if let Some(old) = old_mirror.as_deref() {
+            if old != rendered.sanitized
+                && db_sanitized_hash
+                    .as_deref()
+                    .is_none_or(|hash| sha256_hex(old.as_bytes()) != hash)
+            {
+                let previous = load_span_map(&map_path).unwrap_or(rendered.span_map);
+                return Ok((FileOutcome::PendingSkipped, previous, None));
+            }
+        }
     }
 
     // A force reset is about to discard an un-projected agent edit: keep a
     // durable copy under journal/discarded/ before overwriting it.
     let mut stashed = None;
-    if force_mirror
-        && let Some(old) = old_mirror.as_deref()
-        && old != rendered.sanitized
-        && db_sanitized_hash
-            .as_deref()
-            .is_none_or(|hash| sha256_hex(old.as_bytes()) != hash)
-    {
-        let stash_path = layout
-            .journal_dir
-            .join("discarded")
-            .join(crate::journal::new_journal_id())
-            .join(rel);
-        crate::fsutil::atomic_write_sync(&stash_path, old)
-            .with_context(|| format!("stash pending mirror edit for {}", rel.display()))?;
-        log::info!(
-            "resetting a pending mirror edit for {}; copy kept at {}",
-            rel.display(),
-            stash_path.display()
-        );
-        stashed = Some(stash_path);
-        // Best-effort retention (same knob as journal entries): force-sync
-        // heavy workspaces must not accumulate stash dirs without bound.
-        if let Err(err) =
-            crate::journal::prune_discarded_stashes(layout, config.journal.max_entries)
-        {
-            log::warn!("discarded-stash pruning failed: {err:#}");
+    if force_mirror {
+        if let Some(old) = old_mirror.as_deref() {
+            if old != rendered.sanitized
+                && db_sanitized_hash
+                    .as_deref()
+                    .is_none_or(|hash| sha256_hex(old.as_bytes()) != hash)
+            {
+                let stash_path = layout
+                    .journal_dir
+                    .join("discarded")
+                    .join(crate::journal::new_journal_id())
+                    .join(rel);
+                crate::fsutil::atomic_write_sync(&stash_path, old)
+                    .with_context(|| format!("stash pending mirror edit for {}", rel.display()))?;
+                log::info!(
+                    "resetting a pending mirror edit for {}; copy kept at {}",
+                    rel.display(),
+                    stash_path.display()
+                );
+                stashed = Some(stash_path);
+                // Best-effort retention (same knob as journal entries): force-sync
+                // heavy workspaces must not accumulate stash dirs without bound.
+                if let Err(err) =
+                    crate::journal::prune_discarded_stashes(layout, config.journal.max_entries)
+                {
+                    log::warn!("discarded-stash pruning failed: {err:#}");
+                }
+            }
         }
     }
 
@@ -747,12 +761,14 @@ fn render_and_store(
     if let Some(old_map) = old_map_raw
         .as_deref()
         .and_then(|raw| serde_json::from_str::<SpanMap>(raw).ok())
-        && old_map.original_hash == rendered.span_map.original_hash
-        && old_map.sanitized_hash == rendered.span_map.sanitized_hash
-        && old_map.replacements == rendered.span_map.replacements
-        && old_map.spans == rendered.span_map.spans
     {
-        rendered.span_map.updated_at = old_map.updated_at;
+        if old_map.original_hash == rendered.span_map.original_hash
+            && old_map.sanitized_hash == rendered.span_map.sanitized_hash
+            && old_map.replacements == rendered.span_map.replacements
+            && old_map.spans == rendered.span_map.spans
+        {
+            rendered.span_map.updated_at = old_map.updated_at;
+        }
     }
     let next_map = serde_json::to_string_pretty(&rendered.span_map).context("serialize map")?;
     let unchanged = old_mirror.as_deref() == Some(rendered.sanitized.as_str())

@@ -1295,14 +1295,18 @@ fn external_model_proposals_validated_queued_and_applied_on_approval() {
     assert!(mirror_before.contains("safe_helper"));
     assert!(!mirror_before.contains("assist_helper"));
 
-    // Approve the surviving proposal -> registry updated -> engine applies it.
+    // Approve the surviving proposal -> symbol-scoped v2 projection applies it.
     let items = code_sanity::proposal::list_review(repo.path(), false).unwrap();
     assert_eq!(items.len(), 1);
     code_sanity::proposal::resolve_review(repo.path(), &items[0].id, true).unwrap();
 
+    let conn = code_sanity::db::connect(&layout).unwrap();
+    let projected =
+        code_sanity::semantic_store::project_document(&conn, repo.path(), "src/lib.rs").unwrap();
+    assert!(projected.content.contains("fn assist_helper()"));
+    assert!(!projected.content.contains("fn safe_helper"));
     let mirror_after = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror_after.contains("fn assist_helper()"));
-    assert!(!mirror_after.contains("fn safe_helper"));
+    assert!(mirror_after.contains("fn safe_helper()"));
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("fn safe_helper")); // real symbol untouched
     assert!(verify_workspace(repo.path()).is_ok());
@@ -1821,6 +1825,7 @@ fn resolve_review_refuses_alias_that_occurs_elsewhere_in_repo() {
         id: "2099-01-01T00-00-00.000000000Z-testtest".to_string(),
         file: "src/a.rs".to_string(),
         proposal: code_sanity::proposal::Proposal {
+            target: None,
             category: "identifier".to_string(),
             original_text: "shadowfax".to_string(),
             sanitized_text: "gadget".to_string(),

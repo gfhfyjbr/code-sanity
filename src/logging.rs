@@ -27,17 +27,18 @@ impl Log for CliLogger {
     }
 
     fn log(&self, record: &Record<'_>) {
-        if record.level() <= self.file_level
-            && let Ok(mut guard) = self.file.lock()
-            && let Some(file) = guard.as_mut()
-        {
-            let _ = writeln!(
-                file,
-                "{} {:5} {}",
-                chrono::Utc::now().to_rfc3339(),
-                record.level(),
-                record.args()
-            );
+        if record.level() <= self.file_level {
+            if let Ok(mut guard) = self.file.lock() {
+                if let Some(file) = guard.as_mut() {
+                    let _ = writeln!(
+                        file,
+                        "{} {:5} {}",
+                        chrono::Utc::now().to_rfc3339(),
+                        record.level(),
+                        record.args()
+                    );
+                }
+            }
         }
         if self
             .stderr_level
@@ -48,10 +49,10 @@ impl Log for CliLogger {
     }
 
     fn flush(&self) {
-        if let Ok(mut guard) = self.file.lock()
-            && let Some(file) = guard.as_mut()
-        {
-            let _ = file.flush();
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = file.flush();
+            }
         }
     }
 }

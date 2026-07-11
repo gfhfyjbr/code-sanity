@@ -58,6 +58,66 @@ pub struct ApplyOptions {
     pub dry_run: bool,
 }
 
+/// One already-validated real-source update produced by the semantic v2
+/// transaction planner. The commit path below reuses the durable v1 journal,
+/// rollback, permission preservation, and reindex machinery.
+pub(crate) struct RealFileUpdate {
+    pub rel: PathBuf,
+    pub before: String,
+    pub after: String,
+}
+
+pub(crate) fn commit_real_file_updates_locked(
+    root: &Path,
+    layout: &Layout,
+    updates: &[RealFileUpdate],
+    agent: Option<String>,
+    session_id: Option<String>,
+) -> Result<PathBuf> {
+    if updates.is_empty() {
+        bail!("semantic transaction contains no file updates");
+    }
+    let conn = db::connect(layout)?;
+    db::ensure_schema(&conn)?;
+    let config = Config::load_or_default(layout)?;
+    let files = updates
+        .iter()
+        .map(|update| normalize_rel_path(&update.rel))
+        .collect::<Vec<_>>();
+    let mut original_patch = String::new();
+    let planned = updates
+        .iter()
+        .map(|update| {
+            original_patch.push_str(&whole_file_patch(
+                &update.rel,
+                &update.before,
+                &update.after,
+            ));
+            PlannedFileApply {
+                rel: update.rel.clone(),
+                before: Some(update.before.clone()),
+                op: PlannedOp::Write(update.after.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+    commit_planned_apply(
+        root,
+        layout,
+        &conn,
+        &ApplyOptions {
+            agent,
+            session_id,
+            dry_run: false,
+        },
+        &original_patch,
+        &original_patch,
+        &files,
+        &planned,
+        config.journal.max_entries,
+        None,
+    )
+}
+
 #[derive(Debug, Clone)]
 struct UnifiedPatch {
     files: Vec<FilePatch>,
@@ -1073,6 +1133,9 @@ pub fn recover_workspace(root: &Path, rollback: bool, force: bool) -> Result<Rec
     if protected_drift {
         reconverge_workspace(root, &layout)
             .context("reindex after recovered protected symbol change")?;
+    } else if !report.recovered.is_empty() {
+        crate::semantic_store::index_workspace_locked(root, &layout)
+            .context("refresh semantic index after recovery")?;
     }
     Ok(report)
 }
@@ -1207,6 +1270,8 @@ fn commit_planned_apply(
                 bail!("simulated apply failure after {} write(s)", idx + 1);
             }
         }
+        crate::semantic_store::index_workspace_locked(root, layout)
+            .context("refresh semantic index after file writes")?;
         Ok(())
     })();
 
@@ -1256,6 +1321,9 @@ fn commit_planned_apply(
                 if protected_drift {
                     reconverge_workspace(root, layout)
                         .context("reindex after rolled-back protected symbol change")?;
+                } else {
+                    crate::semantic_store::index_workspace_locked(root, layout)
+                        .context("refresh semantic index after rollback")?;
                 }
                 Ok(())
             })();
@@ -1551,10 +1619,10 @@ fn normalize_patch_file_path(path: &str, root: &Path, layout: &Layout) -> Result
         }
     }
     let mut components = candidate.components();
-    if let Some(Component::Normal(first)) = components.next()
-        && (first == "a" || first == "b")
-    {
-        candidate = components.as_path().to_path_buf();
+    if let Some(Component::Normal(first)) = components.next() {
+        if first == "a" || first == "b" {
+            candidate = components.as_path().to_path_buf();
+        }
     }
     let mirror_prefix = Path::new(".code-sanity").join("mirror");
     if let Ok(stripped) = candidate.strip_prefix(&mirror_prefix) {
@@ -1712,10 +1780,10 @@ fn apply_file_patch_to_content(content: &str, file_patch: &FilePatch) -> Result<
                     // (kept verbatim above); appending after it must not merge
                     // the two lines. The parser drops `\ No newline` markers,
                     // so bridge output is newline-normalized by design.
-                    if let Some(last) = out.last_mut()
-                        && !last.ends_with('\n')
-                    {
-                        last.push_str(eol);
+                    if let Some(last) = out.last_mut() {
+                        if !last.ends_with('\n') {
+                            last.push_str(eol);
+                        }
                     }
                     out.push(format!("{}{eol}", line_body_text(content)));
                 }

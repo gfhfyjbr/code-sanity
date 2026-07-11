@@ -926,6 +926,7 @@ mod tests {
             id: "id".to_string(),
             file: "src/main.rs".to_string(),
             proposal: Proposal {
+                target: None,
                 category: "identifier".to_string(),
                 original_text: "Trezor".to_string(),
                 sanitized_text: "HardwareWallet".to_string(),
@@ -953,6 +954,7 @@ mod tests {
             id: "id".to_string(),
             file: "src/main.mm".to_string(),
             proposal: Proposal {
+                target: None,
                 category: "identifier".to_string(),
                 original_text: "beginCursorSuppression".to_string(),
                 sanitized_text: "beginCursorHandling".to_string(),

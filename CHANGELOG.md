@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A revisioned AST/semantic v2 index stores stable nodes, symbols,
+  occurrences, symbol-scoped aliases, proposals, and transactions. Rust and
+  the C/C++/Objective-C family use Tree-sitter plus compiler/LSP references and
+  rename; JS/TS, Python, and Go expose Tree-sitter AST edits without inventing
+  semantic rename support.
+- MCP and CLI v2 surfaces provide semantic snapshot/find/read, compiler-backed
+  references/rename, AST-node edits, preview, and revision-CAS commit.
+
+### Changed
+
+- LLM proposal chunks receive only relevant owned semantic candidates and must
+  return existing symbol/occurrence IDs. Decisions deduplicate by symbol, and
+  approved aliases affect only bound declaration/reference occurrences.
+- All v1 and v2 writers refresh the semantic index through the existing
+  crash-safe journal/rollback path; `verify` now checks both index generations.
+
+### Fixed
+
+- The declared Rust 1.85 MSRV builds again; newer let-chain syntax was replaced
+  with equivalent stable control flow.
+
 ## [0.4.3] - 2026-07-11
 
 ### Fixed

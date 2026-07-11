@@ -56,6 +56,13 @@ fn command_name(command: Option<&Command>) -> &'static str {
         Some(Command::Sync { .. }) => "sync",
         Some(Command::EmbedIndex) => "embed-index",
         Some(Command::SemanticSearch { .. }) => "semantic-search",
+        Some(Command::WorkspaceSnapshot) => "workspace-snapshot",
+        Some(Command::FindCode { .. }) => "find-code",
+        Some(Command::ReadCode { .. }) => "read-code",
+        Some(Command::EditNode { .. }) => "edit-node",
+        Some(Command::RenameSymbol { .. }) => "rename-symbol",
+        Some(Command::PreviewTransaction { .. }) => "preview-transaction",
+        Some(Command::CommitTransaction { .. }) => "commit-transaction",
         Some(Command::Verify) => "verify",
         Some(Command::Doctor { .. }) => "doctor",
         Some(Command::InstallHooks { .. }) => "install-hooks",
@@ -208,6 +215,51 @@ enum Command {
         /// Number of top-scoring chunks to return.
         #[arg(long, default_value_t = 10)]
         k: usize,
+    },
+    /// Show the revision and counts of the AST/semantic v2 index.
+    WorkspaceSnapshot,
+    /// Find stable semantic symbols by name or qualified name.
+    FindCode {
+        query: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Read one AST-projected document with stable IDs and capabilities.
+    ReadCode { path: PathBuf },
+    /// Preview an edit anchored to one AST node.
+    EditNode {
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        replacement: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+    /// Preview a compiler/LSP-backed semantic rename.
+    RenameSymbol {
+        #[arg(long)]
+        symbol_id: String,
+        #[arg(long)]
+        new_name: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+    /// Preview multiple structured intents from a JSON file or stdin.
+    PreviewTransaction {
+        #[arg(long)]
+        intents: Option<PathBuf>,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+    /// Commit a previously previewed semantic transaction.
+    CommitTransaction {
+        transaction_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
     },
     /// Check mirror/map/db consistency and scan for term leaks (exit 3 on failure).
     Verify,
@@ -654,6 +706,9 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             for (path, reason) in &report.errors {
                 eprintln!("error: {path}: {reason}");
             }
+            for error in &report.semantic.errors {
+                eprintln!("semantic error: {error}");
+            }
             if out.is_json() {
                 out.emit(
                     "index",
@@ -669,6 +724,10 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     ("Pending edits", report.pending.to_string()),
                     ("Symlinks", report.skipped_symlinks.to_string()),
                     ("Errors", report.errors.len().to_string()),
+                    ("AST revision", report.semantic.revision.to_string()),
+                    ("AST indexed", report.semantic.indexed.to_string()),
+                    ("AST unchanged", report.semantic.unchanged.to_string()),
+                    ("AST read-only", report.semantic.read_only.to_string()),
                     ("Elapsed", format_elapsed(started.elapsed())),
                 ];
                 if !crate::presentation::summary("Index complete", &rows) {
@@ -1155,6 +1214,9 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             for (path, reason) in &report.errors {
                 eprintln!("error: {path}: {reason}");
             }
+            for error in &report.semantic.errors {
+                eprintln!("semantic error: {error}");
+            }
             if out.is_json() {
                 out.emit(
                     "sync",
@@ -1170,6 +1232,9 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     ("Pending edits", report.pending.to_string()),
                     ("Stashed", report.stashed.len().to_string()),
                     ("Errors", report.errors.len().to_string()),
+                    ("AST revision", report.semantic.revision.to_string()),
+                    ("AST indexed", report.semantic.indexed.to_string()),
+                    ("AST read-only", report.semantic.read_only.to_string()),
                     ("Elapsed", format_elapsed(started.elapsed())),
                 ];
                 if !crate::presentation::summary("Sync complete", &rows) {
@@ -1272,6 +1337,86 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                 format_elapsed(started.elapsed())
             );
         }
+        Command::WorkspaceSnapshot => {
+            let snapshot = semantic_read(&root, crate::semantic_store::snapshot)?;
+            emit_semantic_value(out, "workspace-snapshot", serde_json::to_value(snapshot)?)?;
+        }
+        Command::FindCode { query, limit } => {
+            let result = semantic_read(&root, |conn| {
+                Ok(json!({
+                    "revision": crate::semantic_store::current_revision(conn)?,
+                    "symbols": crate::semantic_store::find_symbols(conn, &query, limit)?
+                        .into_iter()
+                        .map(|(path, symbol)| json!({ "path": path, "symbol": symbol }))
+                        .collect::<Vec<_>>()
+                }))
+            })?;
+            emit_semantic_value(out, "find-code", result)?;
+        }
+        Command::ReadCode { path } => {
+            let path = crate::config::normalize_safe_rel_path(&path, "read-code path")?;
+            let rel = crate::config::normalize_rel_path(&path);
+            let document = semantic_read(&root, |conn| {
+                crate::semantic_store::project_document(conn, &root, &rel)
+            })?;
+            emit_semantic_value(out, "read-code", serde_json::to_value(document)?)?;
+        }
+        Command::EditNode {
+            node_id,
+            replacement,
+            expected_revision,
+        } => {
+            let preview = crate::transaction::preview_transaction(
+                &root,
+                expected_revision,
+                vec![crate::transaction::EditIntent::EditNode {
+                    node_id,
+                    replacement,
+                }],
+            )?;
+            emit_semantic_value(out, "edit-node", serde_json::to_value(preview)?)?;
+        }
+        Command::RenameSymbol {
+            symbol_id,
+            new_name,
+            expected_revision,
+        } => {
+            let preview = crate::transaction::preview_transaction(
+                &root,
+                expected_revision,
+                vec![crate::transaction::EditIntent::RenameSymbol {
+                    symbol_id,
+                    new_name,
+                }],
+            )?;
+            emit_semantic_value(out, "rename-symbol", serde_json::to_value(preview)?)?;
+        }
+        Command::PreviewTransaction {
+            intents,
+            expected_revision,
+        } => {
+            let raw = read_optional_file_or_stdin(intents.as_ref())?;
+            let intents = serde_json::from_str::<Vec<crate::transaction::EditIntent>>(&raw)
+                .context("parse transaction intents JSON")?;
+            let preview =
+                crate::transaction::preview_transaction(&root, expected_revision, intents)?;
+            emit_semantic_value(out, "preview-transaction", serde_json::to_value(preview)?)?;
+        }
+        Command::CommitTransaction {
+            transaction_id,
+            expected_revision,
+            agent,
+            session_id,
+        } => {
+            let report = crate::transaction::commit_transaction(
+                &root,
+                &transaction_id,
+                expected_revision,
+                agent,
+                session_id,
+            )?;
+            emit_semantic_value(out, "commit-transaction", serde_json::to_value(report)?)?;
+        }
         Command::Verify => {
             let progress =
                 crate::presentation::TaskProgress::start("Verifying workspace", !out.is_json());
@@ -1310,6 +1455,34 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
         }
     }
 
+    Ok(())
+}
+
+fn semantic_read<T>(
+    root: &std::path::Path,
+    operation: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+) -> Result<T> {
+    let layout = crate::config::Layout::new(root);
+    layout.require_initialized()?;
+    let _lock = crate::lock::WorkspaceLock::acquire_shared(&layout)?;
+    let conn = crate::db::connect(&layout)?;
+    crate::db::check_schema(&conn)?;
+    operation(&conn)
+}
+
+fn emit_semantic_value(
+    out: crate::output::Output,
+    command: &'static str,
+    value: serde_json::Value,
+) -> Result<()> {
+    if out.is_json() {
+        out.emit(command, value, None);
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).context("serialize semantic CLI output")?
+        );
+    }
     Ok(())
 }
 

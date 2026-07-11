@@ -9,7 +9,7 @@ use std::path::Path;
 /// state (rebuilt by `index` from the real files and config), so migration is
 /// drop-and-recreate for the derived tables; only `patch_journal` history is
 /// preserved.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 6;
 
 pub fn connect(layout: &Layout) -> Result<Connection> {
     let conn = Connection::open(&layout.db_path)
@@ -49,6 +49,14 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         // because no pre-v2 database can contain them.
         tx.execute_batch(
             r#"
+            drop table if exists semantic_occurrences;
+            drop table if exists semantic_proposals;
+            drop table if exists semantic_aliases;
+            drop table if exists semantic_symbols;
+            drop table if exists semantic_nodes;
+            drop table if exists semantic_transactions;
+            drop table if exists semantic_documents;
+            drop table if exists semantic_workspace;
             drop table if exists spans;
             drop table if exists replacements;
             drop table if exists files;
@@ -209,6 +217,109 @@ fn create_tables(conn: &Connection) -> Result<()> {
           vector blob not null
         );
         create index if not exists embedding_chunks_rel on embedding_chunks(rel_path);
+
+        create table if not exists semantic_workspace(
+          singleton integer primary key check(singleton = 1),
+          revision integer not null,
+          alias_fingerprint text not null
+        );
+        insert or ignore into semantic_workspace(singleton, revision, alias_fingerprint)
+          values(1, 0, '');
+
+        create table if not exists semantic_documents(
+          rel_path text primary key,
+          language text not null,
+          content_hash text not null,
+          origin text not null,
+          capabilities_json text not null,
+          parse_errors integer not null,
+          indexed_revision integer not null
+        );
+
+        create table if not exists semantic_nodes(
+          node_id text primary key,
+          rel_path text not null references semantic_documents(rel_path) on delete cascade,
+          parent_node_id text,
+          kind text not null,
+          start_byte integer not null,
+          end_byte integer not null,
+          start_line integer not null,
+          start_column integer not null,
+          end_line integer not null,
+          end_column integer not null
+        );
+        create index if not exists semantic_nodes_rel on semantic_nodes(rel_path, start_byte);
+
+        create table if not exists semantic_symbols(
+          symbol_id text primary key,
+          rel_path text not null references semantic_documents(rel_path) on delete cascade,
+          node_id text not null,
+          name text not null,
+          kind text not null,
+          qualified_name text not null,
+          scope_node_id text,
+          origin text not null,
+          locally_bound integer not null
+        );
+        create index if not exists semantic_symbols_rel on semantic_symbols(rel_path, name);
+
+        create table if not exists semantic_occurrences(
+          occurrence_id text primary key,
+          rel_path text not null references semantic_documents(rel_path) on delete cascade,
+          node_id text not null,
+          symbol_id text references semantic_symbols(symbol_id) on delete set null,
+          name text not null,
+          role text not null,
+          start_byte integer not null,
+          end_byte integer not null,
+          start_line integer not null,
+          start_column integer not null,
+          end_line integer not null,
+          end_column integer not null
+        );
+        create index if not exists semantic_occurrences_symbol
+          on semantic_occurrences(symbol_id, rel_path, start_byte);
+
+        create table if not exists semantic_aliases(
+          symbol_id text primary key,
+          original_name text not null,
+          sanitized_name text not null,
+          category text not null,
+          confidence real,
+          reason text,
+          status text not null,
+          source text not null,
+          created_revision integer not null
+        );
+        drop index if exists semantic_aliases_sanitized;
+        create index if not exists semantic_aliases_name
+          on semantic_aliases(sanitized_name);
+
+        create table if not exists semantic_proposals(
+          proposal_id text primary key,
+          symbol_id text not null,
+          occurrence_id text,
+          replacement text not null,
+          category text not null,
+          confidence real not null,
+          reason text not null,
+          status text not null,
+          context_revision integer not null,
+          created_at text not null
+        );
+        create index if not exists semantic_proposals_symbol
+          on semantic_proposals(symbol_id, status);
+
+        create table if not exists semantic_transactions(
+          transaction_id text primary key,
+          base_revision integer not null,
+          status text not null,
+          intents_json text not null,
+          preview_json text not null,
+          committed_revision integer,
+          created_at text not null,
+          updated_at text not null
+        );
         "#,
     )
     .context("initialize sqlite schema")
