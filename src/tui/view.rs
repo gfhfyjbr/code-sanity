@@ -13,7 +13,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
     app.hits.clear();
-    app.review_area = None;
 
     if area.width < 72 || area.height < 20 {
         render_too_small(frame, area);
@@ -191,15 +190,27 @@ fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
         horizontal: 1,
         vertical: 1,
     });
-    app.review_area = Some(inner);
-    app.list_rows = inner.height.max(1) as usize;
-    app.list_offset = app
-        .list_offset
-        .min(app.filtered.len().saturating_sub(app.list_rows));
+    let row_heights = app
+        .filtered
+        .iter()
+        .map(|index| {
+            review_row_text(&app.reviews[*index], inner.width as usize, false)
+                .0
+                .len()
+        })
+        .collect::<Vec<_>>();
+    let viewport_height = inner.height.max(1) as usize;
+    app.list_offset = app.list_offset.min(app.filtered.len().saturating_sub(1));
     if app.selected < app.list_offset {
         app.list_offset = app.selected;
-    } else if app.selected >= app.list_offset + app.list_rows {
-        app.list_offset = app.selected + 1 - app.list_rows;
+    }
+    while app.list_offset < app.selected
+        && row_heights[app.list_offset..=app.selected]
+            .iter()
+            .sum::<usize>()
+            > viewport_height
+    {
+        app.list_offset += 1;
     }
 
     if app.filtered.is_empty() {
@@ -217,19 +228,37 @@ fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    for (row, filtered_index) in app
-        .filtered
-        .iter()
-        .skip(app.list_offset)
-        .take(app.list_rows)
-        .enumerate()
-    {
-        let item = &app.reviews[*filtered_index];
-        let selected = app.list_offset + row == app.selected;
+    let mut visible_rows = Vec::new();
+    let mut used_height = 0;
+    for (index, filtered_index) in app.filtered.iter().enumerate().skip(app.list_offset) {
+        let row_height = row_heights[index].min(viewport_height);
+        if !visible_rows.is_empty() && used_height + row_height > viewport_height {
+            break;
+        }
+        visible_rows.push((index, *filtered_index, used_height, row_height));
+        used_height += row_height;
+        if used_height >= viewport_height {
+            break;
+        }
+    }
+    app.list_rows = visible_rows.len().max(1);
+
+    for (index, filtered_index, row_y, row_height) in visible_rows {
+        let item = &app.reviews[filtered_index];
+        let selected = index == app.selected;
         let (text, flagged) = review_row_text(item, inner.width as usize, selected);
-        let row_area = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let row_area = Rect::new(
+            inner.x,
+            inner.y + row_y as u16,
+            inner.width,
+            row_height as u16,
+        );
+        app.hits.push(ButtonHit {
+            area: row_area,
+            action: HitAction::Review(index),
+        });
         frame.render_widget(
-            Paragraph::new(text).style(
+            Paragraph::new(text.join("\n")).style(
                 Style::default()
                     .fg(if selected {
                         FG
@@ -642,7 +671,6 @@ fn render_command_suggestions(frame: &mut Frame, app: &App, input: Rect) {
 
 fn render_help(frame: &mut Frame, app: &mut App, area: Rect) {
     app.hits.clear();
-    app.review_area = None;
     render_modal_backdrop(frame, area);
     let popup_area = centered(area, 72, 22);
     let inner = popup(frame, popup_area, "Keyboard and mouse");
@@ -684,7 +712,6 @@ fn render_confirmation(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     app.hits.clear();
-    app.review_area = None;
     render_modal_backdrop(frame, area);
     let popup_area = centered(area, 76, 13);
     let inner = popup(frame, popup_area, &confirmation.title);
@@ -794,32 +821,71 @@ fn level_name(level: LogLevel) -> &'static str {
     }
 }
 
-fn clip_text(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
-        return value.to_string();
+fn wrap_with_prefix(
+    value: &str,
+    first_prefix: &str,
+    next_prefix: &str,
+    width: usize,
+) -> Vec<String> {
+    let first_width = width.saturating_sub(first_prefix.chars().count()).max(1);
+    let next_width = width.saturating_sub(next_prefix.chars().count()).max(1);
+    let mut remaining = value.chars().peekable();
+    let mut lines = Vec::new();
+    let mut first = true;
+
+    while remaining.peek().is_some() {
+        let (prefix, content_width) = if first {
+            (first_prefix, first_width)
+        } else {
+            (next_prefix, next_width)
+        };
+        let chunk = remaining.by_ref().take(content_width).collect::<String>();
+        lines.push(format!("{prefix}{chunk}"));
+        first = false;
     }
-    let keep = width.saturating_sub(1);
-    format!("{}~", value.chars().take(keep).collect::<String>())
+
+    if lines.is_empty() {
+        lines.push(first_prefix.to_string());
+    }
+    lines
 }
 
 fn review_row_text(
     item: &crate::proposal::ReviewItem,
     width: usize,
     selected: bool,
-) -> (String, bool) {
+) -> (Vec<String>, bool) {
     let flagged = item.flag != "clean";
     let marker = if selected { ">" } else { " " };
     let warning = if flagged { "!" } else { " " };
     let confidence = (item.proposal.confidence * 100.0).round() as usize;
-    let term_width = (width.saturating_sub(12) / 2).clamp(6, 18);
-    let original = clip_text(&item.proposal.original_text, term_width);
-    let sanitized = clip_text(&item.proposal.sanitized_text, term_width);
-    (
-        format!(
-            "{marker}{warning} {original:<term_width$} -> {sanitized:<term_width$} {confidence:>3}%"
-        ),
-        flagged,
-    )
+    let inline = format!(
+        "{marker}{warning} {} -> {} {confidence:>3}%",
+        item.proposal.original_text, item.proposal.sanitized_text
+    );
+    if inline.chars().count() <= width {
+        return (vec![inline], flagged);
+    }
+
+    let mut lines = wrap_with_prefix(
+        &item.proposal.original_text,
+        &format!("{marker}{warning} "),
+        "   ",
+        width,
+    );
+    let confidence = format!(" {confidence:>3}%");
+    let sanitized_width = width.saturating_sub(confidence.chars().count());
+    let mut sanitized = wrap_with_prefix(
+        &item.proposal.sanitized_text,
+        "   -> ",
+        "      ",
+        sanitized_width,
+    );
+    if let Some(last) = sanitized.last_mut() {
+        last.push_str(&confidence);
+    }
+    lines.extend(sanitized);
+    (lines, flagged)
 }
 
 #[cfg(test)]
@@ -872,11 +938,42 @@ mod tests {
         };
         let (flagged, warning) = review_row_text(&item, 50, false);
         assert!(warning);
-        assert!(flagged.starts_with(" !"));
+        assert!(flagged[0].starts_with(" !"));
 
         item.flag = "clean".to_string();
         let (clean, warning) = review_row_text(&item, 50, false);
         assert!(!warning);
-        assert!(clean.starts_with("  "));
+        assert!(clean[0].starts_with("  "));
+    }
+
+    #[test]
+    fn review_rows_preserve_long_identifiers_without_ellipsis() {
+        use crate::proposal::{Proposal, ReviewItem, ReviewStatus};
+        let item = ReviewItem {
+            id: "id".to_string(),
+            file: "src/main.mm".to_string(),
+            proposal: Proposal {
+                category: "identifier".to_string(),
+                original_text: "beginCursorSuppression".to_string(),
+                sanitized_text: "beginCursorHandling".to_string(),
+                confidence: 0.78,
+                rationale: None,
+            },
+            status: ReviewStatus::Pending,
+            flag: "clean".to_string(),
+            created_at: String::new(),
+        };
+
+        let (wide, _) = review_row_text(&item, 64, false);
+        assert_eq!(wide.len(), 1);
+        assert!(wide[0].contains("beginCursorSuppression"));
+        assert!(wide[0].contains("beginCursorHandling"));
+
+        let (narrow, _) = review_row_text(&item, 42, true);
+        let rendered = narrow.join("\n");
+        assert!(narrow.len() >= 2);
+        assert!(rendered.contains("beginCursorSuppression"));
+        assert!(rendered.contains("beginCursorHandling"));
+        assert!(!rendered.contains('~'));
     }
 }
