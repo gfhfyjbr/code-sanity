@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-07-12
+
 ### Added
 
 - The TUI review pane now shows an adaptive, full-height before/after change
