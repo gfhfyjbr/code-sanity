@@ -1,24 +1,31 @@
 # code-sanity
 
+[![CI](https://github.com/gfhfyjbr/code-sanity/actions/workflows/ci.yml/badge.svg)](https://github.com/gfhfyjbr/code-sanity/actions/workflows/ci.yml)
+
 `code-sanity` builds a sanitized mirror of a real repository and applies agent edits from that mirror back to the real files. The real repository remains the source of truth; `.code-sanity/mirror` is the agent-facing view, and `.code-sanity/maps` plus `db.sqlite` hold span and hash state.
 
 Sanitization is deterministic and local (dictionary + human-approved alias registry + denylist). A model can *propose* aliases through a provider interface, but it never writes the mirror.
 
 ## Installation
 
-From a source checkout, the installer builds an optimized binary and places it
-in `${CARGO_HOME:-$HOME/.cargo}/bin` without `sudo`:
+The installer detects macOS/Linux and x86_64/aarch64, downloads the matching
+binary from the latest GitHub Release, verifies its SHA-256 checksum, and places
+it in `${CARGO_HOME:-$HOME/.cargo}/bin` without `sudo` or a Rust toolchain:
 
 ```bash
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.sh | bash
 
-# Optional custom location and idempotent shell PATH setup:
-./install.sh --bin-dir "$HOME/.local/bin" --add-to-path
+# Pin a release or customize installation:
+curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.sh | \
+  bash -s -- --version v0.2.0 --bin-dir "$HOME/.local/bin" --add-to-path
 ```
 
-Run `./install.sh --help` for `--no-build`, `--uninstall`, and environment
-overrides. Installation is atomic and verifies the installed binary before
-returning success.
+Download and inspect `install.sh` first if piping a remote script is outside
+your trust policy. From a checkout, `./install.sh --from-source` performs the
+old optimized Cargo build; `--no-build` installs an existing
+`target/release/code-sanity`. Run `./install.sh --help` for uninstall and
+environment overrides. Installation is atomic and verifies both the release
+archive and installed binary before returning success.
 
 Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 [GitHub Release](https://github.com/gfhfyjbr/code-sanity/releases):
@@ -26,7 +33,7 @@ Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 ```bash
 # pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
 #                     x86_64-apple-darwin, aarch64-apple-darwin
-version=v0.3.0
+version=v0.2.0
 target=aarch64-apple-darwin
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz"
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz.sha256"
@@ -45,6 +52,11 @@ cargo install --path . --locked
 
 Linux and macOS only — workspace locking is `flock`-based and the build refuses
 other platforms.
+
+Release tags are built by GitHub Actions for all four supported targets. The
+pipeline verifies the tag against `Cargo.toml`, runs tests and dependency policy
+checks, publishes checksummed archives, then installs the published release on
+fresh Linux and macOS runners. See [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Quick Start
 
