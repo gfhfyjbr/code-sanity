@@ -405,10 +405,11 @@ impl ProposalProvider for LlmProposalProvider {
         // `already_mapped` list alongside the still-real occurrences. Keep the
         // denylist visible: unmapped denylisted terms are exactly what the
         // proposer must help name.
+        let comment_free_content = mask_comments_for_proposal(rel, content);
         let mut provider_config = config.clone();
         provider_config.sanitizer.denylist.clear();
         let provider_content =
-            crate::redact::Redactor::terms_only(&provider_config).redact(content);
+            crate::redact::Redactor::terms_only(&provider_config).redact(&comment_free_content);
         let core_offset = proposal_core_offset(&provider_content, chunk);
         let (context_before, provider_content) = provider_content.split_at(core_offset);
         let user = serde_json::to_string(&serde_json::json!({
@@ -423,6 +424,7 @@ impl ProposalProvider for LlmProposalProvider {
                 "Never propose operating-system components, framework or library APIs, imported packages, SDK symbols, browser names, hardware vendor names, protocol vocabulary, or other public external identifiers, even when they occur in strings or comments",
                 "Treat context.indexed_external_identifiers as authoritative API ownership evidence; never propose one of those identifiers or a vendor/API fragment embedded in one",
                 "Do not suggest changes to imports, public APIs, protocol constants, SQL, or shell syntax",
+                "Source comments are masked from file.content and are out of scope; never propose comment vocabulary",
                 "Do not suggest any term listed in policy.allowlist",
                 "Both original_text and sanitized_text must each be exactly one ASCII word run matching [A-Za-z0-9_]+; never return spaces, hyphens, dots, slashes, or punctuation",
                 "For a candidate embedded in a larger identifier, return the smallest meaningful risk-loaded or private-name substring rather than the entire identifier",
@@ -440,7 +442,7 @@ impl ProposalProvider for LlmProposalProvider {
             ],
             "output_schema": {
                 "proposals": [{
-                    "category": "identifier|comment|string",
+                    "category": "identifier|string",
                     "original_text": "string",
                     "sanitized_text": "string",
                     "confidence": "number from 0 to 1",
@@ -763,8 +765,9 @@ pub fn propose_sanitize_with_progress(
             }
             Ok(real) => {
                 let chunks = if chunk_llm_files {
+                    let proposal_source = mask_comments_for_proposal(Path::new(&file), &real);
                     split_proposal_chunks(
-                        &real,
+                        &proposal_source,
                         config.sanitizer.propose_chunk_bytes,
                         config.sanitizer.propose_chunk_overlap_lines,
                     )
@@ -1314,6 +1317,32 @@ fn validate_proposal_with_index(
     Ok(flag)
 }
 
+fn mask_comments_for_proposal(rel_path: &Path, content: &str) -> String {
+    let language = crate::sanitize::detect_language(rel_path, content);
+    if matches!(language.as_str(), "markdown" | "plaintext") {
+        return content.to_string();
+    }
+    let strings = crate::sanitize::string_ranges(&language, content);
+    let comments = crate::sanitize::comment_ranges(&language, content, &strings);
+    if comments.is_empty() {
+        return content.to_string();
+    }
+
+    let mut masked = content.as_bytes().to_vec();
+    for range in comments {
+        for byte in &mut masked[range.start..range.end] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(masked).expect("comment masking preserves valid UTF-8")
+}
+
+fn occurs_outside_comments(rel_path: &Path, content: &str, value: &str) -> bool {
+    mask_comments_for_proposal(rel_path, content).contains(value)
+}
+
 fn external_api_owner<'a>(
     candidate: &str,
     indexed_external: &'a BTreeSet<String>,
@@ -1359,6 +1388,9 @@ pub fn validate_proposal(
     if proposal.original_text.is_empty() {
         return Err("empty original text".to_string());
     }
+    if !matches!(proposal.category.as_str(), "identifier" | "string") {
+        return Err("comment proposals are out of scope".to_string());
+    }
     // The sanitizer can only match word-run terms; a proposal outside that
     // class would be recorded and silently never fire.
     if let Some(reason) = matchability_error(&proposal.original_text) {
@@ -1374,6 +1406,9 @@ pub fn validate_proposal(
     }
     if !content.contains(&proposal.original_text) {
         return Err("original text does not appear in the file".to_string());
+    }
+    if !occurs_outside_comments(rel_path, content, &proposal.original_text) {
+        return Err("original text appears only inside comments".to_string());
     }
     if config
         .sanitizer
@@ -1823,6 +1858,64 @@ mod tests {
     }
 
     #[test]
+    fn proposal_comment_mask_preserves_code_strings_and_offsets() {
+        let content = "// TOCTOU and кириллица\nconst char *url = \"https://example.test\";\n/* fake */ int helper = 1;\n";
+        let masked = mask_comments_for_proposal(Path::new("src/main.mm"), content);
+
+        assert_eq!(masked.len(), content.len());
+        assert_eq!(masked.lines().count(), content.lines().count());
+        assert!(!masked.contains("TOCTOU"));
+        assert!(!masked.contains("кириллица"));
+        assert!(!masked.contains("fake"));
+        assert!(masked.contains("https://example.test"));
+        assert!(masked.contains("int helper = 1"));
+    }
+
+    #[test]
+    fn rejects_comment_only_terms_regardless_of_claimed_category() {
+        let config = Config::default();
+        let mut proposal = Proposal {
+            category: "identifier".to_string(),
+            original_text: "TOCTOU".to_string(),
+            sanitized_text: "race_guard".to_string(),
+            confidence: 1.0,
+            rationale: None,
+        };
+        let comment_only = "// TOCTOU protection\nint helper = 1;\n";
+        let reason = validate_proposal(Path::new("src/main.cpp"), &proposal, comment_only, &config)
+            .unwrap_err();
+        assert!(reason.contains("only inside comments"), "{reason}");
+
+        proposal.category = "comment".to_string();
+        let reason = validate_proposal(
+            Path::new("src/main.cpp"),
+            &proposal,
+            "int TOCTOU = 1;\n",
+            &config,
+        )
+        .unwrap_err();
+        assert!(reason.contains("out of scope"), "{reason}");
+    }
+
+    #[test]
+    fn allows_terms_that_also_occur_outside_comments() {
+        let proposal = Proposal {
+            category: "identifier".to_string(),
+            original_text: "TOCTOU".to_string(),
+            sanitized_text: "race_guard".to_string(),
+            confidence: 1.0,
+            rationale: None,
+        };
+        let verdict = validate_proposal(
+            Path::new("src/main.cpp"),
+            &proposal,
+            "// TOCTOU protection\nint TOCTOU = 1;\n",
+            &Config::default(),
+        );
+        assert!(verdict.is_ok(), "{verdict:?}");
+    }
+
+    #[test]
     fn rejects_alias_containing_denylisted_term() {
         let config = config_with_denylist(&["secret"]);
         let proposal = Proposal {
@@ -1873,7 +1966,7 @@ mod tests {
         .into_iter()
         .collect();
         for (candidate, content) in [
-            ("SecurityAgent", "// SecurityAgent dialog"),
+            ("SecurityAgent", "int SecurityAgent = 1;"),
             ("Trezor", "const char* vendor = \"Trezor\";"),
         ] {
             let proposal = Proposal {
@@ -1941,9 +2034,9 @@ mod tests {
     fn proposal_path_can_select_an_indexed_directory() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join("src")).unwrap();
-        std::fs::write(repo.path().join("src/a.rs"), "// shadowfax internal\n").unwrap();
-        std::fs::write(repo.path().join("src/b.rs"), "// shadowfax repeated\n").unwrap();
-        std::fs::write(repo.path().join("outside.rs"), "// shadowfax outside\n").unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "let shadowfax = 1;\n").unwrap();
+        std::fs::write(repo.path().join("src/b.rs"), "let shadowfax = 2;\n").unwrap();
+        std::fs::write(repo.path().join("outside.rs"), "let shadowfax = 3;\n").unwrap();
         crate::index::index_workspace(repo.path()).unwrap();
 
         let layout = Layout::new(repo.path());

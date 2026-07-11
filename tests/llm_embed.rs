@@ -120,7 +120,7 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
     std::fs::create_dir_all(repo.path().join("src")).unwrap();
     std::fs::write(
         repo.path().join("src/lib.rs"),
-        "// dangerous implementation detail\nfn megacorp_client() -> usize {\n    1\n}\n",
+        "// dangerous COMMENT_ONLY_TRIGGER implementation detail\nfn megacorp_client() -> usize {\n    1\n}\n",
     )
     .unwrap();
     index_workspace(repo.path()).unwrap();
@@ -129,6 +129,7 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
     // One proposal is valid, one references a term absent from the file.
     let reply = "```json\n{\"proposals\":[\
         {\"category\":\"identifier\",\"original_text\":\"megacorp\",\"sanitized_text\":\"examplefirm\",\"confidence\":0.95},\
+        {\"category\":\"identifier\",\"original_text\":\"COMMENT_ONLY_TRIGGER\",\"sanitized_text\":\"documentation_note\",\"confidence\":0.95},\
         {\"category\":\"identifier\",\"original_text\":\"ghost_term\",\"sanitized_text\":\"nothing\",\"confidence\":0.9}\
     ]}\n```";
     let chat_requests = Arc::new(AtomicUsize::new(0));
@@ -147,6 +148,18 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
             "known deterministic terms must be redacted before the provider boundary"
         );
         let task: Value = serde_json::from_str(user).unwrap();
+        assert!(
+            task["file"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("megacorp_client")
+        );
+        assert!(
+            !task["file"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("COMMENT_ONLY_TRIGGER")
+        );
         assert!(task["task"].as_str().unwrap().contains("security-"));
         assert!(
             task["rules"]
@@ -204,9 +217,9 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
     )
     .unwrap();
     assert_eq!(chat_requests.load(Ordering::SeqCst), 1);
-    assert_eq!(report.proposed, 2);
+    assert_eq!(report.proposed, 3);
     assert_eq!(report.queued, 1);
-    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(report.rejected.len(), 2);
 
     // The model never wrote the mirror; approval routes through the registry.
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();

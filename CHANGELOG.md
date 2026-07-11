@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- LLM proposal discovery no longer receives or queues source-comment
+  vocabulary. Comment text is masked before provider calls, and local
+  validation rejects comment categories and comment-only occurrences even when
+  a provider ignores the prompt contract.
+
 ## [0.4.2] - 2026-07-11
 
 ### Fixed
