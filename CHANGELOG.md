@@ -14,6 +14,42 @@ recomputes the same protected set. Also: file modes survive the patch bridge,
 `recover` survives a torn file, `sync` no longer destroys un-projected agent
 edits, and a lost `config.toml` no longer silently voids the policy.
 
+### Added
+
+- `install.sh` provides a no-`sudo` source installer with an animated release
+  build, configurable destination, atomic binary replacement, installed-version
+  verification, optional idempotent shell `PATH` setup, and uninstall support.
+- `propose-sanitize` now runs provider calls with bounded concurrency (four
+  workers by default, configurable with `sanitizer.propose_concurrency` or
+  `--jobs`) and reports live per-file progress, latency, queue counts, skips,
+  and errors on stderr. `--no-progress` disables the renderer, and `--json`
+  stdout remains a single machine-readable document.
+- Known dictionary/registry terms are now redacted before an LLM proposal
+  request. The task contract also travels in the structured user message, so
+  OpenAI-compatible gateways that replace custom system prompts still return
+  the required proposal JSON instead of prose or a refusal.
+- Repeated proposal scans no longer create duplicate pending review items for
+  the same file and normalized original term; progress and final reports expose
+  the number suppressed as `duplicates`.
+- Proposal JSON is normalized through an untyped JSON value before schema
+  decoding, tolerating duplicate object keys produced by some compatible
+  gateways while retaining the full local content/policy validation step.
+- LLM proposal discovery now explicitly covers security- and abuse-adjacent
+  vocabulary used in benign code, in addition to private naming. The prompt
+  carries the sanitizer's exact single-word-run constraints so model output is
+  directly compatible with the deterministic matcher.
+- The proposal task now requires byte-for-byte, case-sensitive source evidence
+  and a final membership preflight, explicitly forbidding invented concepts,
+  spelling/case changes, and words synthesized across source punctuation.
+- Large LLM proposal inputs are now split into configurable line-aligned,
+  overlapping chunks (`propose_chunk_bytes`, `propose_chunk_overlap_lines`).
+  Chunks run in bounded parallel waves, report request-level progress, and pass
+  validated findings plus existing pending-review originals to the next wave so
+  the model does not spend output tokens proposing them again. Overlap is sent
+  separately as read-only context; only the non-overlap region is eligible for
+  proposals, with local ownership and deduplication enforced before review.
+  External-command and heuristic provider contracts are unchanged.
+
 ### Breaking
 
 - **Protected identifiers are collected only from code contexts.** The

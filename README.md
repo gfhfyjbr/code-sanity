@@ -6,6 +6,20 @@ Sanitization is deterministic and local (dictionary + human-approved alias regis
 
 ## Installation
 
+From a source checkout, the installer builds an optimized binary and places it
+in `${CARGO_HOME:-$HOME/.cargo}/bin` without `sudo`:
+
+```bash
+./install.sh
+
+# Optional custom location and idempotent shell PATH setup:
+./install.sh --bin-dir "$HOME/.local/bin" --add-to-path
+```
+
+Run `./install.sh --help` for `--no-build`, `--uninstall`, and environment
+overrides. Installation is atomic and verifies the installed binary before
+returning success.
+
 Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 [GitHub Release](https://github.com/gfhfyjbr/code-sanity/releases):
 
@@ -21,7 +35,7 @@ tar xzf "code-sanity-${version}-${target}.tar.gz"
 install -m 755 "code-sanity-${version}-${target}/code-sanity" ~/.local/bin/
 ```
 
-Or build from source (Rust ≥ 1.85):
+The equivalent manual source installation (Rust ≥ 1.85) is:
 
 ```bash
 cargo install --git https://github.com/gfhfyjbr/code-sanity --locked
@@ -150,9 +164,14 @@ everything and resets pending (or tampered) mirror files back to
 
 The model never writes the mirror. It runs only in an offline *propose* step and its output is validated, queued, and applied deterministically:
 
-1. `code-sanity propose-sanitize [--path <path>]` runs the configured proposal provider. The default is a deterministic `HeuristicProposalProvider` (proposes neutral aliases for denylisted terms). Set `provider.kind = "external"` with a `command` (and optional `timeout_secs`) to plug in a local model; it receives `{rel, content}` JSON on stdin and returns a `ProposalBatch`. Because the command comes from repo-local config, executing it requires explicit confirmation with `--allow-provider-command`; stdin/stdout are pumped concurrently (no pipe deadlock on large files) and the child is killed on timeout. Set `provider.kind = "llm"` to use any OpenAI-compatible chat endpoint instead — e.g. a local [kou-router](https://github.com/gfhfyjbr/kou-router) gateway that fans out to OpenAI/Anthropic/Ollama accounts:
+1. `code-sanity propose-sanitize [--path <path>]` runs the configured proposal provider. The model searches for both private/project-specific naming and security- or abuse-adjacent vocabulary used benignly but liable to be misclassified without context. LLM files larger than `sanitizer.propose_chunk_bytes` are split on complete source lines with `propose_chunk_overlap_lines` of context. Chunks run in bounded parallel waves: pending-review originals and locally validated findings from each wave are sent as `already_proposed_originals` to the next one. Overlap travels as read-only `context_before`, while only the non-overlap `content` is eligible for proposals; ownership and deduplication are also enforced locally. Full-workspace scans use four concurrent requests by default (`sanitizer.propose_concurrency`, range 1–32); override one run with `--jobs <n>`. Live progress goes to stderr per request/chunk plus a per-file proposal summary, while `--json` keeps stdout as exactly one JSON document; `--no-progress` disables it. External-command and heuristic providers retain their one-request-per-file contract. The default provider is a deterministic `HeuristicProposalProvider` (proposes neutral aliases for denylisted terms). Set `provider.kind = "external"` with a `command` (and optional `timeout_secs`) to plug in a local model; it receives `{rel, content}` JSON on stdin and returns a `ProposalBatch`. Because the command comes from repo-local config, executing it requires explicit confirmation with `--allow-provider-command`; stdin/stdout are pumped concurrently (no pipe deadlock on large files) and the child is killed on timeout. Set `provider.kind = "llm"` to use any OpenAI-compatible chat endpoint instead — e.g. a local [kou-router](https://github.com/gfhfyjbr/kou-router) gateway that fans out to OpenAI/Anthropic/Ollama accounts:
 
    ```toml
+   [sanitizer]
+   propose_concurrency = 4
+   propose_chunk_bytes = 16384
+   propose_chunk_overlap_lines = 12
+
    [sanitizer.provider]
    kind = "llm"
    base_url = "http://127.0.0.1:20128/v1"
@@ -169,8 +188,8 @@ The model never writes the mirror. It runs only in an offline *propose* step and
    model = "anthropic/claude-sonnet-4.5"  # export OPENROUTER_API_KEY=sk-or-...
    ```
 
-   The model receives the real file plus the current policy (deny/allow lists, already-mapped terms) and must answer with a strict-JSON `ProposalBatch`. Because the endpoint comes from repo-local config **and receives real file content**, running it requires explicit confirmation with `--allow-provider-endpoint` — for all three kinds, including the loopback kou-router preset. Point `base_url` at a local gateway/Ollama to keep real code on the machine; a remote endpoint (OpenRouter included) sees exactly the content you are trying to sanitize. A remote endpoint with no API key in the environment fails fast with the variable name instead of an HTTP 401 mid-run.
-2. Each proposal is validated: the original must appear in the file, allowlisted terms are refused, identifier aliases must be valid identifiers, aliases may not introduce newlines or contain a denylisted term. Survivors are queued under `.code-sanity/review/`; anything touching a public API name or below `confidence_threshold` is flagged for review.
+   Before the provider boundary, terms already covered by the deterministic dictionary or approved registry are replaced with their aliases; the model receives the remaining real file content plus the current deny/allow policy and must answer with a strict-JSON `ProposalBatch`. Because unknown private naming is still real content and the endpoint comes from repo-local config, running it requires explicit confirmation with `--allow-provider-endpoint` — for all three kinds, including the loopback kou-router preset. Point `base_url` at a local gateway/Ollama to keep the remaining real code on the machine. A remote endpoint with no API key in the environment fails fast with the variable name instead of an HTTP 401 mid-run.
+2. The model contract requires `original_text` to be copied byte-for-byte from a contiguous, case-sensitive source substring and explicitly forbids case/spelling/inflection changes, joining punctuation-separated tokens, and labels inferred only from behavior. Local validation independently enforces source membership: the original must appear in the file, allowlisted and already-mapped terms are refused, identifier aliases must be valid identifiers, and aliases may not introduce newlines or contain a denylisted term. Survivors are queued under `.code-sanity/review/`; an existing pending item for the same file and normalized original term is counted as a duplicate instead of being queued again. Anything touching a public API name or below `confidence_threshold` is flagged for review.
 3. `code-sanity review [--all]` lists the queue. `review --approve <id>` records the alias in the deterministic registry (`sanitizer.alias_registry` in `config.toml`) and reindexes the file; `review --reject <id>` drops it. Approval re-validates so a stale queue can't apply an unsafe alias.
 4. `index`/`verify` use only the deterministic engine (dictionary + alias registry), so they stay reproducible and the model stays out of the write path.
 
@@ -291,7 +310,7 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `project-edit --path <path> [--agent <name>] [--session-id <id>]`
 - `recover [--rollback] [--force]` (`--force` overwrites files whose content changed after the crash)
 - `mode`
-- `propose-sanitize [--path <path>] [--allow-provider-command] [--allow-provider-endpoint]`
+- `propose-sanitize [--path <path>] [--jobs <1..32>] [--no-progress] [--allow-provider-command] [--allow-provider-endpoint]`
 - `review [--approve <id>] [--reject <id>] [--all]`
 - `review-sanitize [--path <path>]`
 - `sh -- <cmd> [args...]`
@@ -399,7 +418,7 @@ printed one per line and the process exits with code `3`.
 - The opencode plugin, MCP server, and Codex/Claude hooks are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
 - Codex/Claude hooks require `python3` on the host.
 - The model-based sanitizer is proposal-only: an external provider (a `command` confirmed with `--allow-provider-command`, or an OpenAI-compatible endpoint confirmed with `--allow-provider-endpoint`) must be supplied; there is no bundled LLM. The deterministic engine (dictionary + alias registry + denylist) always does the actual sanitization.
-- The `llm`/`openrouter`/`kou-router` proposal providers post real file content to the configured endpoint; keep it local (kou-router/Ollama) unless you accept that exposure. Embedding requests carry sanitized mirror content only.
+- The `llm`/`openrouter`/`kou-router` proposal providers pre-redact known dictionary/registry terms, then post the remaining real file content (line-aligned chunks for large files) to the configured endpoint; keep it local (kou-router/Ollama) unless you accept that exposure. Embedding requests carry sanitized mirror content only.
 - Semantic search is brute-force cosine over all stored vectors (no ANN index); fine for tens of thousands of chunks, not millions. Vectors go stale between `index` and the next `embed-index` run (self-healing, hash-keyed).
 - Strict mode (`sh`/`strict-run`) is a guardrail, not a hard sandbox; FUSE/overlay isolation is not implemented. Output sanitization covers terms present in the span maps/dictionary/registry/denylist; novel real names in output are not hidden.
 

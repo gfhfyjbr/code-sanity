@@ -43,7 +43,7 @@ Effort: **S** — up to half a day, **M** — 0.5–2 days, **L** — more than 
 | 15 | Parallel scan + i8 quantization in `semantic_search` | Search latency complaints at 50k+ chunks | M |
 | 16 | `sqlite-vec` (same db.sqlite, same transactions) | Repositories with hundreds of thousands of chunks; **not** an external vector DB — see the decision note below | M–L |
 | 17 | Cache query embeddings | A noticeable share of repeated `semantic-search` queries | S |
-| 18 | Homebrew tap / install.sh | A stream of external users appears | M |
+| 18 | Homebrew tap (`install.sh` is shipped) | A stream of external users appears | M |
 | 19 | Criterion benchmarks for index / patch bridge | Performance regressions while refactoring `patch.rs` | M |
 | 20 | Publish to crates.io | Decision to distribute via `cargo install code-sanity` | S |
 

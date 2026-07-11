@@ -252,6 +252,15 @@ pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
                 .to_string(),
         );
     }
+    if sanitizer.propose_chunk_bytes == 0 {
+        violations.push("sanitizer.propose_chunk_bytes must be at least 1".to_string());
+    }
+    if sanitizer.propose_chunk_overlap_lines > 1_000 {
+        violations.push("sanitizer.propose_chunk_overlap_lines must not exceed 1000".to_string());
+    }
+    if !(1..=32).contains(&sanitizer.propose_concurrency) {
+        violations.push("sanitizer.propose_concurrency must be between 1 and 32".to_string());
+    }
     if config.ignore.max_file_bytes == 0 {
         violations
             .push("ignore.max_file_bytes is 0; every file would be silently skipped".to_string());
@@ -1199,6 +1208,9 @@ mod tests {
         let mut config = Config::default();
         config.sanitizer.confidence_threshold = 5.0;
         config.sanitizer.propose_max_file_bytes = 0;
+        config.sanitizer.propose_chunk_bytes = 0;
+        config.sanitizer.propose_chunk_overlap_lines = 1_001;
+        config.sanitizer.propose_concurrency = 0;
         config.ignore.max_file_bytes = 0;
         config.embeddings.chunk_lines = 4;
         config.embeddings.chunk_overlap = 4; // must be < chunk_lines
@@ -1207,6 +1219,9 @@ mod tests {
         for needle in [
             "confidence_threshold",
             "propose_max_file_bytes",
+            "propose_chunk_bytes",
+            "propose_chunk_overlap_lines",
+            "propose_concurrency",
             "ignore.max_file_bytes",
             "chunk_overlap",
             "batch_size",
@@ -1223,6 +1238,8 @@ mod tests {
         config.sanitizer.confidence_threshold = 0.0;
         assert_eq!(sanitizer_policy_violations(&config), Vec::<String>::new());
         config.sanitizer.confidence_threshold = 1.0;
+        assert_eq!(sanitizer_policy_violations(&config), Vec::<String>::new());
+        config.sanitizer.propose_concurrency = 32;
         assert_eq!(sanitizer_policy_violations(&config), Vec::<String>::new());
     }
 

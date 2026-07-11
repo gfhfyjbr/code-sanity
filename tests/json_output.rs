@@ -323,3 +323,28 @@ fn human_output_is_unchanged_without_the_flag() {
         "human key=value format is the default: {stdout:?}"
     );
 }
+
+#[test]
+fn proposal_progress_uses_stderr_without_polluting_json_stdout() {
+    let repo = copy_fixture("basic-rust");
+    index(repo.path());
+
+    let assert = cli(repo.path())
+        .args(["propose-sanitize", "--jobs", "2"])
+        .assert()
+        .success();
+    let output = assert.get_output();
+    let value = envelope(&output.stdout);
+    assert_eq!(value["command"], "propose-sanitize");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("provider scan:"), "{stderr}");
+    assert!(stderr.contains("provider scan finished:"), "{stderr}");
+    assert!(stderr.contains("/"), "per-file progress missing: {stderr}");
+
+    let quiet = cli(repo.path())
+        .args(["propose-sanitize", "--no-progress"])
+        .assert()
+        .success();
+    assert!(quiet.get_output().stderr.is_empty());
+    envelope(&quiet.get_output().stdout);
+}

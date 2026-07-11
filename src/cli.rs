@@ -7,8 +7,9 @@ use crate::search::read_sanitized_file;
 use crate::verify::verify_workspace;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -147,6 +148,12 @@ enum Command {
     ProposeSanitize {
         #[arg(long)]
         path: Option<PathBuf>,
+        /// Maximum concurrent provider requests (default from config, normally 4).
+        #[arg(short = 'j', long, value_parser = parse_propose_jobs)]
+        jobs: Option<usize>,
+        /// Disable live progress on stderr.
+        #[arg(long)]
+        no_progress: bool,
         /// Confirm executing the provider command from repo-local config.
         #[arg(long)]
         allow_provider_command: bool,
@@ -365,6 +372,238 @@ pub fn run() -> Result<()> {
             }
             Err(err)
         }
+    }
+}
+
+struct ProposeProgressUi {
+    enabled: bool,
+    terminal: bool,
+    total: usize,
+    done: usize,
+    total_requests: usize,
+    done_requests: usize,
+    active: BTreeSet<String>,
+    queued: usize,
+    duplicates: usize,
+    errors: usize,
+    chunk_errors: usize,
+    skipped: usize,
+    last_file: Option<String>,
+}
+
+impl ProposeProgressUi {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            terminal: io::stderr().is_terminal(),
+            total: 0,
+            done: 0,
+            total_requests: 0,
+            done_requests: 0,
+            active: BTreeSet::new(),
+            queued: 0,
+            duplicates: 0,
+            errors: 0,
+            chunk_errors: 0,
+            skipped: 0,
+            last_file: None,
+        }
+    }
+
+    fn handle(&mut self, event: crate::proposal::ProposeProgress) {
+        if !self.enabled {
+            return;
+        }
+        use crate::proposal::{ProposeFileOutcome, ProposeProgress};
+        match event {
+            ProposeProgress::Started {
+                total,
+                jobs,
+                requests,
+            } => {
+                self.total = total;
+                self.total_requests = requests;
+                eprintln!("provider scan: {total} files, {requests} request(s), {jobs} concurrent");
+            }
+            ProposeProgress::FileStarted { file, chunks, .. } => {
+                self.last_file = Some(file.clone());
+                if chunks == 0 {
+                    self.active.insert(file);
+                }
+                if self.terminal {
+                    self.render_terminal();
+                }
+            }
+            ProposeProgress::ChunkStarted {
+                file,
+                chunk,
+                chunks,
+            } => {
+                let label = chunk_label(&file, chunk, chunks);
+                self.last_file = Some(label.clone());
+                self.active.insert(label);
+                if self.terminal {
+                    self.render_terminal();
+                }
+            }
+            ProposeProgress::ChunkFinished {
+                completed,
+                total,
+                file,
+                chunk,
+                chunks,
+                elapsed_ms,
+                outcome,
+            } => {
+                self.done_requests = completed;
+                self.total_requests = total;
+                let label = chunk_label(&file, chunk, chunks);
+                self.active.remove(&label);
+                self.last_file = self.active.iter().next_back().cloned();
+                if matches!(outcome, crate::proposal::ProposeChunkOutcome::Error) {
+                    self.chunk_errors += 1;
+                }
+                if self.terminal {
+                    self.render_terminal();
+                } else {
+                    let status = match outcome {
+                        crate::proposal::ProposeChunkOutcome::Completed => "ok",
+                        crate::proposal::ProposeChunkOutcome::Error => "error",
+                    };
+                    eprintln!(
+                        "[req {completed:>3}/{total}] {status:<5} {:>7}  {}",
+                        format_duration(elapsed_ms),
+                        display_path(&label)
+                    );
+                }
+            }
+            ProposeProgress::FileFinished {
+                completed,
+                total,
+                file,
+                elapsed_ms,
+                outcome,
+                proposed,
+                queued,
+                duplicates,
+                rejected,
+            } => {
+                self.done = completed;
+                self.total = total;
+                self.active.remove(&file);
+                self.last_file = self.active.iter().next_back().cloned();
+                self.queued += queued;
+                self.duplicates += duplicates;
+                match outcome {
+                    ProposeFileOutcome::Error => self.errors += 1,
+                    ProposeFileOutcome::Skipped => self.skipped += 1,
+                    ProposeFileOutcome::Completed => {}
+                }
+                if self.terminal {
+                    self.render_terminal();
+                } else {
+                    let status = match outcome {
+                        ProposeFileOutcome::Completed => "ok",
+                        ProposeFileOutcome::Skipped => "skip",
+                        ProposeFileOutcome::Error => "error",
+                    };
+                    eprintln!(
+                        "[{completed:>3}/{total}] {status:<5} {:>7}  proposals={proposed} queued={queued} duplicates={duplicates} rejected={rejected}  {}",
+                        format_duration(elapsed_ms),
+                        display_path(&file)
+                    );
+                }
+            }
+            ProposeProgress::Finished {
+                total,
+                requests,
+                elapsed_ms,
+                proposed,
+                queued,
+                duplicates,
+                rejected,
+                skipped,
+                errors,
+            } => {
+                if self.terminal {
+                    clear_progress_line();
+                }
+                eprintln!(
+                    "provider scan finished: files={total} requests={requests} proposed={proposed} queued={queued} duplicates={duplicates} rejected={rejected} skipped={skipped} errors={errors} elapsed={}",
+                    format_duration(elapsed_ms)
+                );
+            }
+        }
+    }
+
+    fn render_terminal(&self) {
+        const WIDTH: usize = 24;
+        let (done, total) = if self.total_requests == 0 {
+            (self.done, self.total)
+        } else {
+            (self.done_requests, self.total_requests)
+        };
+        let filled = done
+            .saturating_mul(WIDTH)
+            .checked_div(total)
+            .unwrap_or(WIDTH);
+        let mut bar = String::with_capacity(WIDTH);
+        bar.push_str(&"=".repeat(filled.min(WIDTH)));
+        if filled < WIDTH {
+            bar.push('>');
+            bar.push_str(&" ".repeat(WIDTH - filled - 1));
+        }
+        let file = self
+            .last_file
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_default();
+        eprint!(
+            "\r\x1b[2K[{bar}] req={done:>3}/{total} files={files_done}/{files_total} active={active} queued={queued} dup={duplicates} errors={errors} {file}",
+            files_done = self.done,
+            files_total = self.total,
+            active = self.active.len(),
+            queued = self.queued,
+            duplicates = self.duplicates,
+            errors = self.errors + self.chunk_errors,
+        );
+        let _ = io::stderr().flush();
+    }
+}
+
+fn chunk_label(file: &str, chunk: usize, chunks: usize) -> String {
+    if chunks == 1 {
+        file.to_string()
+    } else {
+        format!("{file} [{chunk}/{chunks}]")
+    }
+}
+
+fn clear_progress_line() {
+    eprint!("\r\x1b[2K");
+    let _ = io::stderr().flush();
+}
+
+fn display_path(path: &str) -> String {
+    path.chars().flat_map(char::escape_default).collect()
+}
+
+fn format_duration(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
+}
+
+fn parse_propose_jobs(raw: &str) -> std::result::Result<usize, String> {
+    let jobs = raw
+        .parse::<usize>()
+        .map_err(|_| "jobs must be an integer between 1 and 32".to_string())?;
+    if (1..=32).contains(&jobs) {
+        Ok(jobs)
+    } else {
+        Err("jobs must be between 1 and 32".to_string())
     }
 }
 
@@ -592,16 +831,21 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
         }
         Command::ProposeSanitize {
             path,
+            jobs,
+            no_progress,
             allow_provider_command,
             allow_provider_endpoint,
         } => {
-            let report = crate::proposal::propose_sanitize(
+            let mut progress = ProposeProgressUi::new(!no_progress);
+            let report = crate::proposal::propose_sanitize_with_progress(
                 &root,
                 path.as_deref(),
                 crate::proposal::ProviderAllow {
                     command: allow_provider_command,
                     endpoint: allow_provider_endpoint,
                 },
+                jobs,
+                |event| progress.handle(event),
             )?;
             for error in &report.errors {
                 eprintln!("error: {error}");
@@ -610,9 +854,10 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                 out.emit("propose-sanitize", serde_json::to_value(&report)?, None);
             } else {
                 println!(
-                    "proposed={} queued={} rejected={} skipped={} errors={}",
+                    "proposed={} queued={} duplicates={} rejected={} skipped={} errors={}",
                     report.proposed,
                     report.queued,
+                    report.duplicates,
                     report.rejected.len(),
                     report.skipped.len(),
                     report.errors.len()

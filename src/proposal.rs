@@ -13,14 +13,16 @@ use crate::db;
 use crate::index::reconverge_workspace;
 use crate::lock::WorkspaceLock;
 use crate::map::load_span_map;
-use crate::sanitize::{collect_protected_identifiers, derive_alias};
+use crate::sanitize::{collect_protected_identifiers, derive_alias, normalize_term};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Instant;
 
 /// A single sanitization proposal. This is the model-facing schema: a provider
 /// returns these, the engine validates and (on approval) records them.
@@ -71,6 +73,8 @@ pub enum ReviewStatus {
 pub struct ProposeReport {
     pub proposed: usize,
     pub queued: usize,
+    /// Valid proposals already represented by a pending review item.
+    pub duplicates: usize,
     pub rejected: Vec<String>,
     /// Per-file failures (read error, provider error): the run continues past
     /// them; only an all-files-failed run is a hard error.
@@ -79,9 +83,132 @@ pub struct ProposeReport {
     pub skipped: Vec<String>,
 }
 
+/// Live, non-sensitive progress from a proposal run. Events name repo-relative
+/// files and counts, but never include file content, model replies, or keys.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+pub enum ProposeProgress {
+    Started {
+        total: usize,
+        jobs: usize,
+        requests: usize,
+    },
+    FileStarted {
+        position: usize,
+        total: usize,
+        file: String,
+        chunks: usize,
+    },
+    ChunkStarted {
+        file: String,
+        chunk: usize,
+        chunks: usize,
+    },
+    ChunkFinished {
+        completed: usize,
+        total: usize,
+        file: String,
+        chunk: usize,
+        chunks: usize,
+        elapsed_ms: u64,
+        outcome: ProposeChunkOutcome,
+    },
+    FileFinished {
+        completed: usize,
+        total: usize,
+        file: String,
+        elapsed_ms: u64,
+        outcome: ProposeFileOutcome,
+        proposed: usize,
+        queued: usize,
+        duplicates: usize,
+        rejected: usize,
+    },
+    Finished {
+        total: usize,
+        requests: usize,
+        elapsed_ms: u64,
+        proposed: usize,
+        queued: usize,
+        duplicates: usize,
+        rejected: usize,
+        skipped: usize,
+        errors: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProposeFileOutcome {
+    Completed,
+    Skipped,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProposeChunkOutcome {
+    Completed,
+    Error,
+}
+
+/// Location of the current request inside the complete source file. Indexes
+/// and line numbers are one-based and inclusive.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ProposalChunkMeta {
+    pub index: usize,
+    pub total: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    /// First line owned by this chunk. Earlier lines are overlap context only.
+    pub core_start_line: usize,
+    /// Last line owned by this chunk (inclusive).
+    pub core_end_line: usize,
+}
+
+impl ProposalChunkMeta {
+    fn single(content: &str) -> Self {
+        Self {
+            index: 1,
+            total: 1,
+            start_line: 1,
+            end_line: content.lines().count().max(1),
+            core_start_line: 1,
+            core_end_line: content.lines().count().max(1),
+        }
+    }
+}
+
+/// File-local findings that a later chunk should not propose again.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ProposalRequestContext {
+    pub already_proposed_originals: Vec<String>,
+}
+
 /// A provider of sanitization proposals (the model interface).
-pub trait ProposalProvider {
+pub trait ProposalProvider: Sync {
     fn propose(&self, rel: &Path, content: &str, config: &Config) -> Result<Vec<Proposal>>;
+
+    fn propose_chunk(
+        &self,
+        rel: &Path,
+        content: &str,
+        config: &Config,
+        _chunk: ProposalChunkMeta,
+    ) -> Result<Vec<Proposal>> {
+        self.propose(rel, content, config)
+    }
+
+    fn propose_chunk_with_context(
+        &self,
+        rel: &Path,
+        content: &str,
+        config: &Config,
+        chunk: ProposalChunkMeta,
+        _context: &ProposalRequestContext,
+    ) -> Result<Vec<Proposal>> {
+        self.propose_chunk(rel, content, config, chunk)
+    }
 }
 
 /// Offline/local model provider: `command` is invoked with `{rel, content}` JSON
@@ -218,8 +345,8 @@ impl ProposalProvider for HeuristicProposalProvider {
 }
 
 /// OpenAI-compatible chat provider (e.g. a local kou-router gateway). The model
-/// receives the real file plus the current policy (deny/allow lists, terms that
-/// already have mappings) and must answer with a strict-JSON [`ProposalBatch`].
+/// receives the file after known mappings are pre-redacted and must answer with
+/// a strict-JSON [`ProposalBatch`].
 /// Its output goes through the same validation and review queue as any other
 /// provider — it never touches the mirror.
 pub struct LlmProposalProvider {
@@ -230,38 +357,103 @@ pub struct LlmProposalProvider {
     pub json_mode: bool,
 }
 
-const LLM_SYSTEM_PROMPT: &str = "You review source code for terms that could \
-trigger false-positive safety refusals in coding agents (e.g. words that sound \
-like malware, attacks, or exfiltration but are benign here) or that leak \
-private naming (internal company, product, or customer names). Propose neutral \
-replacement aliases.\n\
-Rules:\n\
-- only propose terms that literally appear in the file;\n\
-- never propose terms from `allowlist`, and never re-propose keys from `already_mapped`;\n\
-- an alias for category \"identifier\" must be a valid ASCII identifier;\n\
-- aliases must not contain newlines and must not contain any `denylist` term;\n\
-- do not propose renames that change behavior-bearing text (imports, protocol \
-strings, SQL, shell commands, public API names).\n\
-Respond with strict JSON only, no prose and no markdown fences:\n\
-{\"proposals\":[{\"category\":\"identifier|comment|string\",\
-\"original_text\":\"...\",\"sanitized_text\":\"...\",\"confidence\":0.0,\
-\"rationale\":\"...\"}]}\n\
-If nothing needs sanitizing, respond {\"proposals\":[]}.";
+// Some OpenAI-compatible gateways replace or heavily prefix the system prompt.
+// Keep the authoritative task contract in the structured user message below;
+// this short system instruction is only a first line of defense.
+const LLM_SYSTEM_PROMPT: &str = "Return only valid JSON matching the schema provided by the user.";
 
 impl ProposalProvider for LlmProposalProvider {
     fn propose(&self, rel: &Path, content: &str, config: &Config) -> Result<Vec<Proposal>> {
-        let already_mapped: Vec<&String> = config
-            .sanitizer
-            .dictionary
-            .keys()
-            .chain(config.sanitizer.alias_registry.keys())
-            .collect();
+        self.propose_chunk_with_context(
+            rel,
+            content,
+            config,
+            ProposalChunkMeta::single(content),
+            &ProposalRequestContext::default(),
+        )
+    }
+
+    fn propose_chunk(
+        &self,
+        rel: &Path,
+        content: &str,
+        config: &Config,
+        chunk: ProposalChunkMeta,
+    ) -> Result<Vec<Proposal>> {
+        self.propose_chunk_with_context(
+            rel,
+            content,
+            config,
+            chunk,
+            &ProposalRequestContext::default(),
+        )
+    }
+
+    fn propose_chunk_with_context(
+        &self,
+        rel: &Path,
+        content: &str,
+        config: &Config,
+        chunk: ProposalChunkMeta,
+        context: &ProposalRequestContext,
+    ) -> Result<Vec<Proposal>> {
+        // Known dictionary/registry terms need no model judgment. Redact them
+        // before the remote boundary instead of sending a trigger-heavy
+        // `already_mapped` list alongside the still-real occurrences. Keep the
+        // denylist visible: unmapped denylisted terms are exactly what the
+        // proposer must help name.
+        let mut provider_config = config.clone();
+        provider_config.sanitizer.denylist.clear();
+        let provider_content =
+            crate::redact::Redactor::terms_only(&provider_config).redact(content);
+        let core_offset = proposal_core_offset(&provider_content, chunk);
+        let (context_before, provider_content) = provider_content.split_at(core_offset);
         let user = serde_json::to_string(&serde_json::json!({
-            "rel": crate::config::normalize_rel_path(rel),
-            "content": content,
-            "denylist": config.sanitizer.denylist,
-            "allowlist": config.sanitizer.allowlist,
-            "already_mapped": already_mapped,
+            "task": "Review this source file for two independent classes of lexical normalization candidates: (1) project-specific private organization, product, project, customer, and internal names; (2) security- or abuse-adjacent vocabulary used in a benign developer context that could be misclassified by an automated safety filter when read without context. Suggest clear context-neutral replacement terms while preserving the code's meaning.",
+            "rules": [
+                "original_text must be copied byte-for-byte from one contiguous case-sensitive substring of file.content",
+                "Never change original_text capitalization, spelling, inflection, plurality, or separators; never join source tokens separated by whitespace or punctuation",
+                "Never invent a label for a concept merely implied by the code; if the exact candidate is not present, omit it",
+                "For security- or abuse-adjacent vocabulary, include terms associated with offensive-security behavior, credential or device identity abuse, evasion, injection, unauthorized automation, harmful payloads, or similar risk-loaded concepts when the file uses them benignly",
+                "Do not suggest ordinary technical terms unless their standalone or compound meaning is plausibly risk-loaded and could be misclassified without context",
+                "Do not suggest changes to imports, public APIs, protocol constants, SQL, or shell syntax",
+                "Do not suggest any term listed in policy.allowlist",
+                "Both original_text and sanitized_text must each be exactly one ASCII word run matching [A-Za-z0-9_]+; never return spaces, hyphens, dots, slashes, or punctuation",
+                "For a candidate embedded in a larger identifier, return the smallest meaningful risk-loaded or private-name substring rather than the entire identifier",
+                "Treat file.context_before only as read-only context; original_text must occur in file.content, which is the current chunk's owned analysis region",
+                "Do not return an original_text already represented in context.already_proposed_originals, including capitalization or separator variants",
+                "When category is identifier, sanitized_text must additionally match [A-Za-z_][A-Za-z0-9_]*",
+                "Replacement text must not contain a term listed in policy.denylist",
+                "Return strict JSON only, without prose or markdown"
+            ],
+            "required_output_preflight": [
+                "For every proposal, verify file.content contains original_text using an exact case-sensitive substring check",
+                "Remove every proposal that fails the exact substring check",
+                "Remove every proposal already represented in context.already_proposed_originals",
+                "Remove every proposal whose original_text or sanitized_text fails the single ASCII word-run rule"
+            ],
+            "output_schema": {
+                "proposals": [{
+                    "category": "identifier|comment|string",
+                    "original_text": "string",
+                    "sanitized_text": "string",
+                    "confidence": "number from 0 to 1",
+                    "rationale": "state whether this is a private-name or security/abuse-adjacent candidate and why"
+                }]
+            },
+            "empty_response": { "proposals": [] },
+            "context": context,
+            "policy": {
+                "denylist": config.sanitizer.denylist,
+                "allowlist": config.sanitizer.allowlist,
+                "known_terms_redacted": true
+            },
+            "file": {
+                "rel": crate::config::normalize_rel_path(rel),
+                "chunk": chunk,
+                "context_before": context_before,
+                "content": provider_content
+            }
         }))?;
         let reply = self
             .client
@@ -296,16 +488,39 @@ fn strip_code_fences(reply: &str) -> &str {
 fn parse_proposals(raw: &str) -> Result<Vec<Proposal>> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        bail!("provider returned an empty response instead of a ProposalBatch");
     }
-    let batch_err = match serde_json::from_str::<ProposalBatch>(trimmed) {
+    if !trimmed.starts_with(['{', '[']) {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("can't")
+            || lower.contains("cannot")
+            || lower.contains("won't")
+            || lower.contains("refus")
+        {
+            bail!(
+                "provider refused the proposal request instead of returning JSON; \
+                 try another model/provider or revise the proposal task prompt"
+            );
+        }
+        bail!(
+            "provider returned non-JSON text instead of a ProposalBatch; \
+             enable provider json_mode or use a model that follows the JSON schema"
+        );
+    }
+    // Model gateways occasionally emit the same object key twice. Parsing via
+    // Value normalizes that common JSON interoperability wart (last value
+    // wins) before typed deserialization; every resulting proposal still goes
+    // through the real-content and policy validation below.
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|err| anyhow!("parse proposals JSON: {err}"))?;
+    let batch_err = match serde_json::from_value::<ProposalBatch>(value.clone()) {
         Ok(batch) => return Ok(batch.proposals),
         Err(err) => err,
     };
     // Report BOTH failures: the batch shape is what providers are told to
     // emit, so swallowing its error left only the (less relevant) array
     // error to debug a near-miss batch against.
-    serde_json::from_str::<Vec<Proposal>>(trimmed).map_err(|array_err| {
+    serde_json::from_value::<Vec<Proposal>>(value).map_err(|array_err| {
         anyhow!(
             "parse proposals: not a ProposalBatch ({batch_err}) and not a \
              proposal array ({array_err})"
@@ -376,6 +591,83 @@ pub fn propose_sanitize(
     rel: Option<&Path>,
     allow: ProviderAllow,
 ) -> Result<ProposeReport> {
+    propose_sanitize_with_progress(root, rel, allow, None, |_| {})
+}
+
+#[derive(Debug, Clone)]
+struct ProposalChunk {
+    meta: ProposalChunkMeta,
+    content: String,
+}
+
+struct WorkItem {
+    file_index: usize,
+    file: String,
+    chunk: ProposalChunk,
+}
+
+struct FileState {
+    position: usize,
+    file: String,
+    real: String,
+    chunks: usize,
+    remaining: usize,
+    started_at: Option<Instant>,
+    proposals: Vec<Proposal>,
+    proposed: usize,
+    duplicates: usize,
+    rejected: Vec<String>,
+    errors: Vec<String>,
+    immediate: Option<ImmediateFileResult>,
+}
+
+enum ImmediateFileResult {
+    Skipped(String),
+    Error(String),
+}
+
+enum WorkerEvent {
+    ChunkFinished {
+        wave_index: usize,
+        file_index: usize,
+        file: String,
+        meta: ProposalChunkMeta,
+        elapsed_ms: u64,
+        result: WorkerResult,
+    },
+}
+
+enum WorkerResult {
+    Proposals(Vec<Proposal>),
+    Error(String),
+}
+
+struct FileCompletion {
+    outcome: ProposeFileOutcome,
+    proposed: usize,
+    queued: usize,
+    duplicates: usize,
+    rejected: usize,
+}
+
+struct FileProviderOutput {
+    proposals: Vec<Proposal>,
+    proposed: usize,
+    duplicates: usize,
+    rejected: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Run the proposal provider with bounded concurrency and publish progress from
+/// the coordinating thread. `jobs = None` uses
+/// `sanitizer.propose_concurrency`; callers can override it for one run.
+pub fn propose_sanitize_with_progress(
+    root: &Path,
+    rel: Option<&Path>,
+    allow: ProviderAllow,
+    jobs: Option<usize>,
+    mut progress: impl FnMut(ProposeProgress),
+) -> Result<ProposeReport> {
     // Plain init (the wrapper drops the exclusive lock): provider calls may
     // block on HTTP or a child process and must not starve workspace writers.
     let layout = crate::index::init_workspace(root)?;
@@ -397,47 +689,334 @@ pub fn propose_sanitize(
         }
     };
 
+    let started_at = Instant::now();
     let mut report = ProposeReport::default();
+    let pending_items = list_review(root, false)?;
+    let mut pending_keys: BTreeSet<(String, String)> = pending_items
+        .iter()
+        .map(|item| {
+            (
+                item.file.clone(),
+                normalize_term(&item.proposal.original_text),
+            )
+        })
+        .collect();
+    let mut already_proposed_by_file = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for item in pending_items {
+        already_proposed_by_file
+            .entry(item.file)
+            .or_default()
+            .entry(normalize_term(&item.proposal.original_text))
+            .or_insert(item.proposal.original_text);
+    }
     let total = files.len();
-    for file in files {
-        // One unreadable or provider-rejected file must not abort the whole
-        // multi-file run; skip-and-report, hard-fail only when nothing at all
-        // succeeded (a misconfigured provider fails every file identically).
-        let real = match std::fs::read_to_string(root.join(&file)) {
-            Ok(real) => real,
-            Err(err) => {
-                report.errors.push(format!("{file}: read failed: {err}"));
-                continue;
+    let chunk_llm_files = config.sanitizer.provider.llm_endpoint().is_some();
+    let mut file_states = Vec::with_capacity(total);
+    let mut work_items = Vec::new();
+    for (file_index, file) in files.into_iter().enumerate() {
+        let position = file_index + 1;
+        let read = std::fs::read_to_string(root.join(&file));
+        let (real, chunks, immediate) = match read {
+            Err(err) => (
+                String::new(),
+                Vec::new(),
+                Some(ImmediateFileResult::Error(format!("read failed: {err}"))),
+            ),
+            Ok(real) if real.len() as u64 > config.sanitizer.propose_max_file_bytes => {
+                let reason = format!(
+                    "{} bytes exceeds sanitizer.propose_max_file_bytes ({})",
+                    real.len(),
+                    config.sanitizer.propose_max_file_bytes
+                );
+                (real, Vec::new(), Some(ImmediateFileResult::Skipped(reason)))
+            }
+            Ok(real) => {
+                let chunks = if chunk_llm_files {
+                    split_proposal_chunks(
+                        &real,
+                        config.sanitizer.propose_chunk_bytes,
+                        config.sanitizer.propose_chunk_overlap_lines,
+                    )
+                } else {
+                    vec![ProposalChunk {
+                        meta: ProposalChunkMeta::single(&real),
+                        content: real.clone(),
+                    }]
+                };
+                (real, chunks, None)
             }
         };
-        if real.len() as u64 > config.sanitizer.propose_max_file_bytes {
-            report.skipped.push(format!(
-                "{file}: {} bytes exceeds sanitizer.propose_max_file_bytes ({})",
-                real.len(),
-                config.sanitizer.propose_max_file_bytes
-            ));
-            continue;
+        let chunk_count = chunks.len();
+        for chunk in chunks {
+            work_items.push(WorkItem {
+                file_index,
+                file: file.clone(),
+                chunk,
+            });
         }
-        let proposals = match provider.propose(Path::new(&file), &real, &config) {
-            Ok(proposals) => proposals,
-            Err(err) => {
-                report.errors.push(format!("{file}: {err:#}"));
-                continue;
+        file_states.push(FileState {
+            position,
+            file,
+            real,
+            chunks: chunk_count,
+            remaining: chunk_count,
+            started_at: None,
+            proposals: Vec::new(),
+            proposed: 0,
+            duplicates: 0,
+            rejected: Vec::new(),
+            errors: Vec::new(),
+            immediate,
+        });
+    }
+
+    let request_total = work_items.len();
+    let jobs = jobs
+        .unwrap_or(config.sanitizer.propose_concurrency)
+        .min(32)
+        .clamp(1, request_total.max(1));
+    progress(ProposeProgress::Started {
+        total,
+        jobs,
+        requests: request_total,
+    });
+
+    let mut completed_files = 0usize;
+    for state in &mut file_states {
+        let Some(immediate) = state.immediate.take() else {
+            continue;
+        };
+        progress(ProposeProgress::FileStarted {
+            position: state.position,
+            total,
+            file: state.file.clone(),
+            chunks: 0,
+        });
+        let outcome = match immediate {
+            ImmediateFileResult::Skipped(reason) => {
+                report.skipped.push(format!("{}: {reason}", state.file));
+                ProposeFileOutcome::Skipped
+            }
+            ImmediateFileResult::Error(reason) => {
+                report.errors.push(format!("{}: {reason}", state.file));
+                ProposeFileOutcome::Error
             }
         };
-        for proposal in proposals {
-            report.proposed += 1;
-            match validate_proposal(Path::new(&file), &proposal, &real, &config) {
-                Ok(flag) => {
-                    enqueue_review(&layout, &file, &proposal, &flag)?;
-                    report.queued += 1;
-                }
-                Err(reason) => report
-                    .rejected
-                    .push(format!("{}: {reason}", proposal.original_text)),
+        completed_files += 1;
+        progress(ProposeProgress::FileFinished {
+            completed: completed_files,
+            total,
+            file: state.file.clone(),
+            elapsed_ms: 0,
+            outcome,
+            proposed: 0,
+            queued: 0,
+            duplicates: 0,
+            rejected: 0,
+        });
+    }
+
+    let mut completed_requests = 0usize;
+    for wave in work_items.chunks(jobs) {
+        let contexts = wave
+            .iter()
+            .map(|item| ProposalRequestContext {
+                already_proposed_originals: already_proposed_by_file
+                    .get(&item.file)
+                    .map(|items| items.values().cloned().collect())
+                    .unwrap_or_default(),
+            })
+            .collect::<Vec<_>>();
+
+        for item in wave {
+            let state = &mut file_states[item.file_index];
+            if state.started_at.is_none() {
+                state.started_at = Some(Instant::now());
+                progress(ProposeProgress::FileStarted {
+                    position: state.position,
+                    total,
+                    file: item.file.clone(),
+                    chunks: state.chunks,
+                });
             }
+            progress(ProposeProgress::ChunkStarted {
+                file: item.file.clone(),
+                chunk: item.chunk.meta.index,
+                chunks: item.chunk.meta.total,
+            });
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut wave_results = Vec::with_capacity(wave.len());
+        std::thread::scope(|scope| {
+            for (wave_index, item) in wave.iter().enumerate() {
+                let tx = tx.clone();
+                let provider = &provider;
+                let config = &config;
+                let context = &contexts[wave_index];
+                scope.spawn(move || {
+                    let request_started = Instant::now();
+                    let result = match provider.propose_chunk_with_context(
+                        Path::new(&item.file),
+                        &item.chunk.content,
+                        config,
+                        item.chunk.meta,
+                        context,
+                    ) {
+                        Ok(proposals) => WorkerResult::Proposals(proposals),
+                        Err(err) => WorkerResult::Error(format!("{err:#}")),
+                    };
+                    let _ = tx.send(WorkerEvent::ChunkFinished {
+                        wave_index,
+                        file_index: item.file_index,
+                        file: item.file.clone(),
+                        meta: item.chunk.meta,
+                        elapsed_ms: elapsed_ms(request_started),
+                        result,
+                    });
+                });
+            }
+            drop(tx);
+
+            for event in rx {
+                match &event {
+                    WorkerEvent::ChunkFinished {
+                        file,
+                        meta,
+                        elapsed_ms: request_elapsed_ms,
+                        result,
+                        ..
+                    } => {
+                        completed_requests += 1;
+                        let chunk_outcome = if matches!(result, WorkerResult::Error(_)) {
+                            ProposeChunkOutcome::Error
+                        } else {
+                            ProposeChunkOutcome::Completed
+                        };
+                        progress(ProposeProgress::ChunkFinished {
+                            completed: completed_requests,
+                            total: request_total,
+                            file: file.clone(),
+                            chunk: meta.index,
+                            chunks: meta.total,
+                            elapsed_ms: *request_elapsed_ms,
+                            outcome: chunk_outcome,
+                        });
+                    }
+                }
+                wave_results.push(event);
+            }
+        });
+
+        wave_results.sort_by_key(|event| match event {
+            WorkerEvent::ChunkFinished { wave_index, .. } => *wave_index,
+        });
+        for event in wave_results {
+            let WorkerEvent::ChunkFinished {
+                wave_index,
+                file_index,
+                file,
+                meta,
+                result,
+                ..
+            } = event;
+            let state = &mut file_states[file_index];
+            match result {
+                WorkerResult::Proposals(proposals) => {
+                    state.proposed += proposals.len();
+                    let context_keys = contexts[wave_index]
+                        .already_proposed_originals
+                        .iter()
+                        .map(|item| normalize_term(item))
+                        .collect::<BTreeSet<_>>();
+                    let chunk = &wave[wave_index].chunk;
+                    let core_content = proposal_core_content(&chunk.content, meta);
+                    for proposal in proposals {
+                        let normalized = normalize_term(&proposal.original_text);
+                        if context_keys.contains(&normalized)
+                            || (!core_content.contains(&proposal.original_text)
+                                && chunk.content.contains(&proposal.original_text))
+                        {
+                            state.duplicates += 1;
+                            continue;
+                        }
+                        if !core_content.contains(&proposal.original_text) {
+                            state.rejected.push(format!(
+                                "{}: original text does not appear in the chunk's owned content",
+                                proposal.original_text
+                            ));
+                            continue;
+                        }
+                        if validate_proposal(Path::new(&file), &proposal, &state.real, &config)
+                            .is_ok()
+                        {
+                            already_proposed_by_file
+                                .entry(file.clone())
+                                .or_default()
+                                .entry(normalized)
+                                .or_insert_with(|| proposal.original_text.clone());
+                        }
+                        state.proposals.push(proposal);
+                    }
+                }
+                WorkerResult::Error(reason) => state.errors.push(format!(
+                    "chunk {}/{} (lines {}-{}): {reason}",
+                    meta.index, meta.total, meta.start_line, meta.end_line
+                )),
+            }
+            state.remaining -= 1;
+            if state.remaining != 0 {
+                continue;
+            }
+
+            let file = state.file.clone();
+            let real = std::mem::take(&mut state.real);
+            let provider_output = FileProviderOutput {
+                proposals: std::mem::take(&mut state.proposals),
+                proposed: state.proposed,
+                duplicates: state.duplicates,
+                rejected: std::mem::take(&mut state.rejected),
+                errors: std::mem::take(&mut state.errors),
+            };
+            let file_elapsed = state.started_at.map(elapsed_ms).unwrap_or(0);
+            let completion = commit_file_proposals(
+                &layout,
+                &file,
+                &real,
+                provider_output,
+                &config,
+                &mut pending_keys,
+                &mut report,
+            )?;
+            completed_files += 1;
+            progress(ProposeProgress::FileFinished {
+                completed: completed_files,
+                total,
+                file,
+                elapsed_ms: file_elapsed,
+                outcome: completion.outcome,
+                proposed: completion.proposed,
+                queued: completion.queued,
+                duplicates: completion.duplicates,
+                rejected: completion.rejected,
+            });
         }
     }
+
+    report.rejected.sort();
+    report.errors.sort();
+    report.skipped.sort();
+    progress(ProposeProgress::Finished {
+        total,
+        requests: request_total,
+        elapsed_ms: elapsed_ms(started_at),
+        proposed: report.proposed,
+        queued: report.queued,
+        duplicates: report.duplicates,
+        rejected: report.rejected.len(),
+        skipped: report.skipped.len(),
+        errors: report.errors.len(),
+    });
     if total > 0 && report.errors.len() == total {
         bail!(
             "provider failed for all {total} file(s); first: {}",
@@ -445,6 +1024,182 @@ pub fn propose_sanitize(
         );
     }
     Ok(report)
+}
+
+fn commit_file_proposals(
+    layout: &Layout,
+    file: &str,
+    real: &str,
+    provider_output: FileProviderOutput,
+    config: &Config,
+    pending_keys: &mut BTreeSet<(String, String)>,
+    report: &mut ProposeReport,
+) -> Result<FileCompletion> {
+    let FileProviderOutput {
+        proposals,
+        proposed,
+        duplicates: mut file_duplicates,
+        rejected: pre_rejected,
+        errors: provider_errors,
+    } = provider_output;
+    report.proposed += proposed;
+    let mut unique = std::collections::BTreeMap::<(String, String), Proposal>::new();
+    for proposal in proposals {
+        let key = (
+            normalize_term(&proposal.original_text),
+            normalize_term(&proposal.sanitized_text),
+        );
+        match unique.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(proposal);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                file_duplicates += 1;
+                let current = entry.get();
+                if proposal.confidence > current.confidence
+                    || (proposal.confidence == current.confidence
+                        && proposal.sanitized_text < current.sanitized_text)
+                {
+                    entry.insert(proposal);
+                }
+            }
+        }
+    }
+    report.duplicates += file_duplicates;
+
+    let mut file_queued = 0usize;
+    let mut file_rejected = pre_rejected.len();
+    report.rejected.extend(pre_rejected);
+    for proposal in unique.into_values() {
+        match validate_proposal(Path::new(file), &proposal, real, config) {
+            Ok(flag) => {
+                let key = (file.to_string(), normalize_term(&proposal.original_text));
+                if pending_keys.insert(key) {
+                    enqueue_review(layout, file, &proposal, &flag)?;
+                    report.queued += 1;
+                    file_queued += 1;
+                } else {
+                    report.duplicates += 1;
+                    file_duplicates += 1;
+                }
+            }
+            Err(reason) => {
+                report
+                    .rejected
+                    .push(format!("{}: {reason}", proposal.original_text));
+                file_rejected += 1;
+            }
+        }
+    }
+
+    let outcome = if provider_errors.is_empty() {
+        ProposeFileOutcome::Completed
+    } else {
+        report
+            .errors
+            .push(format!("{file}: {}", provider_errors.join("; ")));
+        ProposeFileOutcome::Error
+    };
+    Ok(FileCompletion {
+        outcome,
+        proposed,
+        queued: file_queued,
+        duplicates: file_duplicates,
+        rejected: file_rejected,
+    })
+}
+
+fn split_proposal_chunks(
+    content: &str,
+    target_bytes: usize,
+    overlap_lines: usize,
+) -> Vec<ProposalChunk> {
+    if content.is_empty() || content.len() <= target_bytes {
+        return vec![ProposalChunk {
+            meta: ProposalChunkMeta::single(content),
+            content: content.to_string(),
+        }];
+    }
+
+    let mut lines = Vec::new();
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let end = offset + line.len();
+        lines.push((offset, end));
+        offset = end;
+    }
+    if offset < content.len() {
+        lines.push((offset, content.len()));
+    }
+    if lines.is_empty() {
+        lines.push((0, content.len()));
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < lines.len() {
+        let start_byte = lines[start].0;
+        let mut end = start;
+        while end < lines.len() {
+            let prospective = lines[end].1 - start_byte;
+            if end > start && prospective > target_bytes {
+                break;
+            }
+            end += 1;
+            if prospective >= target_bytes {
+                break;
+            }
+        }
+        ranges.push((start, end));
+        if end == lines.len() {
+            break;
+        }
+        let chunk_lines = end - start;
+        let overlap = overlap_lines.min(chunk_lines / 2);
+        start = end - overlap;
+    }
+
+    let total = ranges.len();
+    ranges
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, (start, end))| ProposalChunk {
+            meta: ProposalChunkMeta {
+                index: index + 1,
+                total,
+                start_line: start + 1,
+                end_line: end,
+                core_start_line: if index == 0 {
+                    start + 1
+                } else {
+                    ranges[index - 1].1 + 1
+                },
+                core_end_line: end,
+            },
+            content: content[lines[start].0..lines[end - 1].1].to_string(),
+        })
+        .collect()
+}
+
+fn proposal_core_offset(content: &str, meta: ProposalChunkMeta) -> usize {
+    let context_lines = meta.core_start_line.saturating_sub(meta.start_line);
+    if context_lines == 0 {
+        return 0;
+    }
+    content
+        .split_inclusive('\n')
+        .take(context_lines)
+        .map(str::len)
+        .sum()
+}
+
+fn proposal_core_content(content: &str, meta: ProposalChunkMeta) -> &str {
+    &content[proposal_core_offset(content, meta)..]
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 /// Validate one proposal against the policy. `Ok(flag)` means it may be queued
@@ -484,6 +1239,15 @@ pub fn validate_proposal(
         .any(|item| item.eq_ignore_ascii_case(&proposal.original_text))
     {
         return Err("term is allowlisted; must not be replaced".to_string());
+    }
+    if config
+        .sanitizer
+        .dictionary
+        .keys()
+        .chain(config.sanitizer.alias_registry.keys())
+        .any(|term| term.eq_ignore_ascii_case(&proposal.original_text))
+    {
+        return Err("term already has a deterministic mapping".to_string());
     }
     if proposal.sanitized_text.contains('\n') {
         return Err("alias introduces a newline".to_string());
@@ -793,6 +1557,64 @@ mod tests {
     }
 
     #[test]
+    fn proposal_chunks_are_line_aligned_and_overlap() {
+        let content = (1..=20)
+            .map(|line| format!("line_{line:02}_payload\n"))
+            .collect::<String>();
+        let chunks = split_proposal_chunks(&content, 64, 1);
+        assert!(chunks.len() > 1);
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.meta.index, index + 1);
+            assert_eq!(chunk.meta.total, chunks.len());
+            assert!(content.contains(&chunk.content));
+            assert!(chunk.content.ends_with('\n'));
+        }
+        for pair in chunks.windows(2) {
+            assert_eq!(
+                pair[0].content.lines().next_back(),
+                pair[1].content.lines().next(),
+                "adjacent chunks must share one complete line"
+            );
+            assert_eq!(
+                pair[1].meta.core_start_line,
+                pair[0].meta.end_line + 1,
+                "the next chunk must not own its overlap prefix"
+            );
+        }
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| proposal_core_content(&chunk.content, chunk.meta))
+                .collect::<String>(),
+            content,
+            "owned regions must cover the source exactly once"
+        );
+    }
+
+    #[test]
+    fn proposal_chunker_keeps_small_and_long_utf8_lines_intact() {
+        let small = "alpha\nbeta\n";
+        let chunks = split_proposal_chunks(small, 1024, 12);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].content, small);
+        assert_eq!(chunks[0].meta.start_line, 1);
+        assert_eq!(chunks[0].meta.end_line, 2);
+
+        let long = format!("{}\nshort\n", "界".repeat(100));
+        let chunks = split_proposal_chunks(&long, 32, 1);
+        assert!(chunks[0].content.starts_with('界'));
+        assert!(chunks[0].content.len() > 32, "one long line stays whole");
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<Vec<_>>()
+                .concat(),
+            long
+        );
+    }
+
+    #[test]
     fn strip_code_fences_unwraps_fenced_json() {
         let fenced = "```json\n{\"proposals\":[]}\n```";
         assert_eq!(strip_code_fences(fenced), "{\"proposals\":[]}");
@@ -814,6 +1636,28 @@ mod tests {
         // An unterminated fence falls back to the trimmed reply.
         let unterminated = "```json\n{\"proposals\":[]}";
         assert_eq!(strip_code_fences(unterminated), unterminated);
+    }
+
+    #[test]
+    fn non_json_provider_replies_get_safe_actionable_errors() {
+        let refusal = parse_proposals("I can't discuss that.").unwrap_err();
+        assert!(refusal.to_string().contains("provider refused"));
+        assert!(!refusal.to_string().contains("discuss"));
+
+        let prose = parse_proposals("Here are the proposals you requested.").unwrap_err();
+        assert!(prose.to_string().contains("non-JSON text"));
+        let empty = parse_proposals("  \n").unwrap_err();
+        assert!(empty.to_string().contains("empty response"));
+    }
+
+    #[test]
+    fn duplicate_model_object_keys_are_normalized_before_validation() {
+        let proposals = parse_proposals(
+            r#"{"proposals":[{"category":"identifier","original_text":"stale","original_text":"helper","sanitized_text":"assistant","confidence":0.9}]}"#,
+        )
+        .unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].original_text, "helper");
     }
 
     #[test]
@@ -854,6 +1698,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_terms_that_already_have_a_deterministic_mapping() {
+        let config = Config::default();
+        let proposal = Proposal {
+            category: "identifier".to_string(),
+            original_text: "dangerous".to_string(),
+            sanitized_text: "another_alias".to_string(),
+            confidence: 1.0,
+            rationale: None,
+        };
+        let reason = validate_proposal(
+            Path::new("src/lib.rs"),
+            &proposal,
+            "fn dangerous() {}",
+            &config,
+        )
+        .unwrap_err();
+        assert!(reason.contains("deterministic mapping"), "{reason}");
     }
 
     #[test]

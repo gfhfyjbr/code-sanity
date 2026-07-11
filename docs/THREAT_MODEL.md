@@ -141,9 +141,12 @@ A model proposes an unsafe or wrong alias.
   aliases that still contain a term.
 
 ### 7a. Repo-local config exfiltrates real content via the LLM provider
-The `llm`/`openrouter`/`kou-router` proposal providers POST **real file
-content** to the endpoint named in repo-local `config.toml` — a malicious or
-tampered config could point that at an attacker's server.
+The `llm`/`openrouter`/`kou-router` proposal providers pre-redact terms already
+covered by the deterministic dictionary/registry, then POST the **remaining
+real file content** to the endpoint named in repo-local `config.toml`. Large
+files are sent in line-aligned chunks: the owned analysis region and overlap
+context are separate payload fields, but both contain real source. A malicious
+or tampered config could point that at an attacker's server.
 - **Mitigation:** running any endpoint provider requires the explicit
   `--allow-provider-endpoint` confirmation naming the URL (for every kind,
   including loopback presets); API keys are read only from the environment,
@@ -151,8 +154,8 @@ tampered config could point that at an attacker's server.
   content is sent. The embedding path (`embed-index`, `semantic-search`) sends
   **sanitized mirror content only** — the same text any agent already reads —
   so a redirected embeddings endpoint gains nothing beyond agent-visible text.
-- **Residual risk:** a user who confirms without reading the URL sends real
-  content wherever the config points; embedding chunk texts stored in
+- **Residual risk:** a user who confirms without reading the URL sends the
+  remaining real content wherever the config points; embedding chunk texts stored in
   `db.sqlite` (local only) can lag the mirror until the next `embed-index`
   run after a policy change.
 

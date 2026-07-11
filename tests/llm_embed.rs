@@ -4,13 +4,16 @@
 
 use code_sanity::config::{Config, Layout, ProviderConfig};
 use code_sanity::index_workspace;
-use code_sanity::proposal::{ProviderAllow, propose_sanitize};
+use code_sanity::proposal::{
+    ProposeProgress, ProviderAllow, propose_sanitize, propose_sanitize_with_progress,
+};
 use code_sanity::read_sanitized_file;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type Handler = dyn Fn(&str, &Value) -> Value + Send + Sync;
@@ -117,7 +120,7 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
     std::fs::create_dir_all(repo.path().join("src")).unwrap();
     std::fs::write(
         repo.path().join("src/lib.rs"),
-        "fn megacorp_client() -> usize {\n    1\n}\n",
+        "// dangerous implementation detail\nfn megacorp_client() -> usize {\n    1\n}\n",
     )
     .unwrap();
     index_workspace(repo.path()).unwrap();
@@ -139,6 +142,33 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
         // The provider must send the real file content to the model.
         let user = request["messages"][1]["content"].as_str().unwrap();
         assert!(user.contains("megacorp_client"));
+        assert!(
+            !user.contains("dangerous"),
+            "known deterministic terms must be redacted before the provider boundary"
+        );
+        let task: Value = serde_json::from_str(user).unwrap();
+        assert!(task["task"].as_str().unwrap().contains("security-"));
+        assert!(
+            task["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule.as_str().unwrap().contains("[A-Za-z0-9_]+"))
+        );
+        assert!(
+            task["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule.as_str().unwrap().contains("byte-for-byte"))
+        );
+        assert!(
+            task["required_output_preflight"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule.as_str().unwrap().contains("case-sensitive substring"))
+        );
         counter.fetch_add(1, Ordering::SeqCst);
         chat_response(&reply_owned)
     }));
@@ -562,6 +592,331 @@ fn provider_error_on_one_file_does_not_abort_the_run() {
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert!(report.errors[0].contains("bad.rs"), "{:?}", report.errors);
     assert!(report.queued >= 1, "good file's proposals must be queued");
+}
+
+#[test]
+fn proposal_provider_runs_with_bounded_concurrency_and_reports_progress() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    for index in 0..6 {
+        std::fs::write(
+            repo.path().join(format!("src/file_{index}.rs")),
+            format!("fn helper_{index}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    index_workspace(repo.path()).unwrap();
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let active_for_handler = Arc::clone(&active);
+    let max_for_handler = Arc::clone(&max_active);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, _request: &Value| {
+        let now = active_for_handler.fetch_add(1, Ordering::SeqCst) + 1;
+        max_for_handler.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        active_for_handler.fetch_sub(1, Ordering::SeqCst);
+        chat_response("{\"proposals\":[]}")
+    }));
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: false,
+    };
+    config.save(&layout).unwrap();
+
+    let events = Mutex::new(Vec::new());
+    let report = propose_sanitize_with_progress(
+        repo.path(),
+        None,
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+        Some(3),
+        |event| events.lock().unwrap().push(event),
+    )
+    .unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(
+        max_active.load(Ordering::SeqCst) >= 2,
+        "provider calls should overlap"
+    );
+    assert!(
+        max_active.load(Ordering::SeqCst) <= 3,
+        "jobs must bound provider concurrency"
+    );
+
+    let events = events.into_inner().unwrap();
+    let total = events
+        .iter()
+        .find_map(|event| match event {
+            ProposeProgress::Started { total, jobs, .. } => {
+                assert_eq!(*jobs, 3);
+                Some(*total)
+            }
+            _ => None,
+        })
+        .expect("started event");
+    let finished_files = events
+        .iter()
+        .filter(|event| matches!(event, ProposeProgress::FileFinished { .. }))
+        .count();
+    assert_eq!(finished_files, total);
+    assert!(matches!(
+        events.last(),
+        Some(ProposeProgress::Finished { .. })
+    ));
+}
+
+#[test]
+fn one_large_file_is_chunked_parallel_and_overlap_findings_are_deduplicated() {
+    let repo = tempfile::tempdir().unwrap();
+    let content = (0..40)
+        .map(|index| format!("fn helper_{index}() {{ let hwid_{index} = {index}; }}\n"))
+        .collect::<String>();
+    std::fs::write(repo.path().join("large.rs"), content).unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let requests_with_seen = Arc::new(AtomicUsize::new(0));
+    let requests_for_handler = Arc::clone(&requests);
+    let active_for_handler = Arc::clone(&active);
+    let max_for_handler = Arc::clone(&max_active);
+    let seen_for_handler = Arc::clone(&requests_with_seen);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
+        requests_for_handler.fetch_add(1, Ordering::SeqCst);
+        let now = active_for_handler.fetch_add(1, Ordering::SeqCst) + 1;
+        max_for_handler.fetch_max(now, Ordering::SeqCst);
+        let user: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert!(user["file"]["chunk"]["total"].as_u64().unwrap() > 1);
+        assert!(user["file"]["content"].as_str().unwrap().contains("hwid"));
+        let already_seen = user["context"]["already_proposed_originals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("hwid"));
+        if already_seen {
+            seen_for_handler.fetch_add(1, Ordering::SeqCst);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        active_for_handler.fetch_sub(1, Ordering::SeqCst);
+        if already_seen {
+            chat_response("{\"proposals\":[]}")
+        } else {
+            chat_response(
+                "{\"proposals\":[{\"category\":\"identifier\",\"original_text\":\"hwid\",\
+                 \"sanitized_text\":\"device_ref\",\"confidence\":0.9}]}",
+            )
+        }
+    }));
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.propose_chunk_bytes = 160;
+    config.sanitizer.propose_chunk_overlap_lines = 1;
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: true,
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize_with_progress(
+        repo.path(),
+        Some(Path::new("large.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+        Some(3),
+        |_| {},
+    )
+    .unwrap();
+    let request_count = requests.load(Ordering::SeqCst);
+    assert!(request_count > 2);
+    assert!(max_active.load(Ordering::SeqCst) >= 2);
+    assert!(max_active.load(Ordering::SeqCst) <= 3);
+    assert!(requests_with_seen.load(Ordering::SeqCst) > 0);
+    assert_eq!(report.proposed, request_count.min(3));
+    assert_eq!(report.queued, 1);
+    assert_eq!(report.duplicates, request_count.min(3) - 1);
+    assert_eq!(
+        code_sanity::proposal::list_review(repo.path(), false)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn overlap_context_is_never_owned_even_when_the_model_returns_it() {
+    let repo = tempfile::tempdir().unwrap();
+    let content = (0..30)
+        .map(|index| format!("fn marker_{index:02}() {{}}\n"))
+        .collect::<String>();
+    std::fs::write(repo.path().join("overlap.rs"), content).unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let context_responses = Arc::new(AtomicUsize::new(0));
+    let responses_for_handler = Arc::clone(&context_responses);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
+        let user: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let context_before = user["file"]["context_before"].as_str().unwrap();
+        let candidate = context_before
+            .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+            .find(|word| word.starts_with("marker_"));
+        let Some(candidate) = candidate else {
+            return chat_response("{\"proposals\":[]}");
+        };
+        responses_for_handler.fetch_add(1, Ordering::SeqCst);
+        chat_response(&format!(
+            "{{\"proposals\":[{{\"category\":\"identifier\",\"original_text\":\"{candidate}\",\
+             \"sanitized_text\":\"neutral_ref\",\"confidence\":0.9}}]}}"
+        ))
+    }));
+
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.propose_chunk_bytes = 100;
+    config.sanitizer.propose_chunk_overlap_lines = 1;
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: true,
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize_with_progress(
+        repo.path(),
+        Some(Path::new("overlap.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+        Some(2),
+        |_| {},
+    )
+    .unwrap();
+    let context_responses = context_responses.load(Ordering::SeqCst);
+    assert!(context_responses > 0);
+    assert_eq!(report.proposed, context_responses);
+    assert_eq!(report.duplicates, context_responses);
+    assert_eq!(report.queued, 0);
+    assert!(report.rejected.is_empty());
+}
+
+#[test]
+fn repeated_provider_scan_deduplicates_pending_review_items() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("lib.rs"), "fn megacorp_helper() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let base_url = spawn_mock_server(Arc::new(|_path: &str, request: &Value| {
+        let user: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let already_seen = user["context"]["already_proposed_originals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.as_str() == Some("megacorp"));
+        if already_seen {
+            chat_response("{\"proposals\":[]}")
+        } else {
+            chat_response(
+                "{\"proposals\":[{\"category\":\"identifier\",\"original_text\":\"megacorp\",\
+                 \"sanitized_text\":\"examplefirm\",\"confidence\":0.95}]}",
+            )
+        }
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: false,
+    };
+    config.save(&layout).unwrap();
+
+    let allow = ProviderAllow {
+        command: false,
+        endpoint: true,
+    };
+    let first = propose_sanitize(repo.path(), Some(Path::new("lib.rs")), allow).unwrap();
+    assert_eq!(first.queued, 1);
+    assert_eq!(first.duplicates, 0);
+
+    let second = propose_sanitize(repo.path(), Some(Path::new("lib.rs")), allow).unwrap();
+    assert_eq!(second.queued, 0);
+    assert_eq!(second.proposed, 0);
+    assert_eq!(second.duplicates, 0);
+    assert_eq!(
+        code_sanity::proposal::list_review(repo.path(), false)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn security_adjacent_terms_can_be_proposed_for_review() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repo.path().join("lib.rs"),
+        "fn collect_hwid() {\n    let launcher = build_launcher();\n}\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let base_url = spawn_mock_server(Arc::new(|_path: &str, request: &Value| {
+        let user = request["messages"][1]["content"].as_str().unwrap();
+        assert!(user.contains("collect_hwid"));
+        assert!(user.contains("launcher"));
+        chat_response(
+            "{\"proposals\":[\
+             {\"category\":\"identifier\",\"original_text\":\"hwid\",\"sanitized_text\":\"device_ref\",\"confidence\":0.9},\
+             {\"category\":\"identifier\",\"original_text\":\"launcher\",\"sanitized_text\":\"starter\",\"confidence\":0.85}\
+             ]}",
+        )
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: true,
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize(
+        repo.path(),
+        Some(Path::new("lib.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.proposed, 2);
+    assert_eq!(report.queued, 2);
+    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
 }
 
 #[test]

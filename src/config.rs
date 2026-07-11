@@ -178,6 +178,17 @@ pub struct SanitizerConfig {
     /// models and used to abort the whole run with an HTTP 400.
     #[serde(default = "default_propose_max_file_bytes")]
     pub propose_max_file_bytes: u64,
+    /// Target maximum bytes per LLM proposal request. Chunks stay aligned to
+    /// complete source lines, so one exceptionally long line may exceed it.
+    #[serde(default = "default_propose_chunk_bytes")]
+    pub propose_chunk_bytes: usize,
+    /// Source lines repeated on both sides of adjacent proposal chunks.
+    #[serde(default = "default_propose_chunk_overlap_lines")]
+    pub propose_chunk_overlap_lines: usize,
+    /// Maximum number of files sent to the proposal provider concurrently.
+    /// `propose-sanitize --jobs` can override this for one run.
+    #[serde(default = "default_propose_concurrency")]
+    pub propose_concurrency: usize,
     /// Deterministic alias registry: exact original term -> approved alias.
     /// Populated by approving model proposals; consulted by the deterministic
     /// engine during index so the model never writes the mirror directly.
@@ -191,6 +202,18 @@ fn default_confidence_threshold() -> f64 {
 
 fn default_propose_max_file_bytes() -> u64 {
     192 * 1024
+}
+
+fn default_propose_chunk_bytes() -> usize {
+    16 * 1024
+}
+
+fn default_propose_chunk_overlap_lines() -> usize {
+    12
+}
+
+fn default_propose_concurrency() -> usize {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,6 +490,9 @@ impl Default for Config {
                 denylist: Vec::new(),
                 confidence_threshold: default_confidence_threshold(),
                 propose_max_file_bytes: default_propose_max_file_bytes(),
+                propose_chunk_bytes: default_propose_chunk_bytes(),
+                propose_chunk_overlap_lines: default_propose_chunk_overlap_lines(),
+                propose_concurrency: default_propose_concurrency(),
                 alias_registry: BTreeMap::new(),
             },
             ignore: IgnoreConfig {
