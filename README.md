@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.s
 
 # Pin a release or customize installation:
 curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.sh | \
-  bash -s -- --version v0.4.6 --bin-dir "$HOME/.local/bin" --add-to-path
+  bash -s -- --version v0.4.7 --bin-dir "$HOME/.local/bin" --add-to-path
 ```
 
 Download and inspect `install.sh` first if piping a remote script is outside
@@ -49,7 +49,7 @@ Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 ```bash
 # pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
 #                     x86_64-apple-darwin, aarch64-apple-darwin
-version=v0.4.6
+version=v0.4.7
 target=aarch64-apple-darwin
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz"
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz.sha256"
