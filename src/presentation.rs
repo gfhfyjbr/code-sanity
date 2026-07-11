@@ -7,6 +7,8 @@ const BOLD: &str = "\x1b[1m";
 const MUTED: &str = "\x1b[38;2;146;150;161m";
 const PRIMARY: &str = "\x1b[38;2;168;177;255m";
 const SUCCESS: &str = "\x1b[38;2;61;214;140m";
+const WARNING: &str = "\x1b[38;2;249;180;78m";
+const DANGER: &str = "\x1b[38;2;255;99;105m";
 
 pub fn stdout_is_tty() -> bool {
     io::stdout().is_terminal()
@@ -151,6 +153,37 @@ pub fn table_with_minimums(
     true
 }
 
+pub fn review_queue(items: &[crate::proposal::ReviewItem]) -> bool {
+    if !stdout_is_tty() {
+        return false;
+    }
+    let width = crossterm::terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(100)
+        .clamp(40, 120);
+    let inner = width.saturating_sub(4);
+    println!("{PRIMARY}╭{}╮{RESET}", "─".repeat(width - 2));
+    print_review_line(
+        &format!("Review queue | {} item(s)", items.len()),
+        ReviewTone::Heading,
+        inner,
+    );
+    println!("{PRIMARY}├{}┤{RESET}", "─".repeat(width - 2));
+    if items.is_empty() {
+        print_review_line("No proposals waiting for review.", ReviewTone::Muted, inner);
+    }
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            println!("{PRIMARY}├{}┤{RESET}", "─".repeat(width - 2));
+        }
+        for (tone, line) in review_item_lines(item, inner) {
+            print_review_line(&line, tone, inner);
+        }
+    }
+    println!("{PRIMARY}╰{}╯{RESET}", "─".repeat(width - 2));
+    true
+}
+
 pub fn success(message: &str) {
     if stdout_is_tty() {
         println!("{SUCCESS}ok{RESET}  {message}");
@@ -190,6 +223,99 @@ fn display_width(value: &str) -> usize {
     value.chars().count()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewTone {
+    Heading,
+    Proposal,
+    Warning,
+    Danger,
+    Muted,
+}
+
+fn review_item_lines(
+    item: &crate::proposal::ReviewItem,
+    width: usize,
+) -> Vec<(ReviewTone, String)> {
+    let mut lines = vec![
+        (
+            ReviewTone::Heading,
+            format!(
+                "{}  {}  {:.0}%",
+                item.id,
+                format!("{:?}", item.status).to_lowercase(),
+                item.proposal.confidence * 100.0
+            ),
+        ),
+        (
+            ReviewTone::Proposal,
+            format!(
+                "{} -> {}",
+                item.proposal.original_text, item.proposal.sanitized_text
+            ),
+        ),
+        (
+            ReviewTone::Muted,
+            format!("FILE: {}  CATEGORY: {}", item.file, item.proposal.category),
+        ),
+    ];
+    if item.flag != "clean" {
+        lines.extend(
+            wrap_labeled("WARNING: ", &item.flag, width)
+                .into_iter()
+                .map(|line| (ReviewTone::Danger, line)),
+        );
+    } else {
+        lines.push((ReviewTone::Warning, "CHECK: clean".to_string()));
+    }
+    let rationale = item
+        .proposal
+        .rationale
+        .as_deref()
+        .unwrap_or("No provider rationale.");
+    lines.extend(
+        wrap_labeled("REASON: ", rationale, width)
+            .into_iter()
+            .map(|line| (ReviewTone::Warning, line)),
+    );
+    lines
+}
+
+fn wrap_labeled(label: &str, value: &str, width: usize) -> Vec<String> {
+    let continuation = " ".repeat(label.chars().count());
+    let mut lines = Vec::new();
+    let mut current = label.to_string();
+    for word in value.split_whitespace() {
+        let separator = usize::from(current.chars().count() > label.chars().count());
+        if current.chars().count() + separator + word.chars().count() > width
+            && current.chars().count() > label.chars().count()
+        {
+            lines.push(current);
+            current = continuation.clone();
+        }
+        if current.chars().count() > continuation.chars().count() && !current.ends_with(' ') {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if current.trim() == label.trim() {
+        current.push_str("(none)");
+    }
+    lines.push(current);
+    lines
+}
+
+fn print_review_line(value: &str, tone: ReviewTone, width: usize) {
+    let color = match tone {
+        ReviewTone::Heading => BOLD,
+        ReviewTone::Proposal => SUCCESS,
+        ReviewTone::Warning => WARNING,
+        ReviewTone::Danger => DANGER,
+        ReviewTone::Muted => MUTED,
+    };
+    let value = clip(value, width);
+    println!("{PRIMARY}│{RESET} {color}{value:<width$}{RESET} {PRIMARY}│{RESET}");
+}
+
 pub fn muted(value: impl AsRef<str>) -> String {
     if stdout_is_tty() {
         format!("{MUTED}{}{RESET}", value.as_ref())
@@ -201,10 +327,37 @@ pub fn muted(value: impl AsRef<str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proposal::{Proposal, ReviewItem, ReviewStatus};
 
     #[test]
     fn clip_keeps_table_width_stable() {
         assert_eq!(clip("abcdefgh", 5), "abcd~");
         assert_eq!(clip("abc", 5), "abc");
+    }
+
+    #[test]
+    fn review_lines_keep_warning_reason_and_full_id() {
+        let item = ReviewItem {
+            id: "2026-07-11T02-48-35.382110000Z-573f7bc8".to_string(),
+            file: "src/client/api.mm".to_string(),
+            proposal: Proposal {
+                category: "identifier".to_string(),
+                original_text: "Trezor".to_string(),
+                sanitized_text: "HardwareWallet".to_string(),
+                confidence: 0.72,
+                rationale: Some("Public vendor API name; replacement may break calls.".to_string()),
+            },
+            status: ReviewStatus::Pending,
+            flag: "touches a protected name (public API or import); needs review".to_string(),
+            created_at: String::new(),
+        };
+        let lines = review_item_lines(&item, 54)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>();
+        assert!(lines.iter().any(|line| line.contains(&item.id)));
+        assert!(lines.iter().any(|line| line.starts_with("WARNING:")));
+        assert!(lines.iter().any(|line| line.starts_with("REASON:")));
+        assert!(lines.join(" ").contains("Public vendor API"));
     }
 }

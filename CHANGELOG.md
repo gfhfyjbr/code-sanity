@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Human `review` output once again shows every proposal's warning flag,
+  rationale, category, confidence, and file without truncating the actionable
+  proposal ID. Flagged TUI rows now carry a visible `!`, and the detail panel
+  labels validation warnings and provider reasons explicitly.
+
 ## [0.4.0] - 2026-07-11
 
 ### Added

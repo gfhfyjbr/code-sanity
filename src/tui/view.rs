@@ -226,19 +226,18 @@ fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
     {
         let item = &app.reviews[*filtered_index];
         let selected = app.list_offset + row == app.selected;
-        let marker = if selected { ">" } else { " " };
-        let confidence = (item.proposal.confidence * 100.0).round() as usize;
-        let term_width = (inner.width.saturating_sub(11) as usize / 2).clamp(6, 18);
-        let original = clip_text(&item.proposal.original_text, term_width);
-        let sanitized = clip_text(&item.proposal.sanitized_text, term_width);
-        let text = format!(
-            "{marker} {original:<term_width$} -> {sanitized:<term_width$} {confidence:>3}%"
-        );
+        let (text, flagged) = review_row_text(item, inner.width as usize, selected);
         let row_area = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
         frame.render_widget(
             Paragraph::new(text).style(
                 Style::default()
-                    .fg(if selected { FG } else { MUTED })
+                    .fg(if selected {
+                        FG
+                    } else if flagged {
+                        WARNING
+                    } else {
+                        MUTED
+                    })
                     .bg(if selected { PANEL_HOVER } else { PANEL })
                     .add_modifier(if selected {
                         Modifier::BOLD
@@ -260,6 +259,7 @@ fn render_review_detail(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(panel("Proposal", false), area);
         return;
     };
+    let flagged = item.flag != "clean";
     let status_color = if is_pending(item) { WARNING } else { MUTED };
     let metadata = vec![
         Line::from(vec![
@@ -288,15 +288,26 @@ fn render_review_detail(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
         Line::from(Span::styled(
-            format!("{} | {}", item.flag, item.file),
-            Style::default().fg(MUTED),
+            if flagged {
+                format!("WARNING: {} | {}", item.flag, item.file)
+            } else {
+                format!("CHECK: clean | {}", item.file)
+            },
+            Style::default()
+                .fg(if flagged { WARNING } else { SUCCESS })
+                .add_modifier(if flagged {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         )),
-        Line::from(
+        Line::from(format!(
+            "REASON: {}",
             item.proposal
                 .rationale
                 .as_deref()
-                .unwrap_or("No provider rationale."),
-        ),
+                .unwrap_or("No provider rationale.")
+        )),
     ];
     frame.render_widget(
         Paragraph::new(metadata)
@@ -791,6 +802,26 @@ fn clip_text(value: &str, width: usize) -> String {
     format!("{}~", value.chars().take(keep).collect::<String>())
 }
 
+fn review_row_text(
+    item: &crate::proposal::ReviewItem,
+    width: usize,
+    selected: bool,
+) -> (String, bool) {
+    let flagged = item.flag != "clean";
+    let marker = if selected { ">" } else { " " };
+    let warning = if flagged { "!" } else { " " };
+    let confidence = (item.proposal.confidence * 100.0).round() as usize;
+    let term_width = (width.saturating_sub(12) / 2).clamp(6, 18);
+    let original = clip_text(&item.proposal.original_text, term_width);
+    let sanitized = clip_text(&item.proposal.sanitized_text, term_width);
+    (
+        format!(
+            "{marker}{warning} {original:<term_width$} -> {sanitized:<term_width$} {confidence:>3}%"
+        ),
+        flagged,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -820,5 +851,32 @@ mod tests {
                 .iter()
                 .any(|hit| matches!(hit.action, HitAction::Cancel))
         );
+    }
+
+    #[test]
+    fn review_rows_mark_flagged_items() {
+        use crate::proposal::{Proposal, ReviewItem, ReviewStatus};
+        let mut item = ReviewItem {
+            id: "id".to_string(),
+            file: "src/main.rs".to_string(),
+            proposal: Proposal {
+                category: "identifier".to_string(),
+                original_text: "Trezor".to_string(),
+                sanitized_text: "HardwareWallet".to_string(),
+                confidence: 0.7,
+                rationale: Some("API name".to_string()),
+            },
+            status: ReviewStatus::Pending,
+            flag: "public API name".to_string(),
+            created_at: String::new(),
+        };
+        let (flagged, warning) = review_row_text(&item, 50, false);
+        assert!(warning);
+        assert!(flagged.starts_with(" !"));
+
+        item.flag = "clean".to_string();
+        let (clean, warning) = review_row_text(&item, 50, false);
+        assert!(!warning);
+        assert!(clean.starts_with("  "));
     }
 }
