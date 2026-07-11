@@ -9,7 +9,7 @@ use std::path::Path;
 /// state (rebuilt by `index` from the real files and config), so migration is
 /// drop-and-recreate for the derived tables; only `patch_journal` history is
 /// preserved.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 pub fn connect(layout: &Layout) -> Result<Connection> {
     let conn = Connection::open(&layout.db_path)
@@ -279,6 +279,10 @@ fn create_tables(conn: &Connection) -> Result<()> {
         );
         create index if not exists semantic_occurrences_symbol
           on semantic_occurrences(symbol_id, rel_path, start_byte);
+        create index if not exists semantic_occurrences_symbol_role
+          on semantic_occurrences(symbol_id, role);
+        create index if not exists semantic_occurrences_role_name
+          on semantic_occurrences(role, name);
 
         create table if not exists semantic_aliases(
           symbol_id text primary key,
