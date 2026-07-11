@@ -67,7 +67,7 @@ fn old_user_version_drops_derived_tables_and_preserves_journal() {
     let conn = db::connect(&layout).unwrap();
     db::ensure_schema(&conn).unwrap();
 
-    assert_eq!(user_version(repo.path()), 6);
+    assert_eq!(user_version(repo.path()), 7);
     let files: i64 = conn
         .query_row("select count(*) from files", [], |row| row.get(0))
         .unwrap();
@@ -102,7 +102,7 @@ fn pre_versioning_v0_database_is_not_dropped() {
     let conn = db::connect(&layout).unwrap();
     db::ensure_schema(&conn).unwrap();
 
-    assert_eq!(user_version(repo.path()), 6);
+    assert_eq!(user_version(repo.path()), 7);
     // init created a .gitignore next to src/a.rs; both rows must survive.
     let files: i64 = conn
         .query_row("select count(*) from files", [], |row| row.get(0))
@@ -113,19 +113,19 @@ fn pre_versioning_v0_database_is_not_dropped() {
 #[test]
 fn future_schema_version_is_refused_without_downgrade() {
     let repo = indexed_workspace();
-    set_user_version(repo.path(), 7);
+    set_user_version(repo.path(), 8);
 
     let layout = Layout::new(repo.path());
     let conn = db::connect(&layout).unwrap();
     let err = db::ensure_schema(&conn).unwrap_err();
-    assert!(err.to_string().contains("schema version 7"), "{err:#}");
+    assert!(err.to_string().contains("schema version 8"), "{err:#}");
     drop(conn);
 
     // What users actually hit: any command opening the workspace.
     let err = code_sanity::index_workspace(repo.path()).unwrap_err();
     assert!(err.to_string().contains("newer"), "{err:#}");
 
-    assert_eq!(user_version(repo.path()), 7, "no silent downgrade");
+    assert_eq!(user_version(repo.path()), 8, "no silent downgrade");
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn check_schema_covers_current_newer_and_older() {
     db::check_schema(&conn).unwrap();
     drop(conn);
 
-    set_user_version(repo.path(), 7);
+    set_user_version(repo.path(), 8);
     let conn = db::connect(&layout).unwrap();
     let err = db::check_schema(&conn).unwrap_err();
     assert!(err.to_string().contains("newer"), "{err:#}");
@@ -200,7 +200,7 @@ fn concurrent_index_after_upgrade_is_serialized() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    assert_eq!(user_version(repo.path()), 6);
+    assert_eq!(user_version(repo.path()), 7);
     assert!(code_sanity::verify_workspace(repo.path()).is_ok());
 }
 
@@ -218,6 +218,23 @@ fn reindex_after_migration_repopulates_derived_state() {
     assert!(
         tracked.contains(&"src/a.rs".to_string()),
         "tracked after reindex: {tracked:?}"
+    );
+    let mut plan = conn
+        .prepare(
+            "explain query plan select count(*) from semantic_occurrences
+             where symbol_id = ?1 and role = 'reference'",
+        )
+        .unwrap();
+    let details = plan
+        .query_map(["sym_test"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("semantic_occurrences_symbol_role")),
+        "semantic reference lookup must use its covering index: {details:?}"
     );
     assert!(code_sanity::verify_workspace(repo.path()).is_ok());
 }

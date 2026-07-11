@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The declared Rust 1.85 MSRV builds again; newer let-chain syntax was replaced
   with equivalent stable control flow.
+- Semantic proposal packet queries use covering occurrence indexes instead of
+  repeatedly scanning every reference for each symbol in large workspaces.
 
 ## [0.4.3] - 2026-07-11
 
