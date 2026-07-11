@@ -31,8 +31,9 @@ jobs:
       - name: Validate installer
         run: |
           bash -n install.sh
-          shellcheck install.sh
+          shellcheck install.sh tests/installer.sh
           test "$(./install.sh --print-target)" = "x86_64-unknown-linux-gnu"
+          bash tests/installer.sh
 
   msrv:
     needs: metadata
@@ -166,5 +167,12 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           bin_dir="$RUNNER_TEMP/code-sanity-bin"
-          ./install.sh --version "$GITHUB_REF_NAME" --bin-dir "$bin_dir" --no-color
+          completion_dir="$RUNNER_TEMP/zsh/site-functions"
+          zshrc="$RUNNER_TEMP/.zshrc"
+          CODE_SANITY_ZSH_RC_FILE="$zshrc" \
+            ./install.sh --version "$GITHUB_REF_NAME" --bin-dir "$bin_dir" \
+            --zsh-completions-dir "$completion_dir" --no-color
           "$bin_dir/code-sanity" --version
+          test -s "$completion_dir/_code-sanity"
+          grep -Fqx '#compdef code-sanity' "$completion_dir/_code-sanity"
+          grep -Fq '# >>> code-sanity completions >>>' "$zshrc"

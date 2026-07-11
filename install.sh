@@ -21,6 +21,13 @@ TARGET="${CODE_SANITY_TARGET:-}"
 SOURCE_MODE=0
 BUILD_SOURCE=1
 ADD_TO_PATH=0
+INSTALL_ZSH_COMPLETIONS=1
+ZSH_COMPLETIONS_EXPLICIT=0
+if [[ -n "${CODE_SANITY_ZSH_COMPLETIONS_DIR:-}" ]]; then
+    ZSH_COMPLETIONS_EXPLICIT=1
+fi
+ZSH_COMPLETIONS_DIR="${CODE_SANITY_ZSH_COMPLETIONS_DIR:-${ZDOTDIR:-$HOME}/.zfunc}"
+ZSH_RC_FILE="${CODE_SANITY_ZSH_RC_FILE:-${ZDOTDIR:-$HOME}/.zshrc}"
 UNINSTALL=0
 PRINT_TARGET=0
 COLOR=1
@@ -28,6 +35,12 @@ TASK_PID=""
 TASK_LOG=""
 TEMP_DIR=""
 TEMP_BINARY=""
+TEMP_COMPLETION=""
+TEMP_RC_FILE=""
+
+readonly ZSH_COMPLETION_FILE="_code-sanity"
+readonly ZSH_COMPLETION_BEGIN="# >>> code-sanity completions >>>"
+readonly ZSH_COMPLETION_END="# <<< code-sanity completions <<<"
 
 if [[ ! -t 2 || -n "${NO_COLOR:-}" ]]; then
     COLOR=0
@@ -46,6 +59,11 @@ Options:
   --repo OWNER/REPO  Download from another GitHub repository
   --bin-dir DIR      Install into DIR (default: $CARGO_HOME/bin or ~/.cargo/bin)
   --add-to-path      Add the selected directory to the current shell's rc file
+  --zsh-completions-dir DIR
+                     Install _code-sanity into DIR (default: $ZDOTDIR/.zfunc
+                     or ~/.zfunc)
+  --no-zsh-completions
+                     Do not install or configure zsh completions
   --from-source      Build this checkout with cargo instead of downloading
   --no-build         Install an existing target/release/code-sanity binary
   --uninstall        Remove code-sanity from the selected directory
@@ -58,6 +76,9 @@ Environment:
   CODE_SANITY_REPOSITORY  Default GitHub OWNER/REPO
   CODE_SANITY_VERSION     Default release version or "latest"
   CODE_SANITY_TARGET      Override platform detection (primarily for CI)
+  CODE_SANITY_ZSH_COMPLETIONS_DIR
+                          Default zsh completion directory
+  CODE_SANITY_ZSH_RC_FILE Zsh rc file managed by the installer
   GITHUB_TOKEN            Optional token for GitHub downloads
   CARGO_HOME              Cargo home used to derive the default directory
   NO_COLOR                Disable ANSI colors when set
@@ -98,6 +119,8 @@ cleanup() {
         wait "$TASK_PID" 2>/dev/null || true
     fi
     [[ -n "$TEMP_BINARY" ]] && rm -f -- "$TEMP_BINARY"
+    [[ -n "$TEMP_COMPLETION" ]] && rm -f -- "$TEMP_COMPLETION"
+    [[ -n "$TEMP_RC_FILE" ]] && rm -f -- "$TEMP_RC_FILE"
     [[ -n "$TASK_LOG" ]] && rm -f -- "$TASK_LOG"
     [[ -n "$TEMP_DIR" ]] && rm -rf -- "$TEMP_DIR"
     exit "$status"
@@ -171,6 +194,91 @@ add_bin_dir_to_path() {
     printf '\n%s\n%s\n' "$marker" "$line" >>"$rc_file"
     success "Added $BIN_DIR to PATH in $rc_file"
     warn "Open a new shell or source $rc_file"
+}
+
+strip_zsh_completion_block() {
+    [[ -f "$ZSH_RC_FILE" ]] || return 0
+    grep -Fqx "$ZSH_COMPLETION_BEGIN" "$ZSH_RC_FILE" || return 0
+
+    TEMP_RC_FILE="$(mktemp "${TMPDIR:-/tmp}/code-sanity-zshrc.XXXXXX")"
+    if ! awk -v begin="$ZSH_COMPLETION_BEGIN" -v end="$ZSH_COMPLETION_END" '
+        $0 == begin { skipping = 1; next }
+        skipping && $0 == end { skipping = 0; next }
+        !skipping { print }
+        END { if (skipping) exit 2 }
+    ' "$ZSH_RC_FILE" >"$TEMP_RC_FILE"; then
+        fail "could not remove the managed completion block from $ZSH_RC_FILE"
+    fi
+    cat "$TEMP_RC_FILE" >"$ZSH_RC_FILE"
+    rm -f -- "$TEMP_RC_FILE"
+    TEMP_RC_FILE=""
+}
+
+configure_zsh_completion_path() {
+    local quoted_dir
+    mkdir -p -- "$(dirname -- "$ZSH_RC_FILE")"
+    touch -- "$ZSH_RC_FILE"
+    [[ -w "$ZSH_RC_FILE" ]] || fail "$ZSH_RC_FILE is not writable"
+    strip_zsh_completion_block
+    printf -v quoted_dir '%q' "$ZSH_COMPLETIONS_DIR"
+    if [[ -s "$ZSH_RC_FILE" && "$(tail -c 1 "$ZSH_RC_FILE")" != "" ]]; then
+        printf '\n' >>"$ZSH_RC_FILE"
+    fi
+    {
+        printf '%s\n' "$ZSH_COMPLETION_BEGIN"
+        printf 'fpath=(%s %s)\n' "$quoted_dir" "\$fpath"
+        printf '%s\n' 'autoload -Uz compinit'
+        printf '%s\n' 'if (( $+functions[compdef] )); then'
+        printf '%s\n' '  autoload -Uz _code-sanity'
+        printf '%s\n' '  compdef _code-sanity code-sanity'
+        printf '%s\n' 'else'
+        printf '%s\n' '  compinit'
+        printf '%s\n' 'fi'
+        printf '%s\n' "$ZSH_COMPLETION_END"
+    } >>"$ZSH_RC_FILE"
+}
+
+should_install_zsh_completions() {
+    local shell_name="${SHELL:-}"
+    (( INSTALL_ZSH_COMPLETIONS )) || return 1
+    (( ZSH_COMPLETIONS_EXPLICIT )) && return 0
+    shell_name="${shell_name##*/}"
+    [[ "$shell_name" == "zsh" ]] || command -v zsh >/dev/null 2>&1
+}
+
+install_zsh_completions() {
+    local version="$1"
+    local destination="$ZSH_COMPLETIONS_DIR/$ZSH_COMPLETION_FILE"
+    mkdir -p -- "$ZSH_COMPLETIONS_DIR"
+    [[ -w "$ZSH_COMPLETIONS_DIR" ]] || \
+        fail "$ZSH_COMPLETIONS_DIR is not writable; choose another directory"
+    TEMP_COMPLETION="$ZSH_COMPLETIONS_DIR/.${ZSH_COMPLETION_FILE}.install.$$"
+    if ! "$DESTINATION" completions zsh >"$TEMP_COMPLETION" 2>/dev/null; then
+        rm -f -- "$TEMP_COMPLETION"
+        TEMP_COMPLETION=""
+        warn "$version does not provide zsh completions; skipping"
+        return 0
+    fi
+    grep -Fqx '#compdef code-sanity' "$TEMP_COMPLETION" || \
+        fail "generated zsh completion is malformed"
+    chmod 0644 "$TEMP_COMPLETION"
+    mv -f -- "$TEMP_COMPLETION" "$destination"
+    TEMP_COMPLETION=""
+    configure_zsh_completion_path
+    success "Zsh completion: $destination"
+    success "Zsh fpath configured in $ZSH_RC_FILE"
+}
+
+uninstall_zsh_completions() {
+    local destination="$ZSH_COMPLETIONS_DIR/$ZSH_COMPLETION_FILE"
+    if [[ -e "$destination" ]]; then
+        rm -f -- "$destination"
+        success "Removed $destination"
+    fi
+    if [[ -f "$ZSH_RC_FILE" ]] && grep -Fqx "$ZSH_COMPLETION_BEGIN" "$ZSH_RC_FILE"; then
+        strip_zsh_completion_block
+        success "Removed completion setup from $ZSH_RC_FILE"
+    fi
 }
 
 github_curl() {
@@ -344,6 +452,16 @@ while (($#)); do
             ADD_TO_PATH=1
             shift
             ;;
+        --zsh-completions-dir)
+            (($# >= 2)) || fail "--zsh-completions-dir requires a directory"
+            ZSH_COMPLETIONS_DIR="$2"
+            ZSH_COMPLETIONS_EXPLICIT=1
+            shift 2
+            ;;
+        --no-zsh-completions)
+            INSTALL_ZSH_COMPLETIONS=0
+            shift
+            ;;
         --from-source)
             SOURCE_MODE=1
             shift
@@ -375,6 +493,11 @@ done
 
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "invalid GitHub repository: $REPOSITORY"
 BIN_DIR="${BIN_DIR/#\~/$HOME}"
+ZSH_COMPLETIONS_DIR="${ZSH_COMPLETIONS_DIR/#\~/$HOME}"
+ZSH_RC_FILE="${ZSH_RC_FILE/#\~/$HOME}"
+[[ -n "$ZSH_COMPLETIONS_DIR" && "$ZSH_COMPLETIONS_DIR" != *$'\n'* ]] || \
+    fail "invalid zsh completion directory"
+[[ -n "$ZSH_RC_FILE" && "$ZSH_RC_FILE" != *$'\n'* ]] || fail "invalid zsh rc file"
 TARGET="${TARGET:-$(detect_target)}"
 case "$TARGET" in
     x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin) ;;
@@ -401,6 +524,9 @@ if (( UNINSTALL )); then
         success "Removed $DESTINATION"
     else
         warn "$DESTINATION is not installed"
+    fi
+    if (( INSTALL_ZSH_COMPLETIONS )); then
+        uninstall_zsh_completions
     fi
     exit 0
 fi
@@ -430,6 +556,12 @@ installed_version="$($DESTINATION --version)"
 [[ "$installed_version" == "$candidate_version" ]] || fail "installed binary failed version verification"
 success "Installed $installed_version"
 success "Binary: $DESTINATION"
+
+if should_install_zsh_completions; then
+    install_zsh_completions "$installed_version"
+elif (( INSTALL_ZSH_COMPLETIONS )); then
+    info "Zsh was not detected; completion setup skipped"
+fi
 
 if (( ADD_TO_PATH )); then
     add_bin_dir_to_path

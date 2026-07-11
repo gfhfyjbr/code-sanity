@@ -24,9 +24,10 @@ jobs:
       - name: Validate installer
         run: |
           bash -n install.sh
-          shellcheck install.sh
+          shellcheck install.sh tests/installer.sh
           test "$(./install.sh --print-target)" = "x86_64-unknown-linux-gnu"
           ./install.sh --help >/dev/null
+          bash tests/installer.sh
 
   check:
     strategy:
