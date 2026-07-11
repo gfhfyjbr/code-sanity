@@ -1061,25 +1061,7 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                 if out.is_json() {
                     out.emit("review", json!({ "items": items }), None);
                 } else {
-                    let rows = items
-                        .iter()
-                        .map(|item| {
-                            vec![
-                                item.id.clone(),
-                                format!("{:?}", item.status).to_lowercase(),
-                                format!(
-                                    "{} -> {}",
-                                    item.proposal.original_text, item.proposal.sanitized_text
-                                ),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    let rendered = crate::presentation::table_with_minimums(
-                        &format!("Review queue | {} item(s)", items.len()),
-                        &["ID", "Status", "Proposal"],
-                        &rows,
-                        &[39, 7, 12],
-                    );
+                    let rendered = crate::presentation::review_queue(&items);
                     if !rendered && items.is_empty() {
                         println!("review queue is empty");
                     } else if !rendered {
