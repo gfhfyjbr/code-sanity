@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The file index now records external framework/package/SDK evidence separately
+  from repository-owned protected names. LLM proposal requests receive the
+  relevant scoped evidence, and local validation rejects external API/vendor
+  fragments even when a model labels them private.
+- `propose-sanitize --path` accepts indexed directories as well as individual
+  files, so scoped runs no longer require a shell loop.
+
+### Changed
+
+- Proposal prompts now distinguish non-public repository-owned names from
+  public third-party brands, products, integrations, OS components, protocols,
+  and library APIs, which are explicitly out of scope.
+- Pending originals and findings are deduplicated repo-wide, including
+  normalized containing variants, because one approved alias applies globally.
+- Proposal aliases are checked against every indexed real-file word before an
+  item reaches review; approval retains the same repo-wide check as a backstop.
+- External API evidence is scoped to the selected path, preventing generated or
+  vendored trees outside a targeted source directory from suppressing findings.
+- SQLite schema v3 stores indexed external API evidence; derived lexical and
+  embedding state is rebuilt while patch journal history is preserved.
+
 ## [0.3.1] - 2026-07-11
 
 Follow-up hardening from the v0.3.0 production-readiness audit. The headline
