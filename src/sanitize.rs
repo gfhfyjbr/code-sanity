@@ -39,7 +39,7 @@ use std::path::Path;
 /// for files whose protected set is unchanged (`__acme__` in a python string
 /// was skipped, now sanitizes), which a union-shrink alone would not
 /// invalidate. The forced re-render sweeps legacy prose leaks out.
-pub const SANITIZER_BEHAVIOR_VERSION: u32 = 4;
+pub const SANITIZER_BEHAVIOR_VERSION: u32 = 5;
 
 /// One term the sanitizer must remove, with its normalized matching form.
 #[derive(Debug, Clone)]
@@ -532,6 +532,8 @@ fn is_protection_marker(token: &str) -> bool {
             | "export"
             | "crate"
             | "extern"
+            | "include"
+            | "using"
     )
 }
 
@@ -539,7 +541,96 @@ fn is_protection_marker(token: &str) -> bool {
 /// too (JS/TS `import x from "acme_sdk"`, Go `import "acme/pkg"`) — external
 /// module specifiers the mirror cannot rename consistently.
 fn is_import_marker(token: &str) -> bool {
-    matches!(token, "use" | "import" | "from" | "require" | "package")
+    matches!(
+        token,
+        "use" | "import" | "from" | "require" | "package" | "include" | "using"
+    )
+}
+
+/// Collect identifiers whose ownership is external to the repository.
+///
+/// This is deliberately conservative and syntax-oriented. Angle-bracket C/C++
+/// includes, language/package imports, Objective-C module imports, and `extern`
+/// declarations are API evidence; quoted C/C++ includes and relative JS/Python
+/// imports are treated as repository-local. The proposal pipeline uses this
+/// derived index to keep system/framework/SDK vocabulary out of the review
+/// queue even when an LLM mistakes it for a private product name.
+pub fn collect_external_identifiers(rel_path: &Path, content: &str) -> BTreeSet<String> {
+    let language = detect_language(rel_path, content);
+    if is_prose_language(&language) {
+        return BTreeSet::new();
+    }
+
+    let mut external = BTreeSet::new();
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let angle_import = line
+            .strip_prefix("#include")
+            .or_else(|| line.strip_prefix("#import"))
+            .and_then(|rest| {
+                let rest = rest.trim_start();
+                rest.strip_prefix('<')
+                    .and_then(|value| value.split_once('>').map(|(target, _)| target))
+            });
+        if let Some(target) = angle_import {
+            insert_word_runs(&mut external, target);
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("@import ") {
+            insert_word_runs(&mut external, rest);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("extern ") {
+            insert_non_keywords(&mut external, rest);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("extern crate ") {
+            insert_non_keywords(&mut external, rest);
+            continue;
+        }
+
+        let import_like = line.starts_with("import ")
+            || line.starts_with("from ")
+            || line.starts_with("require(")
+            || line.starts_with("package ")
+            || line.starts_with("use ");
+        if !import_like {
+            continue;
+        }
+
+        // Relative module paths are repository-owned. Rust's explicit local
+        // roots are likewise not external API evidence.
+        let compact = line.replace(['\'', '"'], "");
+        if compact.contains("from .")
+            || compact.contains("require(.")
+            || compact.starts_with("from .")
+            || compact.starts_with("use crate")
+            || compact.starts_with("use self")
+            || compact.starts_with("use super")
+        {
+            continue;
+        }
+        insert_non_keywords(&mut external, line);
+    }
+    external
+}
+
+fn insert_word_runs(out: &mut BTreeSet<String>, content: &str) {
+    for (start, end) in word_runs(content) {
+        let word = &content[start..end];
+        if !is_keyword(word) {
+            out.insert(word.to_string());
+        }
+    }
+}
+
+fn insert_non_keywords(out: &mut BTreeSet<String>, content: &str) {
+    insert_word_runs(out, content);
 }
 
 /// Collect the identifiers this file protects from sanitization: public
@@ -1319,6 +1410,38 @@ mod tests {
         assert!(protected.contains("dangerous_lib"));
         assert!(protected.contains("thing"));
         assert!(!protected.contains("private_one"));
+    }
+
+    #[test]
+    fn external_api_evidence_distinguishes_system_and_local_imports() {
+        let content = r#"
+#import <Security/Security.h>
+#include <nlohmann/json.hpp>
+#include "sync/local.hpp"
+@import AppKit;
+extern const unsigned char trezor_interface_js_data[];
+"#;
+        let external = collect_external_identifiers(Path::new("src/main.mm"), content);
+        for expected in [
+            "Security",
+            "nlohmann",
+            "json",
+            "AppKit",
+            "trezor_interface_js_data",
+        ] {
+            assert!(
+                external.contains(expected),
+                "missing {expected}: {external:?}"
+            );
+        }
+        assert!(
+            !external.contains("sync"),
+            "local includes are not external"
+        );
+        assert!(
+            !external.contains("local"),
+            "local includes are not external"
+        );
     }
 
     #[test]

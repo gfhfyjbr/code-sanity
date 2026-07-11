@@ -67,7 +67,7 @@ fn old_user_version_drops_derived_tables_and_preserves_journal() {
     let conn = db::connect(&layout).unwrap();
     db::ensure_schema(&conn).unwrap();
 
-    assert_eq!(user_version(repo.path()), 2);
+    assert_eq!(user_version(repo.path()), 3);
     let files: i64 = conn
         .query_row("select count(*) from files", [], |row| row.get(0))
         .unwrap();
@@ -81,15 +81,14 @@ fn old_user_version_drops_derived_tables_and_preserves_journal() {
         .query_row("select count(*) from patch_journal", [], |row| row.get(0))
         .unwrap();
     assert_eq!(journal, 1, "patch_journal history must survive migration");
-    // Documented current behavior: embedding tables were added in v2, so the
-    // v1->v2 drop list does not touch them. A future SCHEMA_VERSION bump must
-    // extend the drop list (see the NOTE in ensure_schema).
+    // Embeddings are derived state and are rebuilt alongside the lexical/API
+    // index when the schema changes.
     let chunks: i64 = conn
         .query_row("select count(*) from embedding_chunks", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(chunks, 1);
+    assert_eq!(chunks, 0);
 }
 
 #[test]
@@ -103,7 +102,7 @@ fn pre_versioning_v0_database_is_not_dropped() {
     let conn = db::connect(&layout).unwrap();
     db::ensure_schema(&conn).unwrap();
 
-    assert_eq!(user_version(repo.path()), 2);
+    assert_eq!(user_version(repo.path()), 3);
     // init created a .gitignore next to src/a.rs; both rows must survive.
     let files: i64 = conn
         .query_row("select count(*) from files", [], |row| row.get(0))
@@ -114,19 +113,19 @@ fn pre_versioning_v0_database_is_not_dropped() {
 #[test]
 fn future_schema_version_is_refused_without_downgrade() {
     let repo = indexed_workspace();
-    set_user_version(repo.path(), 3);
+    set_user_version(repo.path(), 4);
 
     let layout = Layout::new(repo.path());
     let conn = db::connect(&layout).unwrap();
     let err = db::ensure_schema(&conn).unwrap_err();
-    assert!(err.to_string().contains("schema version 3"), "{err:#}");
+    assert!(err.to_string().contains("schema version 4"), "{err:#}");
     drop(conn);
 
     // What users actually hit: any command opening the workspace.
     let err = code_sanity::index_workspace(repo.path()).unwrap_err();
     assert!(err.to_string().contains("newer"), "{err:#}");
 
-    assert_eq!(user_version(repo.path()), 3, "no silent downgrade");
+    assert_eq!(user_version(repo.path()), 4, "no silent downgrade");
 }
 
 #[test]
@@ -157,7 +156,7 @@ fn check_schema_covers_current_newer_and_older() {
     db::check_schema(&conn).unwrap();
     drop(conn);
 
-    set_user_version(repo.path(), 3);
+    set_user_version(repo.path(), 4);
     let conn = db::connect(&layout).unwrap();
     let err = db::check_schema(&conn).unwrap_err();
     assert!(err.to_string().contains("newer"), "{err:#}");
@@ -172,7 +171,7 @@ fn check_schema_covers_current_newer_and_older() {
 
 #[test]
 fn concurrent_index_after_upgrade_is_serialized() {
-    // The drop-tables-under-a-writer race: several processes hit the v1->v2
+    // The drop-tables-under-a-writer race: several processes hit the v1->v3
     // migration at once. The exclusive lock inside init must serialize them so
     // every run exits clean and the final state verifies.
     let repo = indexed_workspace();
@@ -201,7 +200,7 @@ fn concurrent_index_after_upgrade_is_serialized() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    assert_eq!(user_version(repo.path()), 2);
+    assert_eq!(user_version(repo.path()), 3);
     assert!(code_sanity::verify_workspace(repo.path()).is_ok());
 }
 

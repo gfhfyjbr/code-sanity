@@ -887,6 +887,8 @@ fn security_adjacent_terms_can_be_proposed_for_review() {
         let user = request["messages"][1]["content"].as_str().unwrap();
         assert!(user.contains("collect_hwid"));
         assert!(user.contains("launcher"));
+        assert!(user.contains("public third-party companies"));
+        assert!(user.contains("indexed_external_identifiers"));
         chat_response(
             "{\"proposals\":[\
              {\"category\":\"identifier\",\"original_text\":\"hwid\",\"sanitized_text\":\"device_ref\",\"confidence\":0.9},\

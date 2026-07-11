@@ -183,6 +183,9 @@ impl ProposalChunkMeta {
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct ProposalRequestContext {
     pub already_proposed_originals: Vec<String>,
+    /// External framework, SDK, package, and `extern` identifiers derived by
+    /// the repository index and relevant to this source chunk.
+    pub indexed_external_identifiers: Vec<String>,
 }
 
 /// A provider of sanitization proposals (the model interface).
@@ -409,13 +412,16 @@ impl ProposalProvider for LlmProposalProvider {
         let core_offset = proposal_core_offset(&provider_content, chunk);
         let (context_before, provider_content) = provider_content.split_at(core_offset);
         let user = serde_json::to_string(&serde_json::json!({
-            "task": "Review this source file for two independent classes of lexical normalization candidates: (1) project-specific private organization, product, project, customer, and internal names; (2) security- or abuse-adjacent vocabulary used in a benign developer context that could be misclassified by an automated safety filter when read without context. Suggest clear context-neutral replacement terms while preserving the code's meaning.",
+            "task": "Review this source file for two independent classes of lexical normalization candidates: (1) non-public names owned by this repository or its operator, such as an internal organization, project, customer, or private product codename; (2) genuinely security- or abuse-adjacent vocabulary used in a benign developer context that could be misclassified by an automated safety filter when read without context. Suggest clear context-neutral replacement terms while preserving the code's meaning.",
             "rules": [
                 "original_text must be copied byte-for-byte from one contiguous case-sensitive substring of file.content",
                 "Never change original_text capitalization, spelling, inflection, plurality, or separators; never join source tokens separated by whitespace or punctuation",
                 "Never invent a label for a concept merely implied by the code; if the exact candidate is not present, omit it",
                 "For security- or abuse-adjacent vocabulary, include terms associated with offensive-security behavior, credential or device identity abuse, evasion, injection, unauthorized automation, harmful payloads, or similar risk-loaded concepts when the file uses them benignly",
                 "Do not suggest ordinary technical terms unless their standalone or compound meaning is plausibly risk-loaded and could be misclassified without context",
+                "A named entity is private only when it is non-public and owned by this repository or its operator; public third-party companies, products, services, integrations, standards, and vendor names are not private candidates",
+                "Never propose operating-system components, framework or library APIs, imported packages, SDK symbols, browser names, hardware vendor names, protocol vocabulary, or other public external identifiers, even when they occur in strings or comments",
+                "Treat context.indexed_external_identifiers as authoritative API ownership evidence; never propose one of those identifiers or a vendor/API fragment embedded in one",
                 "Do not suggest changes to imports, public APIs, protocol constants, SQL, or shell syntax",
                 "Do not suggest any term listed in policy.allowlist",
                 "Both original_text and sanitized_text must each be exactly one ASCII word run matching [A-Za-z0-9_]+; never return spaces, hyphens, dots, slashes, or punctuation",
@@ -438,7 +444,7 @@ impl ProposalProvider for LlmProposalProvider {
                     "original_text": "string",
                     "sanitized_text": "string",
                     "confidence": "number from 0 to 1",
-                    "rationale": "state whether this is a private-name or security/abuse-adjacent candidate and why"
+                    "rationale": "state whether this is a non-public repository-owned name or security/abuse-adjacent candidate, and give concrete evidence; never label a merely public product/vendor name private"
                 }]
             },
             "empty_response": { "proposals": [] },
@@ -658,6 +664,12 @@ struct FileProviderOutput {
     errors: Vec<String>,
 }
 
+struct ProposalPolicyContext<'a> {
+    config: &'a Config,
+    indexed_external: &'a BTreeSet<String>,
+    indexed_words: &'a BTreeMap<String, (String, String)>,
+}
+
 /// Run the proposal provider with bounded concurrency and publish progress from
 /// the coordinating thread. `jobs = None` uses
 /// `sanitizer.propose_concurrency`; callers can override it for one run.
@@ -674,38 +686,57 @@ pub fn propose_sanitize_with_progress(
     let config = Config::load_or_default(&layout)?;
     let provider = provider_for(&config, allow)?;
 
+    // One short shared-lock snapshot supplies both the file set and the
+    // ownership evidence produced by `index`. Provider calls happen after the
+    // lock is dropped.
+    let (tracked_files, index_states) = {
+        let _lock = WorkspaceLock::acquire_shared(&layout)?;
+        let conn = db::connect(&layout)?;
+        db::check_schema(&conn)?;
+        let files = db::tracked_files(&conn)?;
+        let states = db::all_index_states(&conn)?;
+        (files, states)
+    };
+    let indexed_words = indexed_word_owners(root, &tracked_files);
     let files = match rel {
         // The path is repo-config-adjacent input and the file's REAL content
         // goes to a provider: never allow it to point outside the repo.
-        Some(rel) => vec![crate::config::normalize_rel_path(
-            &crate::config::normalize_safe_rel_path(rel, "repo")?,
-        )],
-        None => {
-            // Short shared lock just for the tracked-file snapshot.
-            let _lock = WorkspaceLock::acquire_shared(&layout)?;
-            let conn = db::connect(&layout)?;
-            db::check_schema(&conn)?;
-            db::tracked_files(&conn)?
+        Some(rel) => {
+            let safe = crate::config::normalize_safe_rel_path(rel, "repo")?;
+            let normalized = crate::config::normalize_rel_path(&safe);
+            if root.join(&safe).is_dir() {
+                let prefix = format!("{}/", normalized.trim_end_matches('/'));
+                let selected = tracked_files
+                    .into_iter()
+                    .filter(|file| file.starts_with(&prefix))
+                    .collect::<Vec<_>>();
+                if selected.is_empty() {
+                    bail!("no indexed files under {normalized}; run `code-sanity index`");
+                }
+                selected
+            } else {
+                vec![normalized]
+            }
         }
+        None => tracked_files,
     };
+    let selected_files = files.iter().cloned().collect::<BTreeSet<_>>();
+    let indexed_external = index_states
+        .into_iter()
+        .filter(|state| selected_files.contains(&state.rel_path))
+        .flat_map(|state| state.external())
+        .collect::<BTreeSet<_>>();
 
     let started_at = Instant::now();
     let mut report = ProposeReport::default();
     let pending_items = list_review(root, false)?;
-    let mut pending_keys: BTreeSet<(String, String)> = pending_items
+    let mut pending_keys: BTreeSet<String> = pending_items
         .iter()
-        .map(|item| {
-            (
-                item.file.clone(),
-                normalize_term(&item.proposal.original_text),
-            )
-        })
+        .map(|item| normalize_term(&item.proposal.original_text))
         .collect();
-    let mut already_proposed_by_file = BTreeMap::<String, BTreeMap<String, String>>::new();
+    let mut already_proposed = BTreeMap::<String, String>::new();
     for item in pending_items {
-        already_proposed_by_file
-            .entry(item.file)
-            .or_default()
+        already_proposed
             .entry(normalize_term(&item.proposal.original_text))
             .or_insert(item.proposal.original_text);
     }
@@ -821,10 +852,11 @@ pub fn propose_sanitize_with_progress(
         let contexts = wave
             .iter()
             .map(|item| ProposalRequestContext {
-                already_proposed_originals: already_proposed_by_file
-                    .get(&item.file)
-                    .map(|items| items.values().cloned().collect())
-                    .unwrap_or_default(),
+                already_proposed_originals: already_proposed.values().cloned().collect(),
+                indexed_external_identifiers: relevant_external_identifiers(
+                    &item.chunk.content,
+                    &indexed_external,
+                ),
             })
             .collect::<Vec<_>>();
 
@@ -933,7 +965,9 @@ pub fn propose_sanitize_with_progress(
                     let core_content = proposal_core_content(&chunk.content, meta);
                     for proposal in proposals {
                         let normalized = normalize_term(&proposal.original_text);
-                        if context_keys.contains(&normalized)
+                        if context_keys
+                            .iter()
+                            .any(|seen| normalized_terms_overlap(seen, &normalized))
                             || (!core_content.contains(&proposal.original_text)
                                 && chunk.content.contains(&proposal.original_text))
                         {
@@ -947,12 +981,17 @@ pub fn propose_sanitize_with_progress(
                             ));
                             continue;
                         }
-                        if validate_proposal(Path::new(&file), &proposal, &state.real, &config)
-                            .is_ok()
+                        if validate_proposal_with_index(
+                            Path::new(&file),
+                            &proposal,
+                            &state.real,
+                            &config,
+                            &indexed_external,
+                            &indexed_words,
+                        )
+                        .is_ok()
                         {
-                            already_proposed_by_file
-                                .entry(file.clone())
-                                .or_default()
+                            already_proposed
                                 .entry(normalized)
                                 .or_insert_with(|| proposal.original_text.clone());
                         }
@@ -984,7 +1023,11 @@ pub fn propose_sanitize_with_progress(
                 &file,
                 &real,
                 provider_output,
-                &config,
+                &ProposalPolicyContext {
+                    config: &config,
+                    indexed_external: &indexed_external,
+                    indexed_words: &indexed_words,
+                },
                 &mut pending_keys,
                 &mut report,
             )?;
@@ -1031,8 +1074,8 @@ fn commit_file_proposals(
     file: &str,
     real: &str,
     provider_output: FileProviderOutput,
-    config: &Config,
-    pending_keys: &mut BTreeSet<(String, String)>,
+    policy: &ProposalPolicyContext<'_>,
+    pending_keys: &mut BTreeSet<String>,
     report: &mut ProposeReport,
 ) -> Result<FileCompletion> {
     let FileProviderOutput {
@@ -1071,16 +1114,27 @@ fn commit_file_proposals(
     let mut file_rejected = pre_rejected.len();
     report.rejected.extend(pre_rejected);
     for proposal in unique.into_values() {
-        match validate_proposal(Path::new(file), &proposal, real, config) {
+        match validate_proposal_with_index(
+            Path::new(file),
+            &proposal,
+            real,
+            policy.config,
+            policy.indexed_external,
+            policy.indexed_words,
+        ) {
             Ok(flag) => {
-                let key = (file.to_string(), normalize_term(&proposal.original_text));
-                if pending_keys.insert(key) {
+                let key = normalize_term(&proposal.original_text);
+                if pending_keys
+                    .iter()
+                    .any(|seen| normalized_terms_overlap(seen, &key))
+                {
+                    report.duplicates += 1;
+                    file_duplicates += 1;
+                } else {
+                    pending_keys.insert(key);
                     enqueue_review(layout, file, &proposal, &flag)?;
                     report.queued += 1;
                     file_queued += 1;
-                } else {
-                    report.duplicates += 1;
-                    file_duplicates += 1;
                 }
             }
             Err(reason) => {
@@ -1196,6 +1250,95 @@ fn proposal_core_offset(content: &str, meta: ProposalChunkMeta) -> usize {
 
 fn proposal_core_content(content: &str, meta: ProposalChunkMeta) -> &str {
     &content[proposal_core_offset(content, meta)..]
+}
+
+fn relevant_external_identifiers(
+    content: &str,
+    indexed_external: &BTreeSet<String>,
+) -> Vec<String> {
+    let runs = crate::sanitize::word_runs(content)
+        .into_iter()
+        .map(|(start, end)| normalize_term(&content[start..end]))
+        .filter(|run| run.len() >= 4)
+        .collect::<BTreeSet<_>>();
+    indexed_external
+        .iter()
+        .filter(|external| {
+            let external = normalize_term(external);
+            external.len() >= 4
+                && runs.iter().any(|run| {
+                    run == &external || run.starts_with(&external) || external.starts_with(run)
+                })
+        })
+        .take(128)
+        .cloned()
+        .collect()
+}
+
+fn indexed_word_owners(root: &Path, files: &[String]) -> BTreeMap<String, (String, String)> {
+    let mut words = BTreeMap::new();
+    for rel in files {
+        let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        for (start, end) in crate::sanitize::word_runs(&content) {
+            let word = &content[start..end];
+            words
+                .entry(normalize_term(word))
+                .or_insert_with(|| (rel.clone(), word.to_string()));
+        }
+    }
+    words
+}
+
+fn validate_proposal_with_index(
+    rel_path: &Path,
+    proposal: &Proposal,
+    content: &str,
+    config: &Config,
+    indexed_external: &BTreeSet<String>,
+    indexed_words: &BTreeMap<String, (String, String)>,
+) -> std::result::Result<String, String> {
+    let flag = validate_proposal(rel_path, proposal, content, config)?;
+    if let Some(owner) = external_api_owner(&proposal.original_text, indexed_external) {
+        return Err(format!(
+            "term matches indexed external API/vendor identifier {owner:?}"
+        ));
+    }
+    let alias = normalize_term(&proposal.sanitized_text);
+    if let Some((owner_file, existing)) = indexed_words.get(&alias) {
+        return Err(format!(
+            "alias already occurs in indexed file {owner_file} as {existing:?}; pick a different alias"
+        ));
+    }
+    Ok(flag)
+}
+
+fn external_api_owner<'a>(
+    candidate: &str,
+    indexed_external: &'a BTreeSet<String>,
+) -> Option<&'a str> {
+    let candidate = normalize_term(candidate);
+    if candidate.len() < 4 {
+        return None;
+    }
+    indexed_external.iter().find_map(|external| {
+        let normalized = normalize_term(external);
+        if normalized.len() >= 4
+            && (candidate == normalized
+                || candidate.starts_with(&normalized)
+                || normalized.starts_with(&candidate))
+        {
+            Some(external.as_str())
+        } else {
+            None
+        }
+    })
+}
+
+fn normalized_terms_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || (left.len().min(right.len()) >= 4 && (left.contains(right) || right.contains(left)))
 }
 
 fn elapsed_ms(started_at: Instant) -> u64 {
@@ -1718,6 +1861,107 @@ mod tests {
         )
         .unwrap_err();
         assert!(reason.contains("deterministic mapping"), "{reason}");
+    }
+
+    #[test]
+    fn indexed_external_api_fragments_are_rejected_before_review() {
+        let config = Config::default();
+        let external = [
+            "Security".to_string(),
+            "trezor_interface_js_data".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        for (candidate, content) in [
+            ("SecurityAgent", "// SecurityAgent dialog"),
+            ("Trezor", "const char* vendor = \"Trezor\";"),
+        ] {
+            let proposal = Proposal {
+                category: "string".to_string(),
+                original_text: candidate.to_string(),
+                sanitized_text: "ExternalComponent".to_string(),
+                confidence: 0.99,
+                rationale: None,
+            };
+            let reason = validate_proposal_with_index(
+                Path::new("src/main.mm"),
+                &proposal,
+                content,
+                &config,
+                &external,
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+            assert!(reason.contains("external API/vendor"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn indexed_repo_words_reject_cross_file_alias_collisions() {
+        let config = Config::default();
+        let proposal = Proposal {
+            category: "identifier".to_string(),
+            original_text: "shadowfax".to_string(),
+            sanitized_text: "gadget".to_string(),
+            confidence: 0.99,
+            rationale: None,
+        };
+        let indexed_words = [(
+            normalize_term("gadget"),
+            ("src/other.rs".to_string(), "Gadget".to_string()),
+        )]
+        .into_iter()
+        .collect();
+        let reason = validate_proposal_with_index(
+            Path::new("src/main.rs"),
+            &proposal,
+            "fn shadowfax() {}",
+            &config,
+            &BTreeSet::new(),
+            &indexed_words,
+        )
+        .unwrap_err();
+        assert!(reason.contains("src/other.rs"), "{reason}");
+        assert!(reason.contains("Gadget"), "{reason}");
+    }
+
+    #[test]
+    fn proposal_dedup_collapses_identifier_variants_not_short_fragments() {
+        assert!(normalized_terms_overlap("payload", "deploypayload"));
+        assert!(normalized_terms_overlap("bomb", "bombs"));
+        assert!(normalized_terms_overlap(
+            "inputmonitor",
+            "inputmonitoractive"
+        ));
+        assert!(!normalized_terms_overlap("key", "keylogger"));
+        assert!(!normalized_terms_overlap("inputblocker", "inputblocking"));
+    }
+
+    #[test]
+    fn proposal_path_can_select_an_indexed_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/a.rs"), "// shadowfax internal\n").unwrap();
+        std::fs::write(repo.path().join("src/b.rs"), "// shadowfax repeated\n").unwrap();
+        std::fs::write(repo.path().join("outside.rs"), "// shadowfax outside\n").unwrap();
+        crate::index::index_workspace(repo.path()).unwrap();
+
+        let layout = Layout::new(repo.path());
+        let mut config = Config::load_or_default(&layout).unwrap();
+        config.sanitizer.denylist = vec!["shadowfax".to_string()];
+        config.save(&layout).unwrap();
+
+        let report = propose_sanitize(
+            repo.path(),
+            Some(Path::new("src")),
+            ProviderAllow::default(),
+        )
+        .unwrap();
+        assert_eq!(report.queued, 1);
+        assert_eq!(report.duplicates, 1);
+        let items = list_review(repo.path(), false).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].file, "src/a.rs");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::path::Path;
 /// state (rebuilt by `index` from the real files and config), so migration is
 /// drop-and-recreate for the derived tables; only `patch_journal` history is
 /// preserved.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub fn connect(layout: &Layout) -> Result<Connection> {
     let conn = Connection::open(&layout.db_path)
@@ -53,14 +53,33 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             drop table if exists replacements;
             drop table if exists files;
             drop table if exists index_state;
+            drop table if exists embedding_chunks;
+            drop table if exists embedding_state;
             "#,
         )
         .context("drop outdated derived tables")?;
     }
     create_tables(&tx)?;
+    // Version 0 is also SQLite's default for pre-versioning workspaces, so it
+    // cannot be dropped without risking user-created rows. Add newly required
+    // derived columns in place when such a table already exists.
+    if version == 0 && !table_has_column(&tx, "index_state", "external_json")? {
+        tx.execute_batch(
+            "alter table index_state add column external_json text not null default '[]';",
+        )
+        .context("add v3 external API evidence column")?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
         .context("set sqlite user_version")?;
     tx.commit().context("commit schema transaction")
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let sql = format!("select count(*) from pragma_table_info('{table}') where name = ?1");
+    let count: i64 = conn
+        .query_row(&sql, params![column], |row| row.get(0))
+        .with_context(|| format!("inspect {table}.{column}"))?;
+    Ok(count != 0)
 }
 
 /// Read-path guard: verify the schema is current without writing anything.
@@ -160,7 +179,8 @@ fn create_tables(conn: &Connection) -> Result<()> {
           mtime_ns integer not null,
           size integer not null,
           logic_fingerprint text not null,
-          protected_json text not null
+          protected_json text not null,
+          external_json text not null
         );
 
         create table if not exists patch_journal(
@@ -205,11 +225,19 @@ pub struct IndexState {
     pub size: i64,
     pub logic_fingerprint: String,
     pub protected_json: String,
+    pub external_json: String,
 }
 
 impl IndexState {
     pub fn protected(&self) -> BTreeSet<String> {
         serde_json::from_str::<Vec<String>>(&self.protected_json)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn external(&self) -> BTreeSet<String> {
+        serde_json::from_str::<Vec<String>>(&self.external_json)
             .unwrap_or_default()
             .into_iter()
             .collect()
@@ -223,7 +251,8 @@ pub fn protected_to_json(protected: &BTreeSet<String>) -> String {
 pub fn all_index_states(conn: &Connection) -> Result<Vec<IndexState>> {
     let mut stmt = conn
         .prepare(
-            "select rel_path, input_sha256, mtime_ns, size, logic_fingerprint, protected_json
+            "select rel_path, input_sha256, mtime_ns, size, logic_fingerprint, protected_json,
+                    external_json
              from index_state order by rel_path",
         )
         .context("prepare index_state query")?;
@@ -236,6 +265,7 @@ pub fn all_index_states(conn: &Connection) -> Result<Vec<IndexState>> {
                 size: row.get(3)?,
                 logic_fingerprint: row.get(4)?,
                 protected_json: row.get(5)?,
+                external_json: row.get(6)?,
             })
         })
         .context("query index_state")?;
@@ -254,14 +284,17 @@ pub fn upsert_indexed_file(
     upsert_span_map_tx(&tx, span_map)?;
     tx.execute(
         r#"
-        insert into index_state(rel_path, input_sha256, mtime_ns, size, logic_fingerprint, protected_json)
-        values(?1, ?2, ?3, ?4, ?5, ?6)
+        insert into index_state(
+          rel_path, input_sha256, mtime_ns, size, logic_fingerprint, protected_json, external_json
+        )
+        values(?1, ?2, ?3, ?4, ?5, ?6, ?7)
         on conflict(rel_path) do update set
           input_sha256=excluded.input_sha256,
           mtime_ns=excluded.mtime_ns,
           size=excluded.size,
           logic_fingerprint=excluded.logic_fingerprint,
-          protected_json=excluded.protected_json
+          protected_json=excluded.protected_json,
+          external_json=excluded.external_json
         "#,
         params![
             state.rel_path,
@@ -270,6 +303,7 @@ pub fn upsert_indexed_file(
             state.size,
             state.logic_fingerprint,
             state.protected_json,
+            state.external_json,
         ],
     )
     .context("upsert index_state row")?;

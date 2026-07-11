@@ -12,7 +12,8 @@ use crate::db::{self, IndexState};
 use crate::lock::WorkspaceLock;
 use crate::map::{SpanMap, load_span_map, sha256_hex};
 use crate::sanitize::{
-    SANITIZER_BEHAVIOR_VERSION, collect_protected_identifiers, sanitize_content,
+    SANITIZER_BEHAVIOR_VERSION, collect_external_identifiers, collect_protected_identifiers,
+    sanitize_content,
 };
 use anyhow::{Context, Result};
 use ignore::{DirEntry, WalkBuilder};
@@ -142,6 +143,7 @@ fn index_workspace_locked_inner(
         content: Option<String>,
         sha: Option<String>,
         protected: BTreeSet<String>,
+        external: BTreeSet<String>,
         fast: bool,
     }
 
@@ -216,6 +218,7 @@ fn index_workspace_locked_inner(
                 content: None,
                 sha: None,
                 protected: state.protected(),
+                external: state.external(),
                 fast: true,
             });
             continue;
@@ -235,6 +238,7 @@ fn index_workspace_locked_inner(
         };
         let sha = sha256_hex(content.as_bytes());
         let protected = collect_protected_identifiers(&rel, &content);
+        let external = collect_external_identifiers(&rel, &content);
         candidates.push(Candidate {
             rel,
             rel_string,
@@ -243,6 +247,7 @@ fn index_workspace_locked_inner(
             content: Some(content),
             sha: Some(sha),
             protected,
+            external,
             fast: false,
         });
     }
@@ -300,6 +305,11 @@ fn index_workspace_locked_inner(
         } else {
             candidate.protected.clone()
         };
+        let external = if candidate.fast {
+            collect_external_identifiers(&candidate.rel, &content)
+        } else {
+            candidate.external.clone()
+        };
 
         // Content proved unchanged by hash and logic matches: refresh the
         // mtime/size pre-check columns without re-rendering.
@@ -327,6 +337,7 @@ fn index_workspace_locked_inner(
             size: candidate.size,
             logic_fingerprint: logic.clone(),
             protected_json: db::protected_to_json(&protected),
+            external_json: db::protected_to_json(&external),
         };
         let (outcome, _, stashed) = render_and_store(
             root,
@@ -476,6 +487,7 @@ pub(crate) fn index_single_file_locked(
     let (content, metadata) = read_with_stat(&source_path)?;
     let sha = sha256_hex(content.as_bytes());
     let fresh_protected = collect_protected_identifiers(rel, &content);
+    let fresh_external = collect_external_identifiers(rel, &content);
 
     let states = db::all_index_states(&conn)?;
     let old_protected = states
@@ -514,6 +526,7 @@ pub(crate) fn index_single_file_locked(
         size: metadata.len() as i64,
         logic_fingerprint: logic,
         protected_json: db::protected_to_json(&fresh_protected),
+        external_json: db::protected_to_json(&fresh_external),
     };
     let (outcome, span_map, stashed) = render_and_store(
         root,
