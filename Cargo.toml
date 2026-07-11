@@ -15,10 +15,13 @@ aho-corasick = "1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
 globset = "0.4"
 ignore = "0.4"
+indicatif = "0.18"
 libc = "0.2"
 log = { version = "0.4", features = ["std"] }
+ratatui = "0.29"
 regex = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

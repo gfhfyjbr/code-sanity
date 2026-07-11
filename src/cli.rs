@@ -31,35 +31,36 @@ pub struct Cli {
     json: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// The kebab-case clap name of a command, for the `--json` envelope.
-fn command_name(command: &Command) -> &'static str {
+fn command_name(command: Option<&Command>) -> &'static str {
     match command {
-        Command::Init => "init",
-        Command::Index => "index",
-        Command::Read { .. } => "read",
-        Command::Search { .. } => "search",
-        Command::ApplyPatch { .. } => "apply-patch",
-        Command::Write { .. } => "write",
-        Command::Rename { .. } => "rename",
-        Command::ProjectEdit { .. } => "project-edit",
-        Command::Recover { .. } => "recover",
-        Command::Mode => "mode",
-        Command::ProposeSanitize { .. } => "propose-sanitize",
-        Command::Review { .. } => "review",
-        Command::ReviewSanitize { .. } => "review-sanitize",
-        Command::Sh { .. } => "sh",
-        Command::StrictRun { .. } => "strict-run",
-        Command::Sync { .. } => "sync",
-        Command::EmbedIndex => "embed-index",
-        Command::SemanticSearch { .. } => "semantic-search",
-        Command::Verify => "verify",
-        Command::Doctor { .. } => "doctor",
-        Command::InstallHooks { .. } => "install-hooks",
-        Command::UninstallHooks { .. } => "uninstall-hooks",
-        Command::Serve { .. } => "serve",
+        None => "tui",
+        Some(Command::Init) => "init",
+        Some(Command::Index) => "index",
+        Some(Command::Read { .. }) => "read",
+        Some(Command::Search { .. }) => "search",
+        Some(Command::ApplyPatch { .. }) => "apply-patch",
+        Some(Command::Write { .. }) => "write",
+        Some(Command::Rename { .. }) => "rename",
+        Some(Command::ProjectEdit { .. }) => "project-edit",
+        Some(Command::Recover { .. }) => "recover",
+        Some(Command::Mode) => "mode",
+        Some(Command::ProposeSanitize { .. }) => "propose-sanitize",
+        Some(Command::Review { .. }) => "review",
+        Some(Command::ReviewSanitize { .. }) => "review-sanitize",
+        Some(Command::Sh { .. }) => "sh",
+        Some(Command::StrictRun { .. }) => "strict-run",
+        Some(Command::Sync { .. }) => "sync",
+        Some(Command::EmbedIndex) => "embed-index",
+        Some(Command::SemanticSearch { .. }) => "semantic-search",
+        Some(Command::Verify) => "verify",
+        Some(Command::Doctor { .. }) => "doctor",
+        Some(Command::InstallHooks { .. }) => "install-hooks",
+        Some(Command::UninstallHooks { .. }) => "uninstall-hooks",
+        Some(Command::Serve { .. }) => "serve",
     }
 }
 
@@ -267,7 +268,7 @@ pub fn run() -> Result<()> {
     } else {
         crate::output::Output::Human
     };
-    let name = command_name(&cli.command);
+    let name = command_name(cli.command.as_ref());
     // sh/strict-run hand stdout and the exit code to the wrapped command, and
     // serve's stdout is the MCP protocol stream (or the --once manifest);
     // wrapping either would corrupt the stream, so a harness that sets --json
@@ -275,7 +276,9 @@ pub fn run() -> Result<()> {
     if out.is_json()
         && matches!(
             cli.command,
-            Command::Sh { .. } | Command::StrictRun { .. } | Command::Serve { .. }
+            Some(Command::Sh { .. })
+                | Some(Command::StrictRun { .. })
+                | Some(Command::Serve { .. })
         )
     {
         eprintln!(
@@ -304,14 +307,25 @@ pub fn run() -> Result<()> {
     };
     // The stdio MCP server logs file-only: hosts capture server stderr into
     // their own logs, and warn/error lines can carry unredacted real terms.
-    let stderr_logging = !matches!(cli.command, Command::Serve { once: false });
+    let stderr_logging = !matches!(cli.command, Some(Command::Serve { once: false }));
     crate::logging::init(
         &crate::config::Layout::new(&root),
         cli.verbose,
         stderr_logging,
     );
 
-    match dispatch(cli.command, &root, out) {
+    let result = match cli.command {
+        Some(command) => dispatch(command, &root, out),
+        None if out.is_json() => Err(anyhow::anyhow!("--json requires a subcommand")),
+        None if !io::stdin().is_terminal() || !io::stdout().is_terminal() => {
+            eprintln!(
+                "interactive mode requires a terminal; run code-sanity --help to list commands"
+            );
+            std::process::exit(64);
+        }
+        None => crate::tui::run(&root),
+    };
+    match result {
         Ok(()) => Ok(()),
         Err(err) => {
             // Dedicated exit codes: 2 = patch conflict (real files untouched),
@@ -612,7 +626,10 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
     let root = root.to_path_buf();
     match command {
         Command::Init => {
+            let progress =
+                crate::presentation::TaskProgress::start("Initializing workspace", !out.is_json());
             let layout = init_workspace(&root)?;
+            progress.finish();
             if out.is_json() {
                 out.emit(
                     "init",
@@ -620,12 +637,20 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     None,
                 );
             } else {
-                println!("initialized {}", layout.state_dir.display());
+                let rows = [("State directory", layout.state_dir.display().to_string())];
+                if !crate::presentation::summary("Workspace initialized", &rows) {
+                    println!("initialized {}", layout.state_dir.display());
+                }
             }
         }
         Command::Index => {
             let started = std::time::Instant::now();
+            let progress = crate::presentation::TaskProgress::start(
+                "Indexing sanitized mirror",
+                !out.is_json(),
+            );
             let report = index_workspace(&root)?;
+            progress.finish();
             for (path, reason) in &report.errors {
                 eprintln!("error: {path}: {reason}");
             }
@@ -636,17 +661,29 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     Some(started.elapsed().as_millis()),
                 );
             } else {
-                println!(
-                    "indexed={} unchanged={} skipped={} removed={} pending={} symlinks={} errors={} elapsed={}",
-                    report.indexed,
-                    report.unchanged,
-                    report.skipped,
-                    report.removed,
-                    report.pending,
-                    report.skipped_symlinks,
-                    report.errors.len(),
-                    format_elapsed(started.elapsed())
-                );
+                let rows = [
+                    ("Indexed", report.indexed.to_string()),
+                    ("Unchanged", report.unchanged.to_string()),
+                    ("Skipped", report.skipped.to_string()),
+                    ("Removed", report.removed.to_string()),
+                    ("Pending edits", report.pending.to_string()),
+                    ("Symlinks", report.skipped_symlinks.to_string()),
+                    ("Errors", report.errors.len().to_string()),
+                    ("Elapsed", format_elapsed(started.elapsed())),
+                ];
+                if !crate::presentation::summary("Index complete", &rows) {
+                    println!(
+                        "indexed={} unchanged={} skipped={} removed={} pending={} symlinks={} errors={} elapsed={}",
+                        report.indexed,
+                        report.unchanged,
+                        report.skipped,
+                        report.removed,
+                        report.pending,
+                        report.skipped_symlinks,
+                        report.errors.len(),
+                        format_elapsed(started.elapsed())
+                    );
+                }
             }
         }
         Command::Read { path } => {
@@ -666,8 +703,13 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             glob,
             max_results,
         } => {
+            let progress = crate::presentation::TaskProgress::start(
+                "Searching sanitized mirror",
+                !out.is_json(),
+            );
             let (hits, truncated) =
                 crate::search::search_mirror_limited(&root, &query, glob.as_deref(), max_results)?;
+            progress.finish();
             if out.is_json() {
                 out.emit(
                     "search",
@@ -675,11 +717,28 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     None,
                 );
             } else {
-                for hit in &hits {
-                    println!(
-                        "{}:{}:{}:{}",
-                        hit.rel_path, hit.line, hit.column, hit.line_text
-                    );
+                let rows = hits
+                    .iter()
+                    .map(|hit| {
+                        vec![
+                            hit.rel_path.clone(),
+                            hit.line.to_string(),
+                            hit.column.to_string(),
+                            hit.line_text.clone(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                if !crate::presentation::table(
+                    &format!("Search results | {} hit(s)", hits.len()),
+                    &["File", "Line", "Col", "Preview"],
+                    &rows,
+                ) {
+                    for hit in &hits {
+                        println!(
+                            "{}:{}:{}:{}",
+                            hit.rel_path, hit.line, hit.column, hit.line_text
+                        );
+                    }
                 }
             }
             if truncated {
@@ -697,6 +756,14 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
         } => {
             let patch_text = read_optional_file_or_stdin(patch.as_ref())?;
             let started = std::time::Instant::now();
+            let progress = crate::presentation::TaskProgress::start(
+                if dry_run {
+                    "Validating patch"
+                } else {
+                    "Applying sanitized patch"
+                },
+                !out.is_json(),
+            );
             let report = apply_patch_text_with_options(
                 &root,
                 &patch_text,
@@ -706,23 +773,35 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     dry_run,
                 },
             )?;
+            progress.finish();
             if out.is_json() {
                 let mut data = serde_json::to_value(&report)?;
                 data["dry_run"] = json!(dry_run);
                 out.emit("apply-patch", data, Some(started.elapsed().as_millis()));
             } else {
-                match &report.journal_path {
-                    Some(journal) => println!(
-                        "applied files={} journal={} elapsed={}",
-                        report.files.join(","),
-                        journal.display(),
-                        format_elapsed(started.elapsed())
+                let rows = [
+                    (
+                        "Mode",
+                        if dry_run { "dry run" } else { "applied" }.to_string(),
                     ),
-                    None => println!(
-                        "dry-run ok files={} (no changes written) elapsed={}",
-                        report.files.join(","),
-                        format_elapsed(started.elapsed())
-                    ),
+                    ("Files", report.files.join(", ")),
+                    ("Journal", display_journal(&report.journal_path)),
+                    ("Elapsed", format_elapsed(started.elapsed())),
+                ];
+                if !crate::presentation::summary("Patch complete", &rows) {
+                    match &report.journal_path {
+                        Some(journal) => println!(
+                            "applied files={} journal={} elapsed={}",
+                            report.files.join(","),
+                            journal.display(),
+                            format_elapsed(started.elapsed())
+                        ),
+                        None => println!(
+                            "dry-run ok files={} (no changes written) elapsed={}",
+                            report.files.join(","),
+                            format_elapsed(started.elapsed())
+                        ),
+                    }
                 }
             }
         }
@@ -731,15 +810,24 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             sanitized_content,
         } => {
             let content = read_optional_file_or_stdin(sanitized_content.as_ref())?;
+            let progress =
+                crate::presentation::TaskProgress::start("Projecting mirror write", !out.is_json());
             let report = write_sanitized_content(&root, &path, &content)?;
+            progress.finish();
             if out.is_json() {
                 out.emit("write", serde_json::to_value(&report)?, None);
             } else {
-                println!(
-                    "wrote files={} journal={}",
-                    report.files.join(","),
-                    display_journal(&report.journal_path)
-                );
+                let rows = [
+                    ("Files", report.files.join(", ")),
+                    ("Journal", display_journal(&report.journal_path)),
+                ];
+                if !crate::presentation::summary("Write projected", &rows) {
+                    println!(
+                        "wrote files={} journal={}",
+                        report.files.join(","),
+                        display_journal(&report.journal_path)
+                    );
+                }
             }
         }
         Command::Rename {
@@ -749,6 +837,10 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             agent,
             session_id,
         } => {
+            let progress = crate::presentation::TaskProgress::start(
+                "Renaming through span maps",
+                !out.is_json(),
+            );
             let report = rename_alias(
                 &root,
                 &path,
@@ -760,18 +852,29 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     dry_run: false,
                 },
             )?;
+            progress.finish();
             if out.is_json() {
                 out.emit("rename", serde_json::to_value(&report)?, None);
             } else {
-                println!(
-                    "renamed real={} -> {} occurrences={} sanitized_now={} files={} journal={}",
-                    report.real_from,
-                    to,
-                    report.occurrences,
-                    report.sanitized_to,
-                    report.apply.files.join(","),
-                    display_journal(&report.apply.journal_path)
-                );
+                let rows = [
+                    ("Original", report.real_from.clone()),
+                    ("Renamed to", to.clone()),
+                    ("Sanitized alias", report.sanitized_to.clone()),
+                    ("Occurrences", report.occurrences.to_string()),
+                    ("Files", report.apply.files.join(", ")),
+                    ("Journal", display_journal(&report.apply.journal_path)),
+                ];
+                if !crate::presentation::summary("Rename complete", &rows) {
+                    println!(
+                        "renamed real={} -> {} occurrences={} sanitized_now={} files={} journal={}",
+                        report.real_from,
+                        to,
+                        report.occurrences,
+                        report.sanitized_to,
+                        report.apply.files.join(","),
+                        display_journal(&report.apply.journal_path)
+                    );
+                }
             }
         }
         Command::ProjectEdit {
@@ -779,6 +882,8 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             agent,
             session_id,
         } => {
+            let progress =
+                crate::presentation::TaskProgress::start("Projecting mirror edit", !out.is_json());
             let report = project_mirror_edit(
                 &root,
                 &path,
@@ -788,28 +893,46 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     dry_run: false,
                 },
             )?;
+            progress.finish();
             if out.is_json() {
                 out.emit("project-edit", serde_json::to_value(&report)?, None);
             } else {
-                println!(
-                    "projected files={} journal={}",
-                    report.files.join(","),
-                    display_journal(&report.journal_path)
-                );
+                let rows = [
+                    ("Files", report.files.join(", ")),
+                    ("Journal", display_journal(&report.journal_path)),
+                ];
+                if !crate::presentation::summary("Mirror edit projected", &rows) {
+                    println!(
+                        "projected files={} journal={}",
+                        report.files.join(","),
+                        display_journal(&report.journal_path)
+                    );
+                }
             }
         }
         Command::Recover { rollback, force } => {
+            let progress =
+                crate::presentation::TaskProgress::start("Recovering workspace", !out.is_json());
             let report = recover_workspace(&root, rollback, force)?;
+            progress.finish();
             if out.is_json() {
                 out.emit("recover", serde_json::to_value(&report)?, None);
             } else {
-                println!(
-                    "recovered entries={} rolled_back={} conflicts={} temp_files_removed={}",
-                    report.recovered.len(),
-                    report.rolled_back,
-                    report.conflicts.len(),
-                    report.temp_files_removed
-                );
+                let rows = [
+                    ("Recovered", report.recovered.len().to_string()),
+                    ("Rolled back", report.rolled_back.to_string()),
+                    ("Conflicts", report.conflicts.len().to_string()),
+                    ("Temp files removed", report.temp_files_removed.to_string()),
+                ];
+                if !crate::presentation::summary("Recovery complete", &rows) {
+                    println!(
+                        "recovered entries={} rolled_back={} conflicts={} temp_files_removed={}",
+                        report.recovered.len(),
+                        report.rolled_back,
+                        report.conflicts.len(),
+                        report.temp_files_removed
+                    );
+                }
             }
             for conflict in &report.conflicts {
                 eprintln!("conflict: {conflict}");
@@ -826,7 +949,10 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             if out.is_json() {
                 out.emit("mode", json!({ "mode": mode }), None);
             } else {
-                println!("{mode}");
+                let rows = [("Enforcement mode", mode.to_string())];
+                if !crate::presentation::summary("Workspace policy", &rows) {
+                    println!("{mode}");
+                }
             }
         }
         Command::ProposeSanitize {
@@ -853,15 +979,25 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             if out.is_json() {
                 out.emit("propose-sanitize", serde_json::to_value(&report)?, None);
             } else {
-                println!(
-                    "proposed={} queued={} duplicates={} rejected={} skipped={} errors={}",
-                    report.proposed,
-                    report.queued,
-                    report.duplicates,
-                    report.rejected.len(),
-                    report.skipped.len(),
-                    report.errors.len()
-                );
+                let rows = [
+                    ("Proposed", report.proposed.to_string()),
+                    ("Queued", report.queued.to_string()),
+                    ("Duplicates", report.duplicates.to_string()),
+                    ("Rejected", report.rejected.len().to_string()),
+                    ("Skipped", report.skipped.len().to_string()),
+                    ("Errors", report.errors.len().to_string()),
+                ];
+                if !crate::presentation::summary("Proposal scan complete", &rows) {
+                    println!(
+                        "proposed={} queued={} duplicates={} rejected={} skipped={} errors={}",
+                        report.proposed,
+                        report.queued,
+                        report.duplicates,
+                        report.rejected.len(),
+                        report.skipped.len(),
+                        report.errors.len()
+                    );
+                }
                 for rejected in &report.rejected {
                     println!("rejected: {rejected}");
                 }
@@ -876,7 +1012,12 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             all,
         } => {
             if let Some(id) = approve {
+                let progress = crate::presentation::TaskProgress::start(
+                    "Approving and reindexing",
+                    !out.is_json(),
+                );
                 let item = crate::proposal::resolve_review(&root, &id, true)?;
+                progress.finish();
                 if out.is_json() {
                     out.emit(
                         "review",
@@ -884,13 +1025,21 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                         None,
                     );
                 } else {
-                    println!(
-                        "approved {} {} -> {} (file {})",
-                        item.id,
-                        item.proposal.original_text,
-                        item.proposal.sanitized_text,
-                        item.file
-                    );
+                    let rows = [
+                        ("Proposal", item.id.clone()),
+                        ("Original", item.proposal.original_text.clone()),
+                        ("Replacement", item.proposal.sanitized_text.clone()),
+                        ("File", item.file.clone()),
+                    ];
+                    if !crate::presentation::summary("Proposal approved", &rows) {
+                        println!(
+                            "approved {} {} -> {} (file {})",
+                            item.id,
+                            item.proposal.original_text,
+                            item.proposal.sanitized_text,
+                            item.file
+                        );
+                    }
                 }
             } else if let Some(id) = reject {
                 let item = crate::proposal::resolve_review(&root, &id, false)?;
@@ -901,27 +1050,51 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                         None,
                     );
                 } else {
-                    println!("rejected {}", item.id);
+                    if crate::presentation::stdout_is_tty() {
+                        crate::presentation::success(&format!("rejected {}", item.id));
+                    } else {
+                        println!("rejected {}", item.id);
+                    }
                 }
             } else {
                 let items = crate::proposal::list_review(&root, all)?;
                 if out.is_json() {
                     out.emit("review", json!({ "items": items }), None);
                 } else {
-                    if items.is_empty() {
+                    let rows = items
+                        .iter()
+                        .map(|item| {
+                            vec![
+                                item.id.clone(),
+                                format!("{:?}", item.status).to_lowercase(),
+                                format!(
+                                    "{} -> {}",
+                                    item.proposal.original_text, item.proposal.sanitized_text
+                                ),
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    let rendered = crate::presentation::table_with_minimums(
+                        &format!("Review queue | {} item(s)", items.len()),
+                        &["ID", "Status", "Proposal"],
+                        &rows,
+                        &[39, 7, 12],
+                    );
+                    if !rendered && items.is_empty() {
                         println!("review queue is empty");
-                    }
-                    for item in items {
-                        println!(
-                            "{}\t{:?}\t{}\t{} -> {}\t[{}]\t{}",
-                            item.id,
-                            item.status,
-                            item.file,
-                            item.proposal.original_text,
-                            item.proposal.sanitized_text,
-                            item.flag,
-                            item.proposal.category
-                        );
+                    } else if !rendered {
+                        for item in items {
+                            println!(
+                                "{}\t{:?}\t{}\t{} -> {}\t[{}]\t{}",
+                                item.id,
+                                item.status,
+                                item.file,
+                                item.proposal.original_text,
+                                item.proposal.sanitized_text,
+                                item.flag,
+                                item.proposal.category
+                            );
+                        }
                     }
                 }
             }
@@ -931,18 +1104,44 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             if out.is_json() {
                 out.emit("review-sanitize", json!({ "replacements": rows }), None);
             } else {
-                println!("replacements={}", rows.len());
-                for row in rows {
-                    println!(
-                        "{}:{}\t{}\t{} -> {}\t[{}]\tconf={:.2}",
-                        row.file,
-                        row.original_line,
-                        row.category,
-                        row.original_text,
-                        row.sanitized_text,
-                        row.policy_source,
-                        row.confidence
-                    );
+                let table_rows = rows
+                    .iter()
+                    .map(|row| {
+                        vec![
+                            row.file.clone(),
+                            row.original_line.to_string(),
+                            row.category.clone(),
+                            row.original_text.clone(),
+                            row.sanitized_text.clone(),
+                            row.policy_source.clone(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                if !crate::presentation::table(
+                    &format!("Applied replacements | {}", rows.len()),
+                    &[
+                        "File",
+                        "Line",
+                        "Category",
+                        "Original",
+                        "Replacement",
+                        "Policy",
+                    ],
+                    &table_rows,
+                ) {
+                    println!("replacements={}", rows.len());
+                    for row in rows {
+                        println!(
+                            "{}:{}\t{}\t{} -> {}\t[{}]\tconf={:.2}",
+                            row.file,
+                            row.original_line,
+                            row.category,
+                            row.original_text,
+                            row.sanitized_text,
+                            row.policy_source,
+                            row.confidence
+                        );
+                    }
                 }
             }
         }
@@ -956,6 +1155,8 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
         }
         Command::Sync { path, force } => {
             let started = std::time::Instant::now();
+            let progress =
+                crate::presentation::TaskProgress::start("Synchronizing mirror", !out.is_json());
             let report = match (path, force) {
                 (Some(path), false) => crate::index::sync_single_file(&root, &path)?,
                 (Some(path), true) => {
@@ -968,6 +1169,7 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                 (None, false) => index_workspace(&root)?,
                 (None, true) => crate::index::index_workspace_force(&root)?,
             };
+            progress.finish();
             for (path, reason) in &report.errors {
                 eprintln!("error: {path}: {reason}");
             }
@@ -978,18 +1180,30 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     Some(started.elapsed().as_millis()),
                 );
             } else {
-                println!(
-                    "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={} symlinks={} errors={} elapsed={}",
-                    report.indexed,
-                    report.unchanged,
-                    report.skipped,
-                    report.removed,
-                    report.pending,
-                    report.stashed.len(),
-                    report.skipped_symlinks,
-                    report.errors.len(),
-                    format_elapsed(started.elapsed())
-                );
+                let rows = [
+                    ("Indexed", report.indexed.to_string()),
+                    ("Unchanged", report.unchanged.to_string()),
+                    ("Skipped", report.skipped.to_string()),
+                    ("Removed", report.removed.to_string()),
+                    ("Pending edits", report.pending.to_string()),
+                    ("Stashed", report.stashed.len().to_string()),
+                    ("Errors", report.errors.len().to_string()),
+                    ("Elapsed", format_elapsed(started.elapsed())),
+                ];
+                if !crate::presentation::summary("Sync complete", &rows) {
+                    println!(
+                        "synced indexed={} unchanged={} skipped={} removed={} pending={} stashed={} symlinks={} errors={} elapsed={}",
+                        report.indexed,
+                        report.unchanged,
+                        report.skipped,
+                        report.removed,
+                        report.pending,
+                        report.stashed.len(),
+                        report.skipped_symlinks,
+                        report.errors.len(),
+                        format_elapsed(started.elapsed())
+                    );
+                }
             }
             for stash in &report.stashed {
                 eprintln!("stashed pending mirror edit: {stash}");
@@ -997,7 +1211,12 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
         }
         Command::EmbedIndex => {
             let started = std::time::Instant::now();
+            let progress = crate::presentation::TaskProgress::start(
+                "Embedding sanitized mirror",
+                !out.is_json(),
+            );
             let report = crate::embed::embed_index(&root)?;
+            progress.finish();
             if out.is_json() {
                 out.emit(
                     "embed-index",
@@ -1005,20 +1224,33 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     Some(started.elapsed().as_millis()),
                 );
             } else {
-                println!(
-                    "embedded={} unchanged={} removed={} stale={} chunks={} elapsed={}",
-                    report.embedded,
-                    report.unchanged,
-                    report.removed,
-                    report.stale,
-                    report.chunks,
-                    format_elapsed(started.elapsed())
-                );
+                let rows = [
+                    ("Embedded", report.embedded.to_string()),
+                    ("Unchanged", report.unchanged.to_string()),
+                    ("Removed", report.removed.to_string()),
+                    ("Stale", report.stale.to_string()),
+                    ("Chunks", report.chunks.to_string()),
+                    ("Elapsed", format_elapsed(started.elapsed())),
+                ];
+                if !crate::presentation::summary("Embedding index complete", &rows) {
+                    println!(
+                        "embedded={} unchanged={} removed={} stale={} chunks={} elapsed={}",
+                        report.embedded,
+                        report.unchanged,
+                        report.removed,
+                        report.stale,
+                        report.chunks,
+                        format_elapsed(started.elapsed())
+                    );
+                }
             }
         }
         Command::SemanticSearch { query, k } => {
             let started = std::time::Instant::now();
+            let progress =
+                crate::presentation::TaskProgress::start("Running semantic search", !out.is_json());
             let hits = crate::embed::semantic_search(&root, &query, k)?;
+            progress.finish();
             if out.is_json() {
                 out.emit(
                     "semantic-search",
@@ -1026,11 +1258,28 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     Some(started.elapsed().as_millis()),
                 );
             } else {
-                for hit in &hits {
-                    println!(
-                        "{}:{}-{}\t{:.3}\t{}",
-                        hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
-                    );
+                let rows = hits
+                    .iter()
+                    .map(|hit| {
+                        vec![
+                            hit.rel_path.clone(),
+                            format!("{}-{}", hit.start_line, hit.end_line),
+                            format!("{:.3}", hit.score),
+                            hit.preview.clone(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                if !crate::presentation::table(
+                    &format!("Semantic search | {} hit(s)", hits.len()),
+                    &["File", "Lines", "Score", "Preview"],
+                    &rows,
+                ) {
+                    for hit in &hits {
+                        println!(
+                            "{}:{}-{}\t{:.3}\t{}",
+                            hit.rel_path, hit.start_line, hit.end_line, hit.score, hit.preview
+                        );
+                    }
                 }
             }
             // Stdout stays machine-parseable result lines; the summary goes to
@@ -1042,11 +1291,21 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
             );
         }
         Command::Verify => {
+            let progress =
+                crate::presentation::TaskProgress::start("Verifying workspace", !out.is_json());
             let report = verify_workspace(&root)?;
+            progress.finish();
             if out.is_json() {
                 out.emit("verify", serde_json::to_value(&report)?, None);
             } else {
-                println!("verified tracked_files={}", report.checked);
+                let rows = [
+                    ("Tracked files", report.checked.to_string()),
+                    ("Failures", report.failures.len().to_string()),
+                    ("Status", "healthy".to_string()),
+                ];
+                if !crate::presentation::summary("Verification complete", &rows) {
+                    println!("verified tracked_files={}", report.checked);
+                }
             }
         }
         Command::Doctor { agent } => {
@@ -1105,8 +1364,9 @@ fn display_journal(journal_path: &Option<PathBuf>) -> String {
 fn doctor(root: &std::path::Path, agent: Option<Agent>, out: crate::output::Output) -> Result<()> {
     use serde_json::json;
     let layout = crate::config::Layout::new(root);
+    let pretty = !out.is_json() && crate::presentation::stdout_is_tty();
     let path_status = |path: &std::path::Path| json!({ "path": path.display().to_string(), "exists": path.exists() });
-    if !out.is_json() {
+    if !out.is_json() && !pretty {
         println!("root={}", root.display());
         println!(
             "state_dir={} exists={}",
@@ -1145,7 +1405,7 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>, out: crate::output::Outp
                 && fs::read_to_string(&pre)
                     .map(|body| body.contains("permissionDecision"))
                     .unwrap_or(false);
-            if !out.is_json() {
+            if !out.is_json() && !pretty {
                 println!(
                     "codex hooks.json={} exists={}",
                     hooks.display(),
@@ -1177,7 +1437,7 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>, out: crate::output::Outp
                 && fs::read_to_string(&pre)
                     .map(|body| body.contains("permissionDecision"))
                     .unwrap_or(false);
-            if !out.is_json() {
+            if !out.is_json() && !pretty {
                 println!(
                     "claude settings.json={} exists={}",
                     settings.display(),
@@ -1213,7 +1473,7 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>, out: crate::output::Outp
                 && fs::read_to_string(&plugin)
                     .map(|body| body.contains("project-edit"))
                     .unwrap_or(false);
-            if !out.is_json() {
+            if !out.is_json() && !pretty {
                 println!("opencode plugin={} exists={}", plugin.display(), plugin_ok);
                 println!(
                     "opencode package.json={} exists={}",
@@ -1235,12 +1495,80 @@ fn doctor(root: &std::path::Path, agent: Option<Agent>, out: crate::output::Outp
             }))
         }
         None => {
-            if !out.is_json() {
+            if !out.is_json() && !pretty {
                 println!("agents: codex, claude, opencode");
             }
             None
         }
     };
+    if pretty {
+        let mut rows = vec![
+            ("Root", root.display().to_string()),
+            (
+                "State",
+                if layout.state_dir.exists() {
+                    "ready"
+                } else {
+                    "missing"
+                }
+                .to_string(),
+            ),
+            (
+                "Config",
+                if layout.config_path.exists() {
+                    "present"
+                } else {
+                    "missing"
+                }
+                .to_string(),
+            ),
+            (
+                "Database",
+                if layout.db_path.exists() {
+                    "present"
+                } else {
+                    "missing"
+                }
+                .to_string(),
+            ),
+            (
+                "Mirror",
+                if layout.mirror_dir.exists() {
+                    "present"
+                } else {
+                    "missing"
+                }
+                .to_string(),
+            ),
+            (
+                "Maps",
+                if layout.maps_dir.exists() {
+                    "present"
+                } else {
+                    "missing"
+                }
+                .to_string(),
+            ),
+        ];
+        if let Some(status) = &agent_status {
+            rows.push((
+                "Agent",
+                status["name"].as_str().unwrap_or("unknown").to_string(),
+            ));
+            rows.push((
+                "Hooks",
+                if status["installed"].as_bool().unwrap_or(false) {
+                    "installed"
+                } else {
+                    "not installed"
+                }
+                .to_string(),
+            ));
+        } else {
+            rows.push(("Agents", "codex, claude, opencode".to_string()));
+        }
+        crate::presentation::summary("Workspace doctor", &rows);
+    }
     out.emit(
         "doctor",
         json!({
@@ -1409,7 +1737,7 @@ fn install_hooks(
             None,
         );
     } else {
-        println!("installed hooks for {installed}");
+        crate::presentation::success(&format!("installed hooks for {installed}"));
     }
     Ok(())
 }
@@ -1463,7 +1791,7 @@ fn uninstall_hooks(root: &std::path::Path, agent: Agent, out: crate::output::Out
             None,
         );
     } else {
-        println!("uninstalled hooks for {name}");
+        crate::presentation::success(&format!("uninstalled hooks for {name}"));
     }
     Ok(())
 }

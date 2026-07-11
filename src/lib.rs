@@ -17,11 +17,13 @@ pub mod map;
 pub mod mcp;
 pub mod output;
 pub mod patch;
+pub mod presentation;
 pub mod proposal;
 pub mod redact;
 pub mod sanitize;
 pub mod search;
 pub mod strict;
+pub mod tui;
 pub mod verify;
 
 pub use config::{Config, Layout};

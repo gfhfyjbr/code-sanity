@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Running `code-sanity` without a subcommand now opens a full-screen,
+  mouse-enabled workspace with review, source-context, activity, and workspace
+  views.
+- The interactive command palette supports completion, history, filtering,
+  review decisions, scoped proposal scans, and background index/verify jobs.
+- Human CLI output attached to a terminal now uses live spinners, color,
+  summaries, and width-aware result tables while redirected and JSON output
+  keep their existing machine contracts.
+
+### Changed
+
+- Proposal scans and review decisions in the TUI require explicit confirmation;
+  the provider dialog identifies the configured endpoint and makes clear that
+  real source may leave the process.
+- Long TUI operations run on background workers and expose live progress and an
+  event log without blocking keyboard or mouse input.
+
 ## [0.3.2] - 2026-07-11
 
 ### Added

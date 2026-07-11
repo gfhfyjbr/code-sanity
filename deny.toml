@@ -7,6 +7,10 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Ratatui 0.29 is the newest release compatible with the project's Rust 1.85
+# MSRV and uses `paste` as a build-time proc macro. RUSTSEC-2024-0436 reports
+# abandonment, not a vulnerability; Ratatui 0.30 removes it but requires 1.88.
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 version = 2

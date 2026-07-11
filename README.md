@@ -63,11 +63,33 @@ fresh Linux and macOS runners. See [docs/RELEASING.md](docs/RELEASING.md).
 ```bash
 cargo run -- init
 cargo run -- index
+cargo run --                 # open the interactive workspace
 cargo run -- read src/lib.rs
 cargo run -- search neutral_parser
 cargo run -- grep neutral_parser
 cargo run -- verify
 ```
+
+### Interactive workspace
+
+Running `code-sanity` without a subcommand opens the full-screen terminal UI.
+It combines the pending review queue, proposal details, real-source context,
+workspace status, live operation progress, and an activity log. Tabs, review
+rows, and action buttons support mouse clicks and scrolling.
+
+Press `:` to open the command palette. It provides completion with `Tab` and
+history with `Up`/`Down`; available commands include `index`, `verify`,
+`propose [path] -j N`, `review [all]`, `approve [id]`, `reject [id]`,
+`filter <text>`, `tab review|activity|workspace`, `refresh`, and `quit`.
+Keyboard accelerators (`i`, `v`, `p`, `a`, `r`, `/`) run the same
+command engine. Provider scans and review decisions use confirmation dialogs,
+while long operations run in the background so input and mouse handling stay
+live.
+
+Human CLI output uses colors, spinners, summaries, and result tables when
+attached to a terminal. Redirected output retains the stable plain-text format;
+`--json` remains undecorated machine-readable output. `read`, `sh`,
+`strict-run`, and `serve` keep their raw stream contracts.
 
 Apply a patch written against the sanitized mirror:
 
@@ -311,6 +333,7 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 
 ## Current Commands
 
+- `code-sanity` (no subcommand: interactive workspace)
 - `init`
 - `index`
 - `read <path>`
