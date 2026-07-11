@@ -276,6 +276,7 @@ fn rust_analyzer_regression_combines_semantic_renames_with_ast_edits() {
         &fs::read_to_string(repo.path().join("src/lib.rs")).unwrap(),
         code_sanity::semantic::LanguageId::Rust,
         &get_hwid_symbol.range,
+        2,
     )
     .unwrap();
     assert_eq!(references.len(), 2);

@@ -20,6 +20,8 @@ use std::time::Duration;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const REFERENCE_READY_ATTEMPTS: usize = 20;
+const REFERENCE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceTextEdit {
@@ -41,6 +43,7 @@ pub fn references(
     source: &str,
     language: LanguageId,
     declaration: &TextRange,
+    minimum_references: usize,
 ) -> Result<Vec<LspLocation>> {
     let server = Server::for_language(language)?;
     let root = root
@@ -61,8 +64,7 @@ pub fn references(
             }),
         )?;
         client.wait_for_document(&file_uri(&target))?;
-        let result = client.request_retry_content_modified(
-            "textDocument/references",
+        let result = client.request_references_until(
             json!({
                 "textDocument": { "uri": file_uri(&target) },
                 "position": {
@@ -75,6 +77,7 @@ pub fn references(
                 },
                 "context": { "includeDeclaration": true }
             }),
+            minimum_references,
         );
         let _ = client.notify(
             "textDocument/didClose",
@@ -92,6 +95,7 @@ pub fn rename(
     language: LanguageId,
     declaration: &TextRange,
     new_name: &str,
+    minimum_references: usize,
 ) -> Result<Vec<WorkspaceTextEdit>> {
     let server = Server::for_language(language)?;
     let root = root
@@ -125,13 +129,13 @@ pub fn rename(
             }),
         )?;
         client.wait_for_document(&file_uri(&target))?;
-        let references = client.request_retry_content_modified(
-            "textDocument/references",
+        let references = client.request_references_until(
             json!({
                 "textDocument": { "uri": file_uri(&target) },
                 "position": position,
                 "context": { "includeDeclaration": true }
             }),
+            minimum_references,
         )?;
         let mut result = None;
         for attempt in 0..3 {
@@ -346,6 +350,24 @@ impl Client {
             }
         }
         bail!("LSP {method} did not return a stable result")
+    }
+
+    fn request_references_until(&mut self, params: Value, minimum: usize) -> Result<Value> {
+        let mut observed = 0usize;
+        for attempt in 0..REFERENCE_READY_ATTEMPTS {
+            let value =
+                self.request_retry_content_modified("textDocument/references", params.clone())?;
+            observed = value.as_array().map_or(0, Vec::len);
+            if observed >= minimum {
+                return Ok(value);
+            }
+            if attempt + 1 < REFERENCE_READY_ATTEMPTS {
+                std::thread::sleep(REFERENCE_RETRY_DELAY);
+            }
+        }
+        bail!(
+            "language server reported only {observed} reference(s), below the semantic index minimum {minimum}; refusing incomplete result"
+        )
     }
 
     fn wait_for_document(&mut self, uri: &str) -> Result<()> {

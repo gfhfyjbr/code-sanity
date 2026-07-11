@@ -67,6 +67,7 @@ struct IntentSnapshot {
     document: StoredDocument,
     source: String,
     range: crate::semantic::TextRange,
+    minimum_references: usize,
 }
 
 pub fn preview_transaction(
@@ -121,6 +122,7 @@ pub fn preview_transaction(
                     snapshot.document.language,
                     &snapshot.range,
                     new_name,
+                    snapshot.minimum_references,
                 )?;
                 edits.extend(lsp_edits.into_iter().map(|edit| PlannedEdit {
                     rel_path: edit.rel_path,
@@ -304,6 +306,7 @@ fn snapshot_intent(
                 document,
                 source,
                 range: node.range,
+                minimum_references: 0,
             })
         }
         EditIntent::RenameSymbol { symbol_id, .. } => {
@@ -316,12 +319,14 @@ fn snapshot_intent(
                 bail!("rename_symbol requires an available compiler/LSP backend");
             }
             let source = read_snapshot_source(root, &document)?;
+            let minimum_references = semantic_store::occurrences_for_symbol(conn, symbol_id)?.len();
             Ok(IntentSnapshot {
                 intent,
                 rel_path,
                 document,
                 source,
                 range: symbol.range,
+                minimum_references,
             })
         }
     }

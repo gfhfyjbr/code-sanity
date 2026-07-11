@@ -668,7 +668,7 @@ fn with_semantic_read(
 fn semantic_references(root: &Path, symbol_id: &str) -> Result<ToolOutput> {
     let layout = crate::config::Layout::new(root);
     layout.require_initialized()?;
-    let (revision, rel_path, symbol, document, source) = {
+    let (revision, rel_path, symbol, document, source, minimum_references) = {
         let _lock = crate::lock::WorkspaceLock::acquire_shared(&layout)?;
         let conn = crate::db::connect(&layout)?;
         crate::db::check_schema(&conn)?;
@@ -685,10 +685,26 @@ fn semantic_references(root: &Path, symbol_id: &str) -> Result<ToolOutput> {
         if crate::map::sha256_hex(source.as_bytes()) != document.content_hash {
             bail!("{rel_path} changed since semantic index; run code-sanity index");
         }
-        (revision, rel_path, symbol, document, source)
+        let minimum_references =
+            crate::semantic_store::occurrences_for_symbol(&conn, symbol_id)?.len();
+        (
+            revision,
+            rel_path,
+            symbol,
+            document,
+            source,
+            minimum_references,
+        )
     };
     let rel = crate::config::normalize_safe_rel_path(Path::new(&rel_path), "symbol path")?;
-    let locations = crate::lsp::references(root, &rel, &source, document.language, &symbol.range)?;
+    let locations = crate::lsp::references(
+        root,
+        &rel,
+        &source,
+        document.language,
+        &symbol.range,
+        minimum_references,
+    )?;
     {
         let _lock = crate::lock::WorkspaceLock::acquire_shared(&layout)?;
         let conn = crate::db::connect(&layout)?;
