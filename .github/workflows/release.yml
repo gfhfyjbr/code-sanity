@@ -5,15 +5,49 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate release tag
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "$GITHUB_REF_NAME" = "v$version"
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Validate installer
+        run: |
+          bash -n install.sh
+          shellcheck install.sh
+          test "$(./install.sh --print-target)" = "x86_64-unknown-linux-gnu"
+
+  msrv:
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV
+        run: cargo check --locked
+
   # A tag push bypasses ci.yml (branch push/PR triggers only), so the gate
   # lives here: a tag on a broken commit must not ship binaries.
   test:
+    needs: metadata
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -32,6 +66,7 @@ jobs:
         run: cargo test --locked
 
   deny:
+    needs: metadata
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,21 +75,25 @@ jobs:
           command: check advisories licenses bans sources
 
   build:
-    needs: [test, deny]
+    needs: [metadata, msrv, test, deny]
     strategy:
       matrix:
         include:
           # ubuntu-22.04: oldest supported glibc for wider binary compatibility.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+            smoke: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
+            smoke: true
           - target: aarch64-apple-darwin
             os: macos-latest
+            smoke: true
           # Cross-arch build on the arm64 runner; Apple toolchain handles it,
           # including the bundled SQLite C sources.
           - target: x86_64-apple-darwin
             os: macos-latest
+            smoke: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +105,9 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke binary
+        if: matrix.smoke
+        run: target/${{ matrix.target }}/release/code-sanity --version
       - name: Package
         run: |
           name="code-sanity-${GITHUB_REF_NAME}-${{ matrix.target }}"
@@ -81,10 +123,13 @@ jobs:
             code-sanity-*.tar.gz
             code-sanity-*.tar.gz.sha256
           if-no-files-found: error
+          retention-days: 1
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -104,3 +149,19 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
             --notes-file notes.md
+
+  install-smoke:
+    needs: release
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install published release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bin_dir="$RUNNER_TEMP/code-sanity-bin"
+          ./install.sh --version "$GITHUB_REF_NAME" --bin-dir "$bin_dir" --no-color
+          "$bin_dir/code-sanity" --version

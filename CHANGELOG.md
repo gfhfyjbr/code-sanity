@@ -16,9 +16,15 @@ edits, and a lost `config.toml` no longer silently voids the policy.
 
 ### Added
 
-- `install.sh` provides a no-`sudo` source installer with an animated release
-  build, configurable destination, atomic binary replacement, installed-version
-  verification, optional idempotent shell `PATH` setup, and uninstall support.
+- `install.sh` now detects the host target and downloads the matching checksummed
+  binary from the latest or a pinned GitHub Release, requiring neither `sudo`
+  nor Rust. It verifies archive layout, checksum, release/binary version parity,
+  and the installed binary; source-build, custom destination, idempotent `PATH`,
+  and uninstall modes remain available.
+- CI now validates the installer contract, and tagged CD validates version/tag
+  parity and main-branch ancestry before building all four supported targets.
+  Native binaries are smoke-tested before packaging, then the published release
+  is installed through `install.sh` on fresh Linux and macOS runners.
 - `propose-sanitize` now runs provider calls with bounded concurrency (four
   workers by default, configurable with `sanitizer.propose_concurrency` or
   `--jobs`) and reports live per-file progress, latency, queue counts, skips,
