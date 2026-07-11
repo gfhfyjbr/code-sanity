@@ -42,7 +42,7 @@ Usage:
   curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.sh | bash
 
 Options:
-  --version VERSION  Install a release tag such as v0.4.3 (default: latest)
+  --version VERSION  Install a release tag such as v0.4.4 (default: latest)
   --repo OWNER/REPO  Download from another GitHub repository
   --bin-dir DIR      Install into DIR (default: $CARGO_HOME/bin or ~/.cargo/bin)
   --add-to-path      Add the selected directory to the current shell's rc file
