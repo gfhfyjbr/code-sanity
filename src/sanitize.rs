@@ -851,6 +851,7 @@ pub fn detect_language(rel_path: &Path, _content: &str) -> String {
         Some("toml") => "toml",
         Some("json") => "json",
         Some("go") => "go",
+        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" | "m" | "mm") => "c",
         Some("sh") | Some("bash") | Some("zsh") => "shell",
         Some("yml") | Some("yaml") => "yaml",
         // Unknown extensions are CODE (.java, .rb, .php, ...): when in doubt
@@ -952,7 +953,7 @@ pub(crate) fn comment_ranges(
         }
         if matches!(
             language,
-            "rust" | "typescript" | "javascript" | "go" | "text"
+            "rust" | "typescript" | "javascript" | "go" | "c" | "text"
         ) {
             if bytes[cursor..].starts_with(b"//") {
                 let end = find_byte(bytes, cursor, b'\n').unwrap_or(content.len());
