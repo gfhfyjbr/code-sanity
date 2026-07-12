@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-07-12
+
+### Added
+
+- The TUI review queue supports persistent proposal checkboxes, filtered
+  select/deselect-all, and confirmed bulk approval with progress reporting.
+- The TUI proposal action opens a setup modal with a tracked-directory scope
+  dropdown, provider destination details, and explicit endpoint permission.
+
+### Changed
+
+- Proposal warnings and rationales are stacked and width-wrapped in the change
+  preview, and the queue action has visual spacing from the main toolbar.
+
 ## [0.4.7] - 2026-07-12
 
 ### Added
@@ -465,7 +479,11 @@ Source-only baseline; never released as a binary.
 - Strict mode (`sh` / `strict-run`) with sanitized command output.
 - Proposal review queue with human approval (`propose-sanitize`, `review`).
 
-[Unreleased]: https://github.com/gfhfyjbr/code-sanity/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/gfhfyjbr/code-sanity/compare/v0.4.8...HEAD
+[0.4.8]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.8
+[0.4.7]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.7
+[0.4.6]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.6
+[0.4.5]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.5
 [0.4.4]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.4
 [0.4.3]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.3
 [0.4.2]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.2

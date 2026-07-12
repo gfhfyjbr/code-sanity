@@ -1,4 +1,4 @@
-use super::app::{App, HitAction, LogLevel, Tab, ToolbarAction, is_pending};
+use super::app::{App, HitAction, LogLevel, ProposeFocus, Tab, ToolbarAction, is_pending};
 use super::change_preview;
 use super::components::{
     ACCENT, BG, BORDER, ButtonHit, ButtonVariant, DANGER, FG, MUTED, PANEL, PANEL_HOVER, PRIMARY,
@@ -47,8 +47,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     if app.show_help {
         render_help(frame, app, area);
-    }
-    if app.confirmation.is_some() {
+    } else if app.propose_dialog.is_some() {
+        render_propose_dialog(frame, app, area);
+    } else if app.confirmation.is_some() {
         render_confirmation(frame, app, area);
     }
 }
@@ -165,25 +166,42 @@ fn render_tabs(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_review(frame: &mut Frame, app: &mut App, area: Rect) {
-    let areas = if area.width >= 96 {
-        Layout::default()
+    if area.width >= 96 {
+        let areas = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-            .split(area)
+            .split(area);
+        render_review_queue(frame, app, areas[0]);
+        change_preview::render(frame, app, areas[1]);
     } else {
         let queue_height = area
             .height
             .saturating_mul(3)
             .div_ceil(10)
-            .clamp(3, 8)
+            .clamp(4, 9)
             .min(area.height.saturating_sub(3));
-        Layout::default()
+        let areas = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(queue_height), Constraint::Min(3)])
-            .split(area)
-    };
+            .split(area);
+        render_review_queue(frame, app, areas[0]);
+        change_preview::render(frame, app, areas[1]);
+    }
+}
+
+fn render_review_queue(frame: &mut Frame, app: &mut App, area: Rect) {
+    let button_height = if area.height >= 6 { 3 } else { 1 };
+    let bottom_margin = u16::from(area.height >= 6);
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(button_height),
+            Constraint::Length(bottom_margin),
+        ])
+        .split(area);
     render_review_list(frame, app, areas[0]);
-    change_preview::render(frame, app, areas[1]);
+    render_select_all_button(frame, app, areas[1]);
 }
 
 fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -201,9 +219,15 @@ fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .filtered
         .iter()
         .map(|index| {
-            review_row_text(&app.reviews[*index], inner.width as usize, false)
-                .0
-                .len()
+            let item = &app.reviews[*index];
+            review_row_text(
+                item,
+                inner.width as usize,
+                false,
+                app.is_review_checked(item),
+            )
+            .0
+            .len()
         })
         .collect::<Vec<_>>();
     let viewport_height = inner.height.max(1) as usize;
@@ -253,13 +277,25 @@ fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
     for (index, filtered_index, row_y, row_height) in visible_rows {
         let item = &app.reviews[filtered_index];
         let selected = index == app.selected;
-        let (text, flagged) = review_row_text(item, inner.width as usize, selected);
+        let checked = app.is_review_checked(item);
+        let (text, flagged) = review_row_text(item, inner.width as usize, selected, checked);
         let row_area = Rect::new(
             inner.x,
             inner.y + row_y as u16,
             inner.width,
             row_height as u16,
         );
+        if is_pending(item) {
+            app.hits.push(ButtonHit {
+                area: Rect::new(
+                    row_area.x,
+                    row_area.y,
+                    row_area.width.min(3),
+                    row_area.height,
+                ),
+                action: HitAction::ToggleReview(index),
+            });
+        }
         app.hits.push(ButtonHit {
             area: row_area,
             action: HitAction::Review(index),
@@ -283,6 +319,52 @@ fn render_review_list(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
             row_area,
         );
+    }
+}
+
+fn render_select_all_button(frame: &mut Frame, app: &mut App, area: Rect) {
+    let all_checked = app.all_filtered_pending_checked();
+    let label = if all_checked {
+        "Deselect All"
+    } else {
+        "Select All"
+    };
+    let disabled = app.job.is_some() || !app.has_filtered_pending();
+    let hovered = contains(area, app.mouse.0, app.mouse.1);
+    if area.height >= 3 {
+        draw_button(
+            frame,
+            area,
+            label,
+            ButtonVariant::Secondary,
+            hovered,
+            disabled,
+        );
+    } else {
+        let style = if disabled {
+            Style::default().fg(BORDER).bg(PANEL)
+        } else {
+            Style::default()
+                .fg(if hovered { FG } else { PRIMARY })
+                .bg(PANEL)
+                .add_modifier(if hovered {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                })
+        };
+        frame.render_widget(
+            Paragraph::new(format!("[ {label} ]"))
+                .alignment(Alignment::Center)
+                .style(style),
+            area,
+        );
+    }
+    if !disabled {
+        app.hits.push(ButtonHit {
+            area,
+            action: HitAction::ToggleAllReviews,
+        });
     }
 }
 
@@ -415,7 +497,7 @@ fn render_toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(1),
         Constraint::Length(13),
         Constraint::Length(1),
-        Constraint::Length(13),
+        Constraint::Length(15),
         Constraint::Length(1),
         Constraint::Length(12),
         Constraint::Min(0),
@@ -426,6 +508,12 @@ fn render_toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
     let disabled = app.job.is_some();
     let selected_pending = app.selected_review().is_some_and(is_pending);
+    let checked = app.checked_pending_count();
+    let approve_label = if checked == 0 {
+        "Approve".to_string()
+    } else {
+        format!("Approve ({checked})")
+    };
     let buttons = [
         (
             0,
@@ -450,10 +538,10 @@ fn render_toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         (
             6,
-            "Approve",
+            approve_label.as_str(),
             ButtonVariant::Success,
             ToolbarAction::Approve,
-            disabled || !selected_pending,
+            disabled || (checked == 0 && !selected_pending),
         ),
         (
             8,
@@ -587,8 +675,9 @@ fn render_help(frame: &mut Frame, app: &mut App, area: Rect) {
             "Navigation",
             Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
         )]),
-        Line::from("  j/k or arrows     select proposal"),
+        Line::from("  j/k or arrows     focus proposal"),
         Line::from("  PgUp/PgDn         move one page"),
+        Line::from("  Space/click [ ]   toggle approval selection"),
         Line::from("  Tab                switch view"),
         Line::from("  mouse click/scroll select, switch, and run actions"),
         Line::from(""),
@@ -596,8 +685,8 @@ fn render_help(frame: &mut Frame, app: &mut App, area: Rect) {
             "Actions",
             Style::default().fg(PRIMARY).add_modifier(Modifier::BOLD),
         )]),
-        Line::from("  i index    v verify    p propose"),
-        Line::from("  a approve  r reject    / filter"),
+        Line::from("  i index    v verify    p proposal setup"),
+        Line::from("  a approve checked (or focused)    r reject focused"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Command palette",
@@ -613,6 +702,213 @@ fn render_help(frame: &mut Frame, app: &mut App, area: Rect) {
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_propose_dialog(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(dialog) = app.propose_dialog.clone() else {
+        return;
+    };
+    app.hits.clear();
+    render_modal_backdrop(frame, area);
+    let popup_area = centered(area, 82, 22);
+    let inner = popup(frame, popup_area, "Configure proposal scan");
+
+    let option_rows = if dialog.dropdown_open {
+        inner
+            .height
+            .saturating_sub(10)
+            .saturating_sub(2)
+            .min(6)
+            .min(dialog.scopes.len() as u16)
+    } else {
+        0
+    };
+    let option_height = if option_rows == 0 { 0 } else { option_rows + 2 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(option_height),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(inner);
+
+    let selected_label = dialog
+        .selected()
+        .map(|scope| scope.label.as_str())
+        .unwrap_or("Entire workspace");
+    let directory_focused = dialog.focus == ProposeFocus::Directory;
+    let dropdown_hovered = contains(chunks[0], app.mouse.0, app.mouse.1);
+    frame.render_widget(
+        Paragraph::new(format!(
+            " {selected_label}  {}",
+            if dialog.dropdown_open { "▲" } else { "▼" }
+        ))
+        .style(
+            Style::default()
+                .fg(if directory_focused { FG } else { MUTED })
+                .bg(if dropdown_hovered { PANEL_HOVER } else { PANEL })
+                .add_modifier(if directory_focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        )
+        .block(
+            Block::default()
+                .title(" Directory scope ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if directory_focused {
+                    PRIMARY
+                } else {
+                    BORDER
+                })),
+        ),
+        chunks[0],
+    );
+    app.hits.push(ButtonHit {
+        area: chunks[0],
+        action: HitAction::ProposeDropdown,
+    });
+
+    if option_rows > 0 {
+        let rows = option_rows as usize;
+        let start = dialog
+            .selected_scope
+            .saturating_sub(rows / 2)
+            .min(dialog.scopes.len().saturating_sub(rows));
+        let lines = dialog
+            .scopes
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(rows)
+            .map(|(index, scope)| {
+                let selected = index == dialog.selected_scope;
+                Line::from(Span::styled(
+                    format!("{} {}", if selected { ">" } else { " " }, scope.label),
+                    Style::default()
+                        .fg(if selected { FG } else { MUTED })
+                        .bg(if selected { PANEL_HOVER } else { PANEL })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(PRIMARY)),
+            ),
+            chunks[1],
+        );
+        for row in 0..rows {
+            let index = start + row;
+            app.hits.push(ButtonHit {
+                area: Rect::new(
+                    chunks[1].x.saturating_add(1),
+                    chunks[1].y.saturating_add(1 + row as u16),
+                    chunks[1].width.saturating_sub(2),
+                    1,
+                ),
+                action: HitAction::ProposeScope(index),
+            });
+        }
+    }
+
+    let endpoint_focused = dialog.focus == ProposeFocus::Endpoint;
+    let endpoint_label = if dialog.endpoint_required {
+        format!(
+            "[{}] Allow provider endpoint (required)",
+            if dialog.allow_endpoint { "X" } else { " " }
+        )
+    } else {
+        "[ ] Allow provider endpoint (not required for this provider)".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(endpoint_label).style(
+            Style::default()
+                .fg(if dialog.endpoint_required {
+                    if endpoint_focused { FG } else { WARNING }
+                } else {
+                    MUTED
+                })
+                .bg(if endpoint_focused { PANEL_HOVER } else { PANEL })
+                .add_modifier(if endpoint_focused {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        chunks[2],
+    );
+    if dialog.endpoint_required {
+        app.hits.push(ButtonHit {
+            area: chunks[2],
+            action: HitAction::ProposeEndpoint,
+        });
+    }
+
+    frame.render_widget(
+        Paragraph::new(format!("Destination: {}", dialog.destination))
+            .style(Style::default().fg(MUTED))
+            .wrap(Wrap { trim: true }),
+        chunks[3],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "Real source in the selected scope may be sent to this provider. The provider can only queue proposals. Tab moves focus; Up/Down selects a directory; Space toggles permission.",
+        )
+        .style(Style::default().fg(MUTED))
+        .wrap(Wrap { trim: true }),
+        chunks[4],
+    );
+
+    let buttons = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(15),
+            Constraint::Length(2),
+            Constraint::Length(15),
+        ])
+        .split(chunks[5]);
+    let cancel_hovered = contains(buttons[1], app.mouse.0, app.mouse.1);
+    let run_hovered = contains(buttons[3], app.mouse.0, app.mouse.1);
+    let run_disabled = !dialog.can_run() || app.job.is_some();
+    draw_button(
+        frame,
+        buttons[1],
+        "Cancel [n]",
+        ButtonVariant::Ghost,
+        cancel_hovered || dialog.focus == ProposeFocus::Cancel,
+        false,
+    );
+    draw_button(
+        frame,
+        buttons[3],
+        "Run [y]",
+        ButtonVariant::Primary,
+        run_hovered || dialog.focus == ProposeFocus::Run,
+        run_disabled,
+    );
+    app.hits.push(ButtonHit {
+        area: buttons[1],
+        action: HitAction::ProposeCancel,
+    });
+    if !run_disabled {
+        app.hits.push(ButtonHit {
+            area: buttons[3],
+            action: HitAction::ProposeRun,
+        });
+    }
 }
 
 fn render_confirmation(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -737,31 +1033,37 @@ fn review_row_text(
     item: &crate::proposal::ReviewItem,
     width: usize,
     selected: bool,
+    checked: bool,
 ) -> (Vec<String>, bool) {
     let flagged = item.flag != "clean";
+    let checkbox = if checked { "[X]" } else { "[ ]" };
     let marker = if selected { ">" } else { " " };
     let warning = if flagged { "!" } else { " " };
     let confidence = (item.proposal.confidence * 100.0).round() as usize;
     let inline = format!(
-        "{marker}{warning} {} -> {} {confidence:>3}%",
+        "{checkbox} {marker}{warning} {} -> {} {confidence:>3}%",
         item.proposal.original_text, item.proposal.sanitized_text
     );
     if inline.chars().count() <= width {
         return (vec![inline], flagged);
     }
 
+    let first_prefix = format!("{checkbox} {marker}{warning} ");
+    let continuation = " ".repeat(first_prefix.chars().count());
     let mut lines = wrap_with_prefix(
         &item.proposal.original_text,
-        &format!("{marker}{warning} "),
-        "   ",
+        &first_prefix,
+        &continuation,
         width,
     );
     let confidence = format!(" {confidence:>3}%");
     let sanitized_width = width.saturating_sub(confidence.chars().count());
+    let sanitized_prefix = format!("{continuation}-> ");
+    let sanitized_continuation = " ".repeat(sanitized_prefix.chars().count());
     let mut sanitized = wrap_with_prefix(
         &item.proposal.sanitized_text,
-        "   -> ",
-        "      ",
+        &sanitized_prefix,
+        &sanitized_continuation,
         sanitized_width,
     );
     if let Some(last) = sanitized.last_mut() {
@@ -774,9 +1076,21 @@ fn review_row_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::{Action, Confirmation};
+    use crate::tui::app::{Action, Confirmation, ProposeDialog, ProposeScope};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn screen_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                text.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
 
     #[test]
     fn confirmation_modal_exposes_only_modal_mouse_targets() {
@@ -803,6 +1117,141 @@ mod tests {
     }
 
     #[test]
+    fn propose_modal_renders_scope_dropdown_and_gates_endpoint_permission() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(temp.path());
+        app.propose_dialog = Some(ProposeDialog {
+            scopes: vec![
+                ProposeScope {
+                    path: None,
+                    label: "Entire workspace".to_string(),
+                },
+                ProposeScope {
+                    path: Some("src".into()),
+                    label: "src".to_string(),
+                },
+                ProposeScope {
+                    path: Some("src/worker".into()),
+                    label: "src/worker".to_string(),
+                },
+            ],
+            selected_scope: 0,
+            dropdown_open: false,
+            focus: ProposeFocus::Directory,
+            endpoint_required: true,
+            allow_endpoint: false,
+            destination: "https://provider.example/v1 using test-model".to_string(),
+            jobs: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let blocked = screen_text(&terminal);
+        assert!(blocked.contains("Configure proposal scan"));
+        assert!(blocked.contains("Directory scope"));
+        assert!(blocked.contains("Entire workspace"));
+        assert!(blocked.contains("[ ] Allow provider endpoint (required)"));
+        assert!(blocked.contains("provider.example"));
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| matches!(hit.action, HitAction::ProposeDropdown))
+        );
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| matches!(hit.action, HitAction::ProposeEndpoint))
+        );
+        assert!(
+            !app.hits
+                .iter()
+                .any(|hit| matches!(hit.action, HitAction::ProposeRun))
+        );
+
+        let dialog = app.propose_dialog.as_mut().unwrap();
+        dialog.allow_endpoint = true;
+        dialog.dropdown_open = true;
+        dialog.selected_scope = 2;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let enabled = screen_text(&terminal);
+        assert!(enabled.contains("[X] Allow provider endpoint (required)"));
+        assert!(enabled.contains("src/worker"));
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| matches!(hit.action, HitAction::ProposeScope(2)))
+        );
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| matches!(hit.action, HitAction::ProposeRun))
+        );
+    }
+
+    #[test]
+    fn review_queue_renders_checkboxes_and_swapping_select_all_button() {
+        use crate::proposal::{Proposal, ReviewItem, ReviewStatus};
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(temp.path());
+        app.reviews = vec![ReviewItem {
+            id: "proposal".to_string(),
+            file: "src/main.rs".to_string(),
+            proposal: Proposal {
+                target: None,
+                category: "identifier".to_string(),
+                original_text: "private_name".to_string(),
+                sanitized_text: "neutral_name".to_string(),
+                confidence: 0.91,
+                rationale: None,
+            },
+            status: ReviewStatus::Pending,
+            flag: "clean".to_string(),
+            created_at: String::new(),
+        }];
+        app.filtered = vec![0];
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let unchecked = screen_text(&terminal);
+        assert!(unchecked.contains("[ ]"));
+        assert!(unchecked.contains("Select All"));
+        let lines = unchecked.lines().collect::<Vec<_>>();
+        let select_all = lines
+            .iter()
+            .position(|line| line.contains("Select All"))
+            .unwrap();
+        let toolbar = lines
+            .iter()
+            .enumerate()
+            .skip(select_all + 1)
+            .find_map(|(index, line)| line.contains("Index").then_some(index))
+            .unwrap();
+        assert!(
+            lines[select_all + 1..toolbar]
+                .iter()
+                .any(|line| line.chars().take(36).all(char::is_whitespace)),
+            "expected a blank row below the queue action"
+        );
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| matches!(hit.action, HitAction::ToggleReview(0)))
+        );
+        assert!(
+            app.hits
+                .iter()
+                .any(|hit| matches!(hit.action, HitAction::ToggleAllReviews))
+        );
+
+        app.checked_reviews.insert("proposal".to_string());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let checked = screen_text(&terminal);
+        assert!(checked.contains("[X]"));
+        assert!(checked.contains("Deselect All"));
+        assert!(checked.contains("Approve (1)"));
+    }
+
+    #[test]
     fn review_rows_mark_flagged_items() {
         use crate::proposal::{Proposal, ReviewItem, ReviewStatus};
         let mut item = ReviewItem {
@@ -820,14 +1269,14 @@ mod tests {
             flag: "public API name".to_string(),
             created_at: String::new(),
         };
-        let (flagged, warning) = review_row_text(&item, 50, false);
+        let (flagged, warning) = review_row_text(&item, 50, false, false);
         assert!(warning);
-        assert!(flagged[0].starts_with(" !"));
+        assert!(flagged[0].starts_with("[ ]  !"));
 
         item.flag = "clean".to_string();
-        let (clean, warning) = review_row_text(&item, 50, false);
+        let (clean, warning) = review_row_text(&item, 50, false, true);
         assert!(!warning);
-        assert!(clean[0].starts_with("  "));
+        assert!(clean[0].starts_with("[X]   "));
     }
 
     #[test]
@@ -849,14 +1298,15 @@ mod tests {
             created_at: String::new(),
         };
 
-        let (wide, _) = review_row_text(&item, 64, false);
+        let (wide, _) = review_row_text(&item, 64, false, false);
         assert_eq!(wide.len(), 1);
         assert!(wide[0].contains("beginCursorSuppression"));
         assert!(wide[0].contains("beginCursorHandling"));
 
-        let (narrow, _) = review_row_text(&item, 42, true);
+        let (narrow, _) = review_row_text(&item, 42, true, true);
         let rendered = narrow.join("\n");
         assert!(narrow.len() >= 2);
+        assert!(narrow[0].starts_with("[X] >"));
         assert!(rendered.contains("beginCursorSuppression"));
         assert!(rendered.contains("beginCursorHandling"));
         assert!(!rendered.contains('~'));

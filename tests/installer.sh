@@ -23,7 +23,7 @@ cat >"$SOURCE_DIR/target/release/code-sanity" <<'EOF'
 set -euo pipefail
 case "${1-}" in
     --version)
-        printf '%s\n' 'code-sanity 0.4.7'
+        printf '%s\n' 'code-sanity 0.4.8'
         ;;
     completions)
         [[ -z "${CODE_SANITY_TEST_NO_COMPLETIONS:-}" ]] || exit 64

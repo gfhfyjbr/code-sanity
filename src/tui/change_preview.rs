@@ -47,13 +47,18 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let full_metadata_height = metadata_height(item, inner.width);
     let header_height = if inner.height >= 8 {
-        4
+        full_metadata_height.min(inner.height.saturating_sub(3))
     } else if inner.height >= 4 {
-        1
+        full_metadata_height.saturating_sub(1).min(inner.height)
     } else {
         0
     };
+    if header_height >= inner.height {
+        render_metadata(frame, item, inner);
+        return;
+    }
     let code_area = if header_height == 0 {
         inner
     } else {
@@ -70,6 +75,32 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_metadata(frame: &mut Frame, item: &ReviewItem, area: Rect) {
+    let bordered = usize::from(area.height) > metadata_lines(item, area.width).len();
+    let paragraph = metadata_paragraph(item, area.width, bordered);
+    frame.render_widget(paragraph, area);
+}
+
+fn metadata_height(item: &ReviewItem, width: u16) -> u16 {
+    metadata_lines(item, width)
+        .len()
+        .saturating_add(1)
+        .min(u16::MAX as usize) as u16
+}
+
+fn metadata_paragraph(item: &ReviewItem, width: u16, bordered: bool) -> Paragraph<'static> {
+    let paragraph = Paragraph::new(metadata_lines(item, width));
+    if bordered {
+        paragraph.block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER)),
+        )
+    } else {
+        paragraph
+    }
+}
+
+fn metadata_lines(item: &ReviewItem, width: u16) -> Vec<Line<'static>> {
     let flagged = item.flag != "clean";
     let status_color = if is_pending(item) { WARNING } else { MUTED };
     let scope = if item.proposal.target.is_some() {
@@ -77,7 +108,7 @@ fn render_metadata(frame: &mut Frame, item: &ReviewItem, area: Rect) {
     } else {
         "global alias"
     };
-    let metadata = vec![
+    let mut metadata = vec![
         Line::from(vec![
             Span::styled(
                 item.proposal.original_text.clone(),
@@ -103,45 +134,90 @@ fn render_metadata(frame: &mut Frame, item: &ReviewItem, area: Rect) {
                 Style::default().fg(status_color),
             ),
             Span::styled(format!("{scope}  "), Style::default().fg(MUTED)),
-            Span::styled(
-                if flagged {
-                    format!("WARNING: {}", item.flag)
-                } else {
-                    "CHECK: clean".to_string()
-                },
-                Style::default()
-                    .fg(if flagged { WARNING } else { SUCCESS })
-                    .add_modifier(if flagged {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
         ]),
-        Line::from(Span::styled(
-            format!(
-                "REASON: {}",
-                item.proposal
-                    .rationale
-                    .as_deref()
-                    .unwrap_or("No provider rationale.")
-            ),
-            Style::default().fg(MUTED),
-        )),
     ];
-    let paragraph = Paragraph::new(metadata);
-    if area.height >= 4 {
-        frame.render_widget(
-            paragraph.block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(BORDER)),
-            ),
-            area,
-        );
+    if flagged {
+        metadata.extend(labeled_lines(
+            "WARNING: ",
+            &item.flag,
+            width,
+            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+        ));
     } else {
-        frame.render_widget(paragraph, area);
+        metadata.push(Line::from(Span::styled(
+            "CHECK: clean",
+            Style::default().fg(SUCCESS),
+        )));
     }
+    metadata.extend(labeled_lines(
+        "REASON: ",
+        item.proposal
+            .rationale
+            .as_deref()
+            .unwrap_or("No provider rationale."),
+        width,
+        Style::default().fg(MUTED),
+    ));
+    metadata
+}
+
+fn labeled_lines(label: &str, value: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+    let label_width = display_width(label);
+    let content_width = usize::from(width).saturating_sub(label_width).max(1);
+    let wrapped = wrap_words(value, content_width);
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let prefix = if index == 0 {
+                label.to_string()
+            } else {
+                " ".repeat(label_width)
+            };
+            Line::from(vec![
+                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                Span::styled(text, style),
+            ])
+        })
+        .collect()
+}
+
+fn wrap_words(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if display_width(&candidate) <= width {
+            current = candidate;
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        let mut chunk = String::new();
+        for character in word.chars() {
+            let mut next = chunk.clone();
+            next.push(character);
+            if !chunk.is_empty() && display_width(&next) > width {
+                lines.push(std::mem::take(&mut chunk));
+            }
+            chunk.push(character);
+        }
+        current = chunk;
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn display_width(value: &str) -> usize {
+    Line::from(value).width()
 }
 
 fn render_source(frame: &mut Frame, item: &ReviewItem, source: &[SourceLine], area: Rect) {
@@ -339,6 +415,50 @@ mod tests {
             flag: "clean".to_string(),
             created_at: String::new(),
         }
+    }
+
+    fn plain_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn warning_and_reason_are_stacked_and_wrapped() {
+        let mut item = review_item();
+        item.flag = "confidence below the configured threshold and requires careful human review"
+            .to_string();
+        item.proposal.rationale = Some(
+            "This identifier controls cached output naming and remains local to the worker implementation"
+                .to_string(),
+        );
+
+        let lines = metadata_lines(&item, 42)
+            .iter()
+            .map(plain_text)
+            .collect::<Vec<_>>();
+        let warning = lines
+            .iter()
+            .position(|line| line.starts_with("WARNING: "))
+            .unwrap();
+        let reason = lines
+            .iter()
+            .position(|line| line.starts_with("REASON: "))
+            .unwrap();
+
+        assert_eq!(warning, 2, "warning must follow the status line");
+        assert!(reason > warning + 1, "warning should wrap before reason");
+        assert!(reason + 1 < lines.len(), "reason should wrap too");
+        assert!(lines[warning + 1].starts_with("         "));
+        assert!(lines[reason + 1].starts_with("        "));
+        let normalized = lines
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains("careful human review"));
+        assert!(normalized.contains("worker implementation"));
     }
 
     #[test]
