@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.s
 
 # Pin a release or customize installation:
 curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.sh | \
-  bash -s -- --version v0.4.7 --bin-dir "$HOME/.local/bin" --add-to-path
+  bash -s -- --version v0.4.8 --bin-dir "$HOME/.local/bin" --add-to-path
 ```
 
 Download and inspect `install.sh` first if piping a remote script is outside
@@ -49,7 +49,7 @@ Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 ```bash
 # pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
 #                     x86_64-apple-darwin, aarch64-apple-darwin
-version=v0.4.7
+version=v0.4.8
 target=aarch64-apple-darwin
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz"
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz.sha256"
@@ -105,7 +105,18 @@ history with `Up`/`Down`; available commands include `index`, `verify`,
 Keyboard accelerators (`i`, `v`, `p`, `a`, `r`, `/`) run the same
 command engine. Provider scans and review decisions use confirmation dialogs,
 while long operations run in the background so input and mouse handling stay
-live.
+live. Pending review rows have `[ ]`/`[X]` approval checkboxes: press `Space`
+or click the checkbox to toggle one proposal, and use the button below the
+queue to `Select All` or `Deselect All` proposals in the current filtered view.
+`Approve` processes every checked proposal; with no checkboxes selected it
+keeps the focused-row behavior.
+
+The `Propose` toolbar button and `p` shortcut open a setup modal before any
+provider call. Its directory dropdown is built from directories that contain
+tracked files (`Entire workspace` is always available). Endpoint-backed
+providers also require an explicit `Allow provider endpoint` checkbox before
+`Run` is enabled; the modal shows the configured URL and model receiving the
+selected scope's real source.
 
 Human CLI output uses colors, spinners, summaries, and result tables when
 attached to a terminal. Redirected output retains the stable plain-text format;

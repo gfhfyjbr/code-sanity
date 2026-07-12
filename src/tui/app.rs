@@ -4,7 +4,7 @@ use crate::proposal::{ProposeProgress, ProviderAllow, ReviewItem, ReviewStatus};
 use anyhow::{Result, anyhow};
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
@@ -48,8 +48,9 @@ pub enum Action {
     Propose {
         path: Option<PathBuf>,
         jobs: Option<usize>,
+        allow_endpoint: bool,
     },
-    Approve(String),
+    Approve(Vec<String>),
     Reject(String),
     Init,
 }
@@ -79,6 +80,50 @@ pub struct Confirmation {
     pub action: Action,
     pub title: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeFocus {
+    Directory,
+    Endpoint,
+    Run,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposeScope {
+    pub path: Option<PathBuf>,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProposeDialog {
+    pub scopes: Vec<ProposeScope>,
+    pub selected_scope: usize,
+    pub dropdown_open: bool,
+    pub focus: ProposeFocus,
+    pub endpoint_required: bool,
+    pub allow_endpoint: bool,
+    pub destination: String,
+    pub jobs: Option<usize>,
+}
+
+impl ProposeDialog {
+    pub fn selected(&self) -> Option<&ProposeScope> {
+        self.scopes.get(self.selected_scope)
+    }
+
+    pub fn can_run(&self) -> bool {
+        !self.endpoint_required || self.allow_endpoint
+    }
+
+    fn action(&self) -> Option<Action> {
+        self.can_run().then(|| Action::Propose {
+            path: self.selected().and_then(|scope| scope.path.clone()),
+            jobs: self.jobs,
+            allow_endpoint: self.allow_endpoint,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +181,13 @@ pub struct SourceLine {
 pub enum HitAction {
     Tab(Tab),
     Review(usize),
+    ToggleReview(usize),
+    ToggleAllReviews,
+    ProposeDropdown,
+    ProposeScope(usize),
+    ProposeEndpoint,
+    ProposeRun,
+    ProposeCancel,
     CommandFocus,
     Toolbar(ToolbarAction),
     Confirm,
@@ -156,6 +208,7 @@ pub struct App {
     pub tab: Tab,
     pub reviews: Vec<ReviewItem>,
     pub filtered: Vec<usize>,
+    pub checked_reviews: BTreeSet<String>,
     pub selected: usize,
     pub list_offset: usize,
     pub list_rows: usize,
@@ -166,6 +219,7 @@ pub struct App {
     pub history: Vec<String>,
     pub history_cursor: Option<usize>,
     pub show_help: bool,
+    pub propose_dialog: Option<ProposeDialog>,
     pub confirmation: Option<Confirmation>,
     pub job: Option<JobState>,
     pub logs: VecDeque<LogEntry>,
@@ -186,6 +240,7 @@ impl App {
             tab: Tab::Review,
             reviews: Vec::new(),
             filtered: Vec::new(),
+            checked_reviews: BTreeSet::new(),
             selected: 0,
             list_offset: 0,
             list_rows: 1,
@@ -196,6 +251,7 @@ impl App {
             history: Vec::new(),
             history_cursor: None,
             show_help: false,
+            propose_dialog: None,
             confirmation: None,
             job: None,
             logs: VecDeque::new(),
@@ -215,6 +271,35 @@ impl App {
     pub fn selected_review(&self) -> Option<&ReviewItem> {
         let index = *self.filtered.get(self.selected)?;
         self.reviews.get(index)
+    }
+
+    pub fn is_review_checked(&self, item: &ReviewItem) -> bool {
+        self.checked_reviews.contains(&item.id)
+    }
+
+    pub fn checked_pending_count(&self) -> usize {
+        self.reviews
+            .iter()
+            .filter(|item| is_pending(item) && self.is_review_checked(item))
+            .count()
+    }
+
+    pub fn has_filtered_pending(&self) -> bool {
+        self.filtered
+            .iter()
+            .any(|index| self.reviews.get(*index).is_some_and(is_pending))
+    }
+
+    pub fn all_filtered_pending_checked(&self) -> bool {
+        let mut pending = self
+            .filtered
+            .iter()
+            .filter_map(|index| self.reviews.get(*index))
+            .filter(|item| is_pending(item));
+        let Some(first) = pending.next() else {
+            return false;
+        };
+        self.is_review_checked(first) && pending.all(|item| self.is_review_checked(item))
     }
 
     pub fn source_context(&self, max_lines: usize) -> Vec<SourceLine> {
@@ -266,6 +351,10 @@ impl App {
             }
             return;
         }
+        if self.propose_dialog.is_some() {
+            self.handle_propose_dialog_key(key);
+            return;
+        }
         if self.confirmation.is_some() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.accept_confirmation(),
@@ -287,13 +376,13 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.select_previous(),
             KeyCode::PageDown => self.select_by(self.list_rows as isize),
             KeyCode::PageUp => self.select_by(-(self.list_rows as isize)),
+            KeyCode::Char(' ') if self.tab == Tab::Review => {
+                self.toggle_filtered_review(self.selected)
+            }
             KeyCode::Tab => self.tab = self.tab.next(),
             KeyCode::Char('i') => self.request_action(Action::Index),
             KeyCode::Char('v') => self.request_action(Action::Verify),
-            KeyCode::Char('p') => self.request_action(Action::Propose {
-                path: None,
-                jobs: None,
-            }),
+            KeyCode::Char('p') => self.open_propose_dialog(),
             KeyCode::Char('a') => self.request_selected(true),
             KeyCode::Char('r') => self.request_selected(false),
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -351,6 +440,141 @@ impl App {
         }
     }
 
+    fn handle_propose_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                if self
+                    .propose_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.dropdown_open)
+                {
+                    if let Some(dialog) = &mut self.propose_dialog {
+                        dialog.dropdown_open = false;
+                    }
+                } else {
+                    self.propose_dialog = None;
+                }
+            }
+            KeyCode::Tab => self.cycle_propose_focus(false),
+            KeyCode::BackTab => self.cycle_propose_focus(true),
+            KeyCode::Up => self.move_propose_scope(-1),
+            KeyCode::Down => self.move_propose_scope(1),
+            KeyCode::Left => self.cycle_propose_focus(true),
+            KeyCode::Right => self.cycle_propose_focus(false),
+            KeyCode::Enter => match self.propose_dialog.as_ref().map(|dialog| dialog.focus) {
+                Some(ProposeFocus::Directory) => {
+                    if let Some(dialog) = &mut self.propose_dialog {
+                        dialog.dropdown_open = !dialog.dropdown_open;
+                    }
+                }
+                Some(ProposeFocus::Endpoint) => self.toggle_propose_endpoint(),
+                Some(ProposeFocus::Run) => self.submit_propose_dialog(),
+                Some(ProposeFocus::Cancel) => self.propose_dialog = None,
+                None => {}
+            },
+            KeyCode::Char(' ') => match self.propose_dialog.as_ref().map(|dialog| dialog.focus) {
+                Some(ProposeFocus::Directory) => {
+                    if let Some(dialog) = &mut self.propose_dialog {
+                        dialog.dropdown_open = !dialog.dropdown_open;
+                    }
+                }
+                Some(ProposeFocus::Endpoint) => self.toggle_propose_endpoint(),
+                _ => {}
+            },
+            KeyCode::Char('y') => self.submit_propose_dialog(),
+            KeyCode::Char('n') => self.propose_dialog = None,
+            _ => {}
+        }
+    }
+
+    fn cycle_propose_focus(&mut self, reverse: bool) {
+        let Some(dialog) = &mut self.propose_dialog else {
+            return;
+        };
+        dialog.dropdown_open = false;
+        let order: &[ProposeFocus] = if dialog.endpoint_required {
+            &[
+                ProposeFocus::Directory,
+                ProposeFocus::Endpoint,
+                ProposeFocus::Run,
+                ProposeFocus::Cancel,
+            ]
+        } else {
+            &[
+                ProposeFocus::Directory,
+                ProposeFocus::Run,
+                ProposeFocus::Cancel,
+            ]
+        };
+        let current = order
+            .iter()
+            .position(|focus| *focus == dialog.focus)
+            .unwrap_or(0);
+        let next = if reverse {
+            current.checked_sub(1).unwrap_or(order.len() - 1)
+        } else {
+            (current + 1) % order.len()
+        };
+        dialog.focus = order[next];
+    }
+
+    fn move_propose_scope(&mut self, delta: isize) {
+        let Some(dialog) = &mut self.propose_dialog else {
+            return;
+        };
+        if dialog.scopes.is_empty() {
+            return;
+        }
+        dialog.focus = ProposeFocus::Directory;
+        dialog.dropdown_open = true;
+        dialog.selected_scope = dialog
+            .selected_scope
+            .saturating_add_signed(delta)
+            .min(dialog.scopes.len() - 1);
+    }
+
+    fn toggle_propose_endpoint(&mut self) {
+        if let Some(dialog) = &mut self.propose_dialog {
+            if dialog.endpoint_required {
+                dialog.focus = ProposeFocus::Endpoint;
+                dialog.allow_endpoint = !dialog.allow_endpoint;
+            }
+        }
+    }
+
+    fn open_propose_dialog(&mut self) {
+        if self.job.is_some() {
+            self.log(LogLevel::Warning, "wait for the active operation to finish");
+            return;
+        }
+        let (endpoint_required, destination) = proposal_destination(&self.root);
+        self.propose_dialog = Some(ProposeDialog {
+            scopes: proposal_scopes(&self.root),
+            selected_scope: 0,
+            dropdown_open: false,
+            focus: ProposeFocus::Directory,
+            endpoint_required,
+            allow_endpoint: false,
+            destination,
+            jobs: None,
+        });
+    }
+
+    fn submit_propose_dialog(&mut self) {
+        let Some(dialog) = self.propose_dialog.as_ref() else {
+            return;
+        };
+        let Some(action) = dialog.action() else {
+            self.log(
+                LogLevel::Warning,
+                "allow the configured provider endpoint before starting",
+            );
+            return;
+        };
+        self.propose_dialog = None;
+        self.start_action(action);
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.mouse = (mouse.column, mouse.row);
         match mouse.kind {
@@ -363,6 +587,12 @@ impl App {
                     self.handle_hit(action);
                 }
             }
+            MouseEventKind::ScrollDown if self.propose_dialog.is_some() => {
+                self.move_propose_scope(1)
+            }
+            MouseEventKind::ScrollUp if self.propose_dialog.is_some() => {
+                self.move_propose_scope(-1)
+            }
             MouseEventKind::ScrollDown => self.select_next(),
             MouseEventKind::ScrollUp => self.select_previous(),
             _ => {}
@@ -374,14 +604,35 @@ impl App {
             HitAction::Tab(tab) => self.tab = tab,
             HitAction::Review(index) if index < self.filtered.len() => self.selected = index,
             HitAction::Review(_) => {}
+            HitAction::ToggleReview(index) if index < self.filtered.len() => {
+                self.selected = index;
+                self.toggle_filtered_review(index);
+            }
+            HitAction::ToggleReview(_) => {}
+            HitAction::ToggleAllReviews => self.toggle_all_filtered_reviews(),
+            HitAction::ProposeDropdown => {
+                if let Some(dialog) = &mut self.propose_dialog {
+                    dialog.focus = ProposeFocus::Directory;
+                    dialog.dropdown_open = !dialog.dropdown_open;
+                }
+            }
+            HitAction::ProposeScope(index) => {
+                if let Some(dialog) = &mut self.propose_dialog {
+                    if index < dialog.scopes.len() {
+                        dialog.selected_scope = index;
+                        dialog.dropdown_open = false;
+                        dialog.focus = ProposeFocus::Directory;
+                    }
+                }
+            }
+            HitAction::ProposeEndpoint => self.toggle_propose_endpoint(),
+            HitAction::ProposeRun => self.submit_propose_dialog(),
+            HitAction::ProposeCancel => self.propose_dialog = None,
             HitAction::CommandFocus => self.focus_command(""),
             HitAction::Toolbar(action) => match action {
                 ToolbarAction::Index => self.request_action(Action::Index),
                 ToolbarAction::Verify => self.request_action(Action::Verify),
-                ToolbarAction::Propose => self.request_action(Action::Propose {
-                    path: None,
-                    jobs: None,
-                }),
+                ToolbarAction::Propose => self.open_propose_dialog(),
                 ToolbarAction::Approve => self.request_selected(true),
                 ToolbarAction::Reject => self.request_selected(false),
             },
@@ -423,12 +674,11 @@ impl App {
                 };
             }
             "approve" => {
-                let id = parts
-                    .next()
-                    .map(str::to_string)
-                    .or_else(|| self.selected_review().map(|item| item.id.clone()))
-                    .ok_or_else(|| anyhow!("nothing selected"))?;
-                self.request_action(Action::Approve(id));
+                if let Some(id) = parts.next() {
+                    self.request_action(Action::Approve(vec![id.to_string()]));
+                } else {
+                    self.request_selected(true);
+                }
             }
             "reject" => {
                 let id = parts
@@ -463,7 +713,11 @@ impl App {
                         value => return Err(anyhow!("unexpected propose argument: {value}")),
                     }
                 }
-                self.request_action(Action::Propose { path, jobs });
+                self.request_action(Action::Propose {
+                    path,
+                    jobs,
+                    allow_endpoint: true,
+                });
             }
             "" => {}
             _ => return Err(anyhow!("unknown command `{command}`; type `help`")),
@@ -489,15 +743,79 @@ impl App {
     }
 
     fn request_selected(&mut self, approve: bool) {
-        let Some(id) = self.selected_review().map(|item| item.id.clone()) else {
-            self.log(LogLevel::Warning, "review queue is empty");
+        if approve {
+            let ids = self.approval_ids();
+            if ids.is_empty() {
+                self.log(LogLevel::Warning, "select at least one pending proposal");
+                return;
+            }
+            self.request_action(Action::Approve(ids));
+            return;
+        }
+
+        let Some(id) = self
+            .selected_review()
+            .filter(|item| is_pending(item))
+            .map(|item| item.id.clone())
+        else {
+            self.log(LogLevel::Warning, "select a pending proposal");
             return;
         };
-        self.request_action(if approve {
-            Action::Approve(id)
+        self.request_action(Action::Reject(id));
+    }
+
+    fn approval_ids(&self) -> Vec<String> {
+        let checked = self
+            .reviews
+            .iter()
+            .filter(|item| is_pending(item) && self.is_review_checked(item))
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        if checked.is_empty() {
+            self.selected_review()
+                .filter(|item| is_pending(item))
+                .map(|item| vec![item.id.clone()])
+                .unwrap_or_default()
         } else {
-            Action::Reject(id)
-        });
+            checked
+        }
+    }
+
+    fn toggle_filtered_review(&mut self, filtered_index: usize) {
+        let Some(item) = self
+            .filtered
+            .get(filtered_index)
+            .and_then(|index| self.reviews.get(*index))
+        else {
+            return;
+        };
+        if !is_pending(item) {
+            return;
+        }
+        let id = item.id.clone();
+        if !self.checked_reviews.remove(&id) {
+            self.checked_reviews.insert(id);
+        }
+    }
+
+    fn toggle_all_filtered_reviews(&mut self) {
+        let ids = self
+            .filtered
+            .iter()
+            .filter_map(|index| self.reviews.get(*index))
+            .filter(|item| is_pending(item))
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        if ids.iter().all(|id| self.checked_reviews.contains(id)) {
+            for id in ids {
+                self.checked_reviews.remove(&id);
+            }
+        } else {
+            self.checked_reviews.extend(ids);
+        }
     }
 
     fn request_action(&mut self, action: Action) {
@@ -551,6 +869,13 @@ impl App {
                 }
             }
         }
+        let pending_ids = self
+            .reviews
+            .iter()
+            .filter(|item| is_pending(item))
+            .map(|item| item.id.clone())
+            .collect::<BTreeSet<_>>();
+        self.checked_reviews.retain(|id| pending_ids.contains(id));
         self.apply_filter();
     }
 
@@ -670,25 +995,23 @@ fn run_action(root: &Path, action: Action, tx: &Sender<WorkerEvent>) -> Result<S
                 Err(anyhow!("verify found {} issue(s)", report.failures.len()))
             }
         }
-        Action::Approve(id) => {
-            let item = crate::proposal::resolve_review(root, &id, true)?;
-            Ok(format!(
-                "approved {} -> {} in {}",
-                item.proposal.original_text, item.proposal.sanitized_text, item.file
-            ))
-        }
+        Action::Approve(ids) => approve_reviews(root, &ids, tx),
         Action::Reject(id) => {
             let item = crate::proposal::resolve_review(root, &id, false)?;
             Ok(format!("rejected {}", item.proposal.original_text))
         }
-        Action::Propose { path, jobs } => {
+        Action::Propose {
+            path,
+            jobs,
+            allow_endpoint,
+        } => {
             let progress_tx = tx.clone();
             let report = crate::proposal::propose_sanitize_with_progress(
                 root,
                 path.as_deref(),
                 ProviderAllow {
                     command: true,
-                    endpoint: true,
+                    endpoint: allow_endpoint,
                 },
                 jobs,
                 move |progress| {
@@ -707,6 +1030,41 @@ fn run_action(root: &Path, action: Action, tx: &Sender<WorkerEvent>) -> Result<S
                 report.errors.len()
             ))
         }
+    }
+}
+
+fn approve_reviews(root: &Path, ids: &[String], tx: &Sender<WorkerEvent>) -> Result<String> {
+    if ids.is_empty() {
+        return Err(anyhow!("no proposals selected"));
+    }
+    let mut approved = Vec::new();
+    let mut failed = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        match crate::proposal::resolve_review(root, id, true) {
+            Ok(item) => approved.push(item),
+            Err(error) => failed.push(format!("{id}: {error:#}")),
+        }
+        let completed = index + 1;
+        let _ = tx.send(WorkerEvent::Progress {
+            detail: format!("processed {completed}/{} proposals", ids.len()),
+            progress: Some((completed, ids.len())),
+        });
+    }
+    if !failed.is_empty() {
+        return Err(anyhow!(
+            "approved {}/{} proposals; failed: {}",
+            approved.len(),
+            ids.len(),
+            failed.join("; ")
+        ));
+    }
+    if let [item] = approved.as_slice() {
+        Ok(format!(
+            "approved {} -> {} in {}",
+            item.proposal.original_text, item.proposal.sanitized_text, item.file
+        ))
+    } else {
+        Ok(format!("approved {} proposals", approved.len()))
     }
 }
 
@@ -780,6 +1138,52 @@ fn workspace_info(root: &Path) -> WorkspaceInfo {
     }
 }
 
+fn proposal_scopes(root: &Path) -> Vec<ProposeScope> {
+    let mut directories = BTreeSet::new();
+    let layout = Layout::new(root);
+    if let Ok(files) = crate::db::connect(&layout).and_then(|conn| crate::db::tracked_files(&conn))
+    {
+        for file in files {
+            let path = Path::new(&file);
+            for parent in path.parent().into_iter().flat_map(Path::ancestors) {
+                if parent.as_os_str().is_empty() || parent == Path::new(".") {
+                    continue;
+                }
+                directories.insert(parent.to_path_buf());
+            }
+        }
+    }
+    let mut scopes = vec![ProposeScope {
+        path: None,
+        label: "Entire workspace".to_string(),
+    }];
+    scopes.extend(directories.into_iter().map(|path| ProposeScope {
+        label: path.display().to_string(),
+        path: Some(path),
+    }));
+    scopes
+}
+
+fn proposal_destination(root: &Path) -> (bool, String) {
+    let layout = Layout::new(root);
+    let Ok(config) = Config::load_or_default_lenient(&layout) else {
+        return (false, "configured provider".to_string());
+    };
+    if let Some(endpoint) = config.sanitizer.provider.llm_endpoint() {
+        return (
+            true,
+            format!("{} using {}", endpoint.base_url, endpoint.model),
+        );
+    }
+    (
+        false,
+        format!(
+            "local provider ({})",
+            provider_name(&config.sanitizer.provider)
+        ),
+    )
+}
+
 fn provider_name(provider: &ProviderConfig) -> String {
     match provider {
         ProviderConfig::Stub => "heuristic".to_string(),
@@ -814,11 +1218,21 @@ fn confirmation_copy(root: &Path, action: &Action) -> (String, String) {
                 ),
             )
         }
-        Action::Approve(id) => (
-            "Approve replacement?".to_string(),
-            format!(
-                "Proposal {id} will enter the global alias registry and trigger deterministic reindexing."
-            ),
+        Action::Approve(ids) => (
+            if ids.len() == 1 {
+                "Approve replacement?".to_string()
+            } else {
+                format!("Approve {} replacements?", ids.len())
+            },
+            if ids.len() == 1 {
+                "The selected proposal will be stored in its declared scope. Symbol-scoped aliases affect the semantic projection; legacy global aliases reindex the deterministic mirror."
+                    .to_string()
+            } else {
+                format!(
+                    "{} selected proposals will be stored in their declared scopes. Symbol-scoped aliases affect the semantic projection; legacy global aliases reindex the deterministic mirror.",
+                    ids.len()
+                )
+            },
         ),
         Action::Reject(id) => (
             "Reject proposal?".to_string(),
@@ -865,6 +1279,24 @@ mod tests {
     use super::*;
     use crate::proposal::Proposal;
     use ratatui::layout::Rect;
+
+    fn review(id: &str, status: ReviewStatus) -> ReviewItem {
+        ReviewItem {
+            id: id.to_string(),
+            file: format!("src/{id}.rs"),
+            proposal: Proposal {
+                target: None,
+                category: "identifier".to_string(),
+                original_text: format!("original_{id}"),
+                sanitized_text: format!("sanitized_{id}"),
+                confidence: 0.9,
+                rationale: None,
+            },
+            status,
+            flag: "clean".to_string(),
+            created_at: String::new(),
+        }
+    }
 
     #[test]
     fn source_context_centers_the_matching_line() {
@@ -958,6 +1390,159 @@ mod tests {
         });
 
         assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn space_and_checkbox_hits_toggle_pending_reviews() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(temp.path());
+        app.reviews = vec![
+            review("one", ReviewStatus::Pending),
+            review("resolved", ReviewStatus::Approved),
+        ];
+        app.filtered = vec![0, 1];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.checked_reviews.contains("one"));
+
+        app.handle_hit(HitAction::ToggleReview(0));
+        assert!(!app.checked_reviews.contains("one"));
+
+        app.handle_hit(HitAction::ToggleReview(1));
+        assert!(!app.checked_reviews.contains("resolved"));
+        assert_eq!(app.selected, 1);
+    }
+
+    #[test]
+    fn select_all_swaps_only_after_all_filtered_pending_reviews_are_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(temp.path());
+        app.reviews = vec![
+            review("one", ReviewStatus::Pending),
+            review("two", ReviewStatus::Pending),
+            review("hidden", ReviewStatus::Pending),
+            review("resolved", ReviewStatus::Rejected),
+        ];
+        app.filtered = vec![0, 1, 3];
+
+        assert!(!app.all_filtered_pending_checked());
+        app.handle_hit(HitAction::ToggleReview(0));
+        assert!(!app.all_filtered_pending_checked());
+
+        app.handle_hit(HitAction::ToggleAllReviews);
+        assert!(app.all_filtered_pending_checked());
+        assert!(app.checked_reviews.contains("one"));
+        assert!(app.checked_reviews.contains("two"));
+        assert!(!app.checked_reviews.contains("hidden"));
+        assert!(!app.checked_reviews.contains("resolved"));
+
+        app.handle_hit(HitAction::ToggleAllReviews);
+        assert!(app.checked_reviews.is_empty());
+        assert!(!app.all_filtered_pending_checked());
+    }
+
+    #[test]
+    fn approve_prefers_checked_reviews_and_keeps_focused_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::new(temp.path());
+        app.reviews = vec![
+            review("one", ReviewStatus::Pending),
+            review("two", ReviewStatus::Pending),
+            review("three", ReviewStatus::Pending),
+        ];
+        app.filtered = vec![0, 1, 2];
+        app.selected = 2;
+
+        app.request_selected(true);
+        let focused = app.confirmation.take().unwrap();
+        assert_eq!(focused.action, Action::Approve(vec!["three".to_string()]));
+
+        app.checked_reviews.insert("one".to_string());
+        app.checked_reviews.insert("two".to_string());
+        app.request_selected(true);
+        let checked = app.confirmation.take().unwrap();
+        assert_eq!(
+            checked.action,
+            Action::Approve(vec!["one".to_string(), "two".to_string()])
+        );
+    }
+
+    #[test]
+    fn proposal_scopes_are_derived_from_tracked_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(temp.path().join("docs")).unwrap();
+        std::fs::write(
+            temp.path().join("src/nested/lib.rs"),
+            "fn local_name() {}\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("docs/guide.md"), "guide\n").unwrap();
+        crate::index::index_workspace(temp.path()).unwrap();
+
+        let scopes = proposal_scopes(temp.path());
+        let labels = scopes
+            .iter()
+            .map(|scope| scope.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels[0], "Entire workspace");
+        assert!(labels.contains(&"docs"));
+        assert!(labels.contains(&"src"));
+        assert!(labels.contains(&"src/nested"));
+        assert!(!labels.iter().any(|label| label.contains(".code-sanity")));
+    }
+
+    #[test]
+    fn proposal_dialog_gates_endpoint_and_builds_scoped_action() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/nested")).unwrap();
+        std::fs::write(
+            temp.path().join("src/nested/lib.rs"),
+            "fn local_name() {}\n",
+        )
+        .unwrap();
+        crate::index::index_workspace(temp.path()).unwrap();
+        let layout = Layout::new(temp.path());
+        let mut config = Config::load_or_default(&layout).unwrap();
+        config.sanitizer.provider = ProviderConfig::Llm {
+            base_url: "https://provider.example/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "TEST_API_KEY".to_string(),
+            timeout_secs: None,
+            json_mode: true,
+        };
+        config.save(&layout).unwrap();
+
+        let mut app = App::new(temp.path());
+        app.open_propose_dialog();
+        let dialog = app.propose_dialog.as_ref().unwrap();
+        assert!(dialog.endpoint_required);
+        assert!(!dialog.can_run());
+        assert!(dialog.destination.contains("provider.example"));
+        assert!(dialog.action().is_none());
+
+        let nested = dialog
+            .scopes
+            .iter()
+            .position(|scope| scope.path.as_deref() == Some(Path::new("src/nested")))
+            .unwrap();
+        app.propose_dialog.as_mut().unwrap().selected_scope = nested;
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.propose_dialog.as_ref().unwrap().focus,
+            ProposeFocus::Endpoint
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        let action = app.propose_dialog.as_ref().unwrap().action().unwrap();
+        assert_eq!(
+            action,
+            Action::Propose {
+                path: Some(PathBuf::from("src/nested")),
+                jobs: None,
+                allow_endpoint: true,
+            }
+        );
     }
 
     #[test]
