@@ -25,7 +25,7 @@ libc = "0.2"
 log = { version = "0.4", features = ["std"] }
 ratatui = "0.29"
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
