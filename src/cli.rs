@@ -43,6 +43,7 @@ fn command_name(command: Option<&Command>) -> &'static str {
         Some(Command::Init) => "init",
         Some(Command::Index) => "index",
         Some(Command::Read { .. }) => "read",
+        Some(Command::ProjectPath { .. }) => "project-path",
         Some(Command::Search { .. }) => "search",
         Some(Command::ApplyPatch { .. }) => "apply-patch",
         Some(Command::Write { .. }) => "write",
@@ -83,6 +84,11 @@ enum Command {
     /// Print a file from the sanitized mirror.
     Read {
         /// Repo-relative path, e.g. src/lib.rs.
+        path: PathBuf,
+    },
+    /// Print the agent-facing sanitized spelling of a repository path.
+    ProjectPath {
+        /// Real or already-projected repo-relative path.
         path: PathBuf,
     },
     /// Substring-search the sanitized mirror (alias: grep).
@@ -769,6 +775,14 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     ("AST indexed", report.semantic.indexed.to_string()),
                     ("AST unchanged", report.semantic.unchanged.to_string()),
                     ("AST read-only", report.semantic.read_only.to_string()),
+                    (
+                        "Aliases reconciled",
+                        report.semantic.reconciled_aliases.to_string(),
+                    ),
+                    (
+                        "Aliases quarantined",
+                        report.semantic.quarantined_aliases.to_string(),
+                    ),
                     ("Elapsed", format_elapsed(started.elapsed())),
                 ];
                 if !crate::presentation::summary("Index complete", &rows) {
@@ -788,14 +802,27 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
         }
         Command::Read { path } => {
             let content = read_sanitized_file(&root, &path)?;
+            let projected = crate::path_projection::project_workspace_path(&root, &path)?;
             if out.is_json() {
                 out.emit(
                     "read",
-                    json!({ "path": path.display().to_string(), "content": content }),
+                    json!({ "path": projected.display().to_string(), "content": content }),
                     None,
                 );
             } else {
                 print!("{content}");
+            }
+        }
+        Command::ProjectPath { path } => {
+            let projected = crate::path_projection::project_workspace_path(&root, &path)?;
+            if out.is_json() {
+                out.emit(
+                    "project-path",
+                    json!({ "path": projected.display().to_string() }),
+                    None,
+                );
+            } else {
+                println!("{}", projected.display());
             }
         }
         Command::Search {
@@ -1086,16 +1113,56 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     ("Rejected", report.rejected.len().to_string()),
                     ("Skipped", report.skipped.len().to_string()),
                     ("Errors", report.errors.len().to_string()),
+                    (
+                        "Semantic candidates",
+                        format!(
+                            "{}/{} sent",
+                            report.eligibility.sent_symbol_candidates,
+                            report.eligibility.owned_symbols
+                        ),
+                    ),
+                    (
+                        "Excluded unresolved",
+                        report.eligibility.excluded_unresolved.to_string(),
+                    ),
+                    (
+                        "Compiler-resolvable",
+                        report.eligibility.compiler_resolvable_symbols.to_string(),
+                    ),
+                    (
+                        "Excluded API boundary",
+                        report.eligibility.excluded_api_boundary.to_string(),
+                    ),
+                    (
+                        "Excluded existing alias",
+                        report.eligibility.excluded_existing_alias.to_string(),
+                    ),
+                    (
+                        "Already pending",
+                        report.eligibility.pending_symbol_decisions.to_string(),
+                    ),
+                    (
+                        "Path candidates",
+                        report.eligibility.unique_path_candidates.to_string(),
+                    ),
                 ];
                 if !crate::presentation::summary("Proposal scan complete", &rows) {
                     println!(
-                        "proposed={} queued={} duplicates={} rejected={} skipped={} errors={}",
+                        "proposed={} queued={} duplicates={} rejected={} skipped={} errors={} semantic_candidates={}/{} compiler_resolvable={} excluded_unresolved={} excluded_api_boundary={} excluded_existing_alias={} already_pending={} path_candidates={}",
                         report.proposed,
                         report.queued,
                         report.duplicates,
                         report.rejected.len(),
                         report.skipped.len(),
-                        report.errors.len()
+                        report.errors.len(),
+                        report.eligibility.sent_symbol_candidates,
+                        report.eligibility.owned_symbols,
+                        report.eligibility.compiler_resolvable_symbols,
+                        report.eligibility.excluded_unresolved,
+                        report.eligibility.excluded_api_boundary,
+                        report.eligibility.excluded_existing_alias,
+                        report.eligibility.pending_symbol_decisions,
+                        report.eligibility.unique_path_candidates,
                     );
                 }
                 for rejected in &report.rejected {
@@ -1276,6 +1343,14 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
                     ("AST revision", report.semantic.revision.to_string()),
                     ("AST indexed", report.semantic.indexed.to_string()),
                     ("AST read-only", report.semantic.read_only.to_string()),
+                    (
+                        "Aliases reconciled",
+                        report.semantic.reconciled_aliases.to_string(),
+                    ),
+                    (
+                        "Aliases quarantined",
+                        report.semantic.quarantined_aliases.to_string(),
+                    ),
                     ("Elapsed", format_elapsed(started.elapsed())),
                 ];
                 if !crate::presentation::summary("Sync complete", &rows) {
@@ -1384,21 +1459,37 @@ fn dispatch(command: Command, root: &std::path::Path, out: crate::output::Output
         }
         Command::FindCode { query, limit } => {
             let result = semantic_read(&root, |conn| {
+                let layout = crate::config::Layout::new(&root);
+                let config = crate::config::Config::load_or_default(&layout)?;
+                let projection =
+                    crate::path_projection::PathProjection::from_connection(&config, conn)?;
                 Ok(json!({
                     "revision": crate::semantic_store::current_revision(conn)?,
-                    "symbols": crate::semantic_store::find_symbols(conn, &query, limit)?
+                    "symbols": crate::semantic_store::find_symbols(conn, &root, &query, limit)?
                         .into_iter()
-                        .map(|(path, symbol)| json!({ "path": path, "symbol": symbol }))
-                        .collect::<Vec<_>>()
+                        .map(|(path, symbol)| {
+                            Ok(json!({
+                                "path": projection.projected_string_for_real(&path)?,
+                                "symbol": symbol,
+                            }))
+                        })
+                        .collect::<Result<Vec<_>>>()?
                 }))
             })?;
             emit_semantic_value(out, "find-code", result)?;
         }
         Command::ReadCode { path } => {
             let path = crate::config::normalize_safe_rel_path(&path, "read-code path")?;
-            let rel = crate::config::normalize_rel_path(&path);
             let document = semantic_read(&root, |conn| {
-                crate::semantic_store::project_document(conn, &root, &rel)
+                let layout = crate::config::Layout::new(&root);
+                let config = crate::config::Config::load_or_default(&layout)?;
+                let projection =
+                    crate::path_projection::PathProjection::from_connection(&config, conn)?;
+                let real = projection.real_for_agent(&path)?;
+                let rel = crate::config::normalize_rel_path(&real);
+                let mut document = crate::semantic_store::project_document(conn, &root, &rel)?;
+                document.rel_path = projection.projected_string_for_real(&rel)?;
+                Ok(document)
             })?;
             emit_semantic_value(out, "read-code", serde_json::to_value(document)?)?;
         }
@@ -2057,18 +2148,20 @@ export const CodeSanityPlugin = async ({ directory, $ }: any) => {
     if (abs.startsWith(root)) return relative(root, abs)
     return undefined
   }
-  const toMirror = (p?: string) => {
+  const toMirror = async (p?: string) => {
     const rel = toRel(p)
-    return rel ? join(mirrorRoot, rel) : p
+    if (!rel) return p
+    const projected = (await run(["project-path", rel])) || rel
+    return join(mirrorRoot, projected)
   }
   const inMirror = (p?: string) => {
     if (!p) return false
     const abs = isAbsolute(p) ? p : join(root, p)
     return abs.startsWith(mirrorRoot)
   }
-  const redirect = (args: any) => {
-    if (args?.filePath) args.filePath = toMirror(args.filePath)
-    if (args?.path) args.path = toMirror(args.path)
+  const redirect = async (args: any) => {
+    if (args?.filePath) args.filePath = await toMirror(args.filePath)
+    if (args?.path) args.path = await toMirror(args.path)
   }
 
   return {
@@ -2077,7 +2170,7 @@ export const CodeSanityPlugin = async ({ directory, $ }: any) => {
       const args = output?.args
       if (!tool || !args) return
       if (READ_TOOLS.has(tool)) {
-        redirect(args)
+        await redirect(args)
         return
       }
       if (EDIT_TOOLS.has(tool)) {
@@ -2089,7 +2182,7 @@ export const CodeSanityPlugin = async ({ directory, $ }: any) => {
               ") or use `code-sanity apply-patch`; raw real-repo edits are blocked.",
           )
         }
-        redirect(args)
+        await redirect(args)
       }
     },
     "tool.execute.after": async (input: any, output: any) => {

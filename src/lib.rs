@@ -19,6 +19,7 @@ pub mod map;
 pub mod mcp;
 pub mod output;
 pub mod patch;
+pub mod path_projection;
 pub mod presentation;
 pub mod proposal;
 pub mod redact;

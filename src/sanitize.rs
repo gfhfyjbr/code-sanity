@@ -100,6 +100,36 @@ pub fn term_table(config: &Config) -> Vec<Term> {
     terms
 }
 
+/// Terms used only for agent-facing path components. Explicit path aliases
+/// take precedence over content policy for the same normalized term, then the
+/// ordinary content table is appended so existing dictionary/registry/denylist
+/// mappings continue to sanitize filenames too.
+pub fn path_term_table(config: &Config) -> Vec<Term> {
+    let mut seen = BTreeSet::new();
+    let mut terms = Vec::new();
+    for (raw, replacement) in &config.sanitizer.path_alias_registry {
+        if let Some(reason) = matchability_error(raw) {
+            log::warn!("skipping unmatchable path alias: {reason}");
+            continue;
+        }
+        let normalized = normalize_term(raw);
+        if seen.insert(normalized.clone()) {
+            terms.push(Term {
+                raw: raw.clone(),
+                normalized,
+                replacement: replacement.clone(),
+                policy_source: "path-alias-registry",
+            });
+        }
+    }
+    for term in term_table(config) {
+        if seen.insert(term.normalized.clone()) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
 pub(crate) fn normalize_term(term: &str) -> String {
     term.chars()
         .filter(|ch| *ch != '_' && *ch != '-')
@@ -180,6 +210,13 @@ pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
     entries.extend(
         config
             .sanitizer
+            .path_alias_registry
+            .iter()
+            .map(|(term, alias)| ("path-alias-registry", term, Some(alias))),
+    );
+    entries.extend(
+        config
+            .sanitizer
             .dictionary
             .iter()
             .map(|(term, alias)| ("dictionary", term, Some(alias))),
@@ -201,9 +238,15 @@ pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
             }
         }
     }
-    for item in &config.sanitizer.allowlist {
-        if let Some(reason) = matchability_error(item) {
-            violations.push(format!("allowlist {reason}"));
+    for (source, entries) in [
+        ("allowlist", &config.sanitizer.allowlist),
+        ("proposal-allowlist", &config.sanitizer.proposal_allowlist),
+        ("path-allowlist", &config.sanitizer.path_allowlist),
+    ] {
+        for item in entries {
+            if let Some(reason) = matchability_error(item) {
+                violations.push(format!("{source} {reason}"));
+            }
         }
     }
 
@@ -221,6 +264,34 @@ pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
             ));
         } else {
             alias_owner.insert(alias_normalized, term);
+        }
+    }
+    if !config.sanitizer.path_alias_registry.is_empty() {
+        let path_terms = path_term_table(config);
+        let mut alias_owner: std::collections::BTreeMap<String, &Term> =
+            std::collections::BTreeMap::new();
+        for term in &path_terms {
+            let alias_normalized = normalize_term(&term.replacement);
+            if let Some(existing) = alias_owner.get(alias_normalized.as_str()) {
+                violations.push(format!(
+                    "path alias {:?} is used for both {:?} and {:?}; the path projection would be ambiguous",
+                    term.replacement, existing.raw, term.raw
+                ));
+            } else {
+                alias_owner.insert(alias_normalized, term);
+            }
+        }
+        for term in &path_terms {
+            let alias_normalized = normalize_term(&term.replacement);
+            for other in &path_terms {
+                if alias_normalized.contains(other.normalized.as_str()) {
+                    violations.push(format!(
+                        "path alias {:?} for {:?} still contains sanitizable path term {:?}; \
+                         the path projector's own output would be sanitizable",
+                        term.replacement, term.raw, other.raw
+                    ));
+                }
+            }
         }
     }
     for term in &terms {
@@ -257,6 +328,9 @@ pub fn sanitizer_policy_violations(config: &Config) -> Vec<String> {
     }
     if sanitizer.propose_chunk_overlap_lines > 1_000 {
         violations.push("sanitizer.propose_chunk_overlap_lines must not exceed 1000".to_string());
+    }
+    if !(1..=512).contains(&sanitizer.propose_path_batch_size) {
+        violations.push("sanitizer.propose_path_batch_size must be between 1 and 512".to_string());
     }
     if !(1..=32).contains(&sanitizer.propose_concurrency) {
         violations.push("sanitizer.propose_concurrency must be between 1 and 32".to_string());
@@ -503,6 +577,44 @@ pub fn sanitize_run_text(run: &str, terms: &[Term], protected: &BTreeSet<String>
         cursor = hit.end;
     }
     out.push_str(&run[cursor..]);
+    out
+}
+
+/// Sanitize arbitrary agent-facing text without language keywords or public
+/// identifiers receiving the exemptions used for source code. Path
+/// components use this contract: a filename is metadata, not a declaration,
+/// so a configured term must never survive merely because it happens to be a
+/// language keyword.
+pub fn sanitize_unprotected_text(content: &str, terms: &[Term]) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    let mut hits = Vec::new();
+    for (run_start, run_end) in word_runs(content) {
+        out.push_str(&content[cursor..run_start]);
+        let run = &content[run_start..run_end];
+        hits.clear();
+        hits_in_run(run, 0, terms, &mut hits);
+        hits.sort_by(|a, b| {
+            a.start
+                .cmp(&b.start)
+                .then_with(|| (b.end - b.start).cmp(&(a.end - a.start)))
+        });
+        let mut run_cursor = 0usize;
+        for hit in &hits {
+            if hit.start < run_cursor {
+                continue;
+            }
+            out.push_str(&run[run_cursor..hit.start]);
+            out.push_str(&adapt_replacement(
+                &run[hit.start..hit.end],
+                &terms[hit.term_index].replacement,
+            ));
+            run_cursor = hit.end;
+        }
+        out.push_str(&run[run_cursor..]);
+        cursor = run_end;
+    }
+    out.push_str(&content[cursor..]);
     out
 }
 
@@ -1302,6 +1414,7 @@ mod tests {
         config.sanitizer.propose_max_file_bytes = 0;
         config.sanitizer.propose_chunk_bytes = 0;
         config.sanitizer.propose_chunk_overlap_lines = 1_001;
+        config.sanitizer.propose_path_batch_size = 0;
         config.sanitizer.propose_concurrency = 0;
         config.ignore.max_file_bytes = 0;
         config.embeddings.chunk_lines = 4;
@@ -1313,6 +1426,7 @@ mod tests {
             "propose_max_file_bytes",
             "propose_chunk_bytes",
             "propose_chunk_overlap_lines",
+            "propose_path_batch_size",
             "propose_concurrency",
             "ignore.max_file_bytes",
             "chunk_overlap",
@@ -1332,6 +1446,8 @@ mod tests {
         config.sanitizer.confidence_threshold = 1.0;
         assert_eq!(sanitizer_policy_violations(&config), Vec::<String>::new());
         config.sanitizer.propose_concurrency = 32;
+        assert_eq!(sanitizer_policy_violations(&config), Vec::<String>::new());
+        config.sanitizer.propose_path_batch_size = 512;
         assert_eq!(sanitizer_policy_violations(&config), Vec::<String>::new());
     }
 

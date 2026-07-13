@@ -18,6 +18,7 @@
 use crate::config::{Config, Layout};
 use crate::db;
 use crate::map::{load_span_map, sha256_hex};
+use crate::path_projection::PathProjection;
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -159,9 +160,14 @@ pub fn build_reverse_pairs(root: &Path) -> Result<Vec<(String, String)>> {
     let config = Config::load_or_default(&layout)?;
     let conn = db::connect(&layout)?;
     db::check_schema(&conn)?;
+    let projection = PathProjection::from_connection(&config, &conn)?;
 
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for file in db::tracked_files(&conn)? {
+        let projected = projection.projected_string_for_real(&file)?;
+        if file != projected {
+            map.entry(file.clone()).or_insert(projected);
+        }
         if let Ok(span_map) = load_span_map(&layout.map_path(Path::new(&file))) {
             for replacement in &span_map.replacements {
                 map.entry(replacement.original_text.clone())
@@ -175,9 +181,18 @@ pub fn build_reverse_pairs(root: &Path) -> Result<Vec<(String, String)>> {
     for (term, alias) in &config.sanitizer.alias_registry {
         map.entry(term.clone()).or_insert_with(|| alias.clone());
     }
+    for (term, alias) in &config.sanitizer.path_alias_registry {
+        // Path-only policy wins for raw filenames/basenames in command output.
+        // Full source occurrences are already covered by longer span/file
+        // pairs when an exact content projection exists.
+        map.insert(term.clone(), alias.clone());
+    }
     for term in &config.sanitizer.denylist {
         map.entry(term.clone())
             .or_insert_with(|| crate::sanitize::derive_alias(&config.salt, term));
+    }
+    for pair in crate::semantic_store::accepted_alias_pairs(&conn)? {
+        map.insert(pair.original, pair.alias);
     }
 
     let mut pairs: Vec<(String, String)> = map
@@ -238,24 +253,28 @@ fn materialize_worktree(root: &Path) -> Result<Worktree> {
         .create(&dest)
         .with_context(|| format!("create worktree {}", dest.display()))?;
     let worktree = Worktree { path: dest };
-    copy_dir(&layout.mirror_dir, &worktree.path)?;
-    Ok(worktree)
-}
-
-fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
-    for entry in std::fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
-        let entry = entry.context("read worktree source entry")?;
-        let file_type = entry.file_type().context("stat worktree source entry")?;
-        let target = dest.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir(&entry.path(), &target)?;
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &target)
-                .with_context(|| format!("copy to {}", target.display()))?;
+    let config = Config::load_or_default(&layout)?;
+    let conn = db::connect(&layout)?;
+    db::check_schema(&conn)?;
+    let projection = PathProjection::from_connection(&config, &conn)?;
+    for real in db::tracked_files(&conn)? {
+        let projected = projection.projected_for_real(Path::new(&real))?;
+        let source = layout.mirror_dir.join(&projected);
+        crate::search::ensure_existing_path_inside(&source, &layout.mirror_dir, &projected)?;
+        let target = worktree.path.join(&projected);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
         }
+        std::fs::copy(&source, &target).with_context(|| {
+            format!(
+                "copy projected mirror {} to {}",
+                source.display(),
+                target.display()
+            )
+        })?;
     }
-    Ok(())
+    Ok(worktree)
 }
 
 #[cfg(test)]

@@ -14,14 +14,31 @@
 | `commit_transaction` | `{ "transaction_id", "expected_revision", "agent"?, "session_id"? }` | committed revision, files, journal |
 | `read_file` | `{ "path": "src/lib.rs" }` | sanitized file content |
 | `search` | `{ "query": "...", "glob": "*.rs"?, "max_results"? }` | `path:line:column:text` lines (sanitized, capped) |
-| `list_files` | `{ "glob": "src/**"? }` | repo-relative mirror paths |
+| `list_files` | `{ "glob": "src/**"? }` | projected repo-relative mirror paths |
 | `semantic_search` | `{ "query": "...", "k"? }` | `path:start-end score preview` lines (sanitized); requires embeddings enabled + `embed-index` |
 | `apply_patch` | `{ "patch": "<unified diff>", "agent"?, "session_id"?, "dry_run"? }` | applied files + workspace-relative journal path (`dry_run: true` plans/validates only) |
 | `verify` | `{}` | tracked-file consistency check |
 
-`read_code` is the preferred read path. It projects aliases only at AST occurrences bound to one `symbol_id`; comments, strings, external APIs, and same-spelling unrelated symbols remain unchanged. Mutation is a two-step preview/commit protocol with revision CAS. `edit_node` cannot touch a declaration-containing range, while `rename_symbol` accepts only a compiler/LSP `WorkspaceEdit` contained by the repository.
+`read_code` is the preferred read path. Its content is the same combined
+lexical + semantic projection stored in the mirror; semantic aliases apply only
+at AST occurrences bound to one `symbol_id`. Paths, names, qualified names,
+ranges, and byte offsets are all projected as one coordinate system. Mutation
+is a two-step preview/commit protocol with revision CAS. `edit_node` cannot
+touch a declaration-containing range and back-projects accepted alias
+references in replacement syntax, while `rename_symbol` accepts only a
+compiler/LSP `WorkspaceEdit` contained by the repository.
 
-The legacy `read_file`, `search`, and `list_files` read `.code-sanity/mirror`. File and directory names remain real repo-relative paths by design. Glob parameters use gitignore-style dispatch: without `/` they match file names at any depth (`*.rs`); with `/` they match the repo-relative path (`src/**/*.rs`). Tool output never carries host-absolute paths. `apply_patch` remains the v1 span bridge; new integrations should use v2 structured transactions. See [SEMANTIC_V2.md](SEMANTIC_V2.md) for invariants and capability boundaries.
+The compatibility `read_file`, `search`, and `list_files` read the same
+`.code-sanity/mirror`, including accepted semantic aliases. Every directory component and filename stem uses the
+deterministic sanitized projection; the final extension is preserved. Inputs
+may use a current projected path (preferred), while tracked real spellings are
+accepted as a host-compatibility fallback without being echoed back. Glob
+parameters use gitignore-style dispatch over projected paths: without `/` they
+match file names at any depth (`*.rs`); with `/` they match the repo-relative
+path (`src/**/*.rs`). Tool output never carries host-absolute or real tracked
+paths. `apply_patch` uses the combined span/symbol back-projection bridge; new integrations should use v2
+structured transactions. See [SEMANTIC_V2.md](SEMANTIC_V2.md) for invariants
+and capability boundaries.
 
 Inspect the manifest without starting a session:
 

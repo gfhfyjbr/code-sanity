@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/gfhfyjbr/code-sanity/actions/workflows/ci.yml/badge.svg)](https://github.com/gfhfyjbr/code-sanity/actions/workflows/ci.yml)
 
-`code-sanity` builds a sanitized mirror of a real repository and applies agent edits from that mirror back to the real files. The real repository remains the source of truth; `.code-sanity/mirror` is the agent-facing view, and `.code-sanity/maps` plus `db.sqlite` hold span and hash state.
+`code-sanity` builds a sanitized mirror of a real repository and applies agent edits from that mirror back to the real files. The real repository remains the source of truth; `.code-sanity/mirror` is the agent-facing view, and `.code-sanity/maps` plus `db.sqlite` hold span, path-projection, and hash state. Agent-facing directory names and filename stems use deterministic shared and path-only aliases, so a known or reviewed provocative filename does not keep framing otherwise benign work.
 
-Sanitization is deterministic and local (dictionary + human-approved alias registry + denylist). A model can *propose* aliases through a provider interface, but it never writes the mirror.
+Sanitization is deterministic and local (dictionary + human-approved content/path alias registries + denylist). A model can *propose* aliases through a provider interface, but it never writes the mirror.
 
 ## Installation
 
@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.s
 
 # Pin a release or customize installation:
 curl -fsSL https://raw.githubusercontent.com/gfhfyjbr/code-sanity/main/install.sh | \
-  bash -s -- --version v0.4.8 --bin-dir "$HOME/.local/bin" --add-to-path
+  bash -s -- --version v0.5.0 --bin-dir "$HOME/.local/bin" --add-to-path
 ```
 
 Download and inspect `install.sh` first if piping a remote script is outside
@@ -49,7 +49,7 @@ Prebuilt binaries for Linux and macOS (x86_64 / aarch64) are attached to each
 ```bash
 # pick your platform: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
 #                     x86_64-apple-darwin, aarch64-apple-darwin
-version=v0.4.8
+version=v0.5.0
 target=aarch64-apple-darwin
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz"
 curl -fsSLO "https://github.com/gfhfyjbr/code-sanity/releases/download/${version}/code-sanity-${version}-${target}.tar.gz.sha256"
@@ -109,14 +109,17 @@ live. Pending review rows have `[ ]`/`[X]` approval checkboxes: press `Space`
 or click the checkbox to toggle one proposal, and use the button below the
 queue to `Select All` or `Deselect All` proposals in the current filtered view.
 `Approve` processes every checked proposal; with no checkboxes selected it
-keeps the focused-row behavior.
+keeps the focused-row behavior. A checked batch shares one deterministic
+preflight, one language-server session, and one atomic apply pass; the activity
+panel shows the current validation stage and completed compiler closures.
 
 The `Propose` toolbar button and `p` shortcut open a setup modal before any
-provider call. Its directory dropdown is built from directories that contain
-tracked files (`Entire workspace` is always available). Endpoint-backed
-providers also require an explicit `Allow provider endpoint` checkbox before
-`Run` is enabled; the modal shows the configured URL and model receiving the
-selected scope's real source.
+provider call. Its directory dropdown is built from indexable repository files
+(`Entire workspace` is always available), including before the first manual
+index. A first proposal scan populates the derived index before resolving that
+scope. Endpoint-backed providers also require an explicit `Allow provider
+endpoint` checkbox before `Run` is enabled; the modal shows the configured URL
+and model receiving the selected scope's real source.
 
 Human CLI output uses colors, spinners, summaries, and result tables when
 attached to a terminal. Redirected output retains the stable plain-text format;
@@ -189,6 +192,16 @@ and `acmeClientFactory`.
   practically impossible;
 - replacements adapt to the casing of the matched slice (`ACME` → `CLIENT`,
   `Acme` → `Client`);
+- every component of the agent-facing repo-relative path is projected with the
+  effective path term table: reviewed path-only aliases take precedence, then
+  the ordinary dictionary/content registry/denylist mappings apply. Directory
+  names and filename stems are sanitized while the final extension is
+  preserved for language/tool dispatch
+  (`dangerous/client_dangerous.mm` may become
+  `neutral_x1/consumer_y2_neutral_x1.mm`);
+- path projection is reversible over the complete tracked workspace. Indexing
+  fails before writing if two real files/directories would collapse to one
+  projected path, including ASCII case-insensitive collisions;
 - the **repo-wide protected identifier set** (public declarations,
   import-position names, and code dunders like `__init__`, collected from the
   real files' code contexts — never from prose, comments, or string literals)
@@ -201,15 +214,19 @@ and `acmeClientFactory`.
 - line count is preserved, but replacement lengths may differ;
 - the per-workspace salt is 128-bit, read from `/dev/urandom` at `init`.
 
-Every tracked file gets a JSON span map with original and sanitized byte offsets, line starts, hashes, replacement spans, and rendered sizes.
+Every tracked file gets a JSON span map with its internal real identity, current
+agent-facing projected path, original and sanitized byte offsets, line starts,
+hashes, replacement spans, and rendered sizes. `code-sanity project-path
+<real-or-projected-path>` prints the current agent-facing spelling for adapters
+and diagnostics.
 
 ### Incremental index
 
 Every file is a component owning its mirror file, span map, and db rows. A file
 is re-rendered only when its **input fingerprint** (content sha256, with an
 mtime/size pre-check that avoids reading unchanged files) or the **logic
-fingerprint** (dictionary, registry, allow/deny lists, salt, sanitizer behavior
-version, and the repo-wide protected symbol set) changes. A file that
+fingerprint** (dictionary, registry, allow/deny lists, salt, sanitizer/path
+behavior versions, and the repo-wide protected symbol set) changes. A file that
 disappeared takes its targets with it. Each file commits in a single SQLite
 transaction with idempotent upserts; the database runs in WAL mode with a busy
 timeout and is fully derived state (`PRAGMA user_version` migrations recreate
@@ -228,15 +245,58 @@ everything and resets pending (or tampered) mirror files back to
 
 ## Model-based sanitizer
 
-The model never writes the mirror. It runs only in an offline *propose* step and its output is validated, queued, and applied deterministically:
+The model never writes the mirror. It runs only in an offline *propose* step;
+its output is validated, queued, and applied deterministically. Every provider
+receives the current projected repo-relative path rather than the internal real
+path. A still-unknown term can therefore remain visible until its path proposal
+is reviewed.
 
-1. `code-sanity propose-sanitize [--path <file-or-directory>]` runs the configured proposal provider. The model searches for both non-public repository-owned naming and security- or abuse-adjacent vocabulary used benignly but liable to be misclassified without context. Public third-party brands, products, OS components, protocols, frameworks, and library APIs are out of scope. The index records external ownership evidence from imports and `extern` declarations; relevant evidence is sent with each request and enforced again locally. LLM files larger than `sanitizer.propose_chunk_bytes` are split on complete source lines with `propose_chunk_overlap_lines` of context. Chunks run in bounded parallel waves: pending-review originals and locally validated findings from each wave are sent as `already_proposed_originals` to the next one. Context and pending originals are repo-wide because an approved alias is global; normalized containing variants are deduplicated too. Overlap travels as read-only `context_before`, while only the non-overlap `content` is eligible for proposals. Every alias is checked against the complete indexed real-file vocabulary before review. Full-workspace scans use four concurrent requests by default (`sanitizer.propose_concurrency`, range 1–32); override one run with `--jobs <n>`. Live progress goes to stderr per request/chunk plus a per-file proposal summary, while `--json` keeps stdout as exactly one JSON document; `--no-progress` disables it. External-command and heuristic providers retain their one-request-per-file contract. The default provider is a deterministic `HeuristicProposalProvider` (proposes neutral aliases for denylisted terms). Set `provider.kind = "external"` with a `command` (and optional `timeout_secs`) to plug in a local model; it receives `{rel, content}` JSON on stdin and returns a `ProposalBatch`. Because the command comes from repo-local config, executing it requires explicit confirmation with `--allow-provider-command`; stdin/stdout are pumped concurrently (no pipe deadlock on large files) and the child is killed on timeout. Set `provider.kind = "llm"` to use any OpenAI-compatible chat endpoint instead — e.g. a local [kou-router](https://github.com/gfhfyjbr/kou-router) gateway that fans out to OpenAI/Anthropic/Ollama accounts:
+1. `code-sanity propose-sanitize [--path <file-or-directory>]` runs the
+   configured provider over two independent candidate surfaces:
+   `context.semantic_candidates` contains owned symbols, while
+   `context.path_candidates` contains each current projected directory
+   component and filename stem. Semantic output uses
+   `category: "identifier"` with `target: {symbol_id, occurrence_id}`; path
+   output uses `category: "file_path"` with `target: {path_id}`. The same
+   spelling may receive one, both, or neither decision. Public third-party
+   brands, products, OS components, protocols, frameworks, and library APIs
+   remain out of scope.
+
+   LLM source is split on complete lines at
+   `sanitizer.propose_chunk_bytes`, with
+   `propose_chunk_overlap_lines` of read-only `context_before`. Path metadata is
+   scanned in a dedicated `request_mode: "path-only"` pass: directory and
+   filename-stem candidates are deduplicated across the selected scope and
+   batched by `sanitizer.propose_path_batch_size`. If a source exceeds
+   `sanitizer.propose_max_file_bytes`, its body and semantic candidates are not
+   sent, but its path remains in that shared inventory. Semantic decisions use
+   exact `symbol_id` identity; same-spelling symbols remain independent, and a
+   locally rejected alias does not suppress a later alternative. Unresolved
+   occurrences suppress a local candidate only inside its enclosing function;
+   a non-local C++/ObjC++ candidate remains eligible when clangd can perform the
+   mandatory approval-time closure. A malformed
+   proposal object cannot discard valid siblings, and one wholly invalid JSON
+   response is retried once. Full scans use four concurrent
+   requests by default (`sanitizer.propose_concurrency`, range 1–32), or
+   `--jobs <n>` for one run. Progress goes to stderr; `--json` keeps stdout as
+   one JSON document and `--no-progress` disables live updates.
+
+   The default provider is the deterministic `HeuristicProposalProvider` for
+   denylisted source terms. Set `provider.kind = "external"` with a `command`
+   and optional `timeout_secs` to plug in a local model. During a proposal run
+   it receives `{request_mode, rel, content, chunk, context}` JSON on stdin and returns a
+   `ProposalBatch`; executing a repo-local command requires
+   `--allow-provider-command`, uses concurrent pipe I/O, and is killed on
+   timeout. Set `provider.kind = "llm"` to use any OpenAI-compatible chat
+   endpoint — for example, a local
+   [kou-router](https://github.com/gfhfyjbr/kou-router) gateway:
 
    ```toml
    [sanitizer]
    propose_concurrency = 4
    propose_chunk_bytes = 16384
    propose_chunk_overlap_lines = 12
+   propose_path_batch_size = 64
 
    [sanitizer.provider]
    kind = "llm"
@@ -254,12 +314,54 @@ The model never writes the mirror. It runs only in an offline *propose* step and
    model = "anthropic/claude-sonnet-4.5"  # export OPENROUTER_API_KEY=sk-or-...
    ```
 
-   Before the provider boundary, terms already covered by the deterministic dictionary or approved registry are replaced with their aliases; the model receives the remaining real file content plus the current deny/allow policy and must answer with a strict-JSON `ProposalBatch`. Because unknown private naming is still real content and the endpoint comes from repo-local config, running it requires explicit confirmation with `--allow-provider-endpoint` — for all three kinds, including the loopback kou-router preset. Point `base_url` at a local gateway/Ollama to keep the remaining real code on the machine. A remote endpoint with no API key in the environment fails fast with the variable name instead of an HTTP 401 mid-run.
-2. The model contract requires `original_text` to be copied byte-for-byte from a contiguous, case-sensitive source substring and explicitly forbids case/spelling/inflection changes, joining punctuation-separated tokens, and labels inferred only from behavior. Local validation independently enforces source membership: the original must appear in the file, allowlisted, mapped, indexed-external, and public API terms are refused; identifier aliases must be valid identifiers; aliases may not introduce newlines, contain a denylisted term, or collide with a natural word anywhere in the indexed repository. Survivors are queued under `.code-sanity/review/`; an existing repo-wide pending original or normalized containing variant is counted as a duplicate instead. Low-confidence candidates remain visibly flagged for human review.
-3. `code-sanity review [--all]` lists the queue. `review --approve <id>` records the alias in the deterministic registry (`sanitizer.alias_registry` in `config.toml`) and reindexes the file; `review --reject <id>` drops it. Approval re-validates so a stale queue can't apply an unsafe alias.
-4. `index`/`verify` use only the deterministic engine (dictionary + alias registry), so they stay reproducible and the model stays out of the write path.
+   Before the provider boundary, known deterministic content terms are
+   pre-redacted. Source requests receive the remaining real source and
+   file-local external-ownership evidence; path-only requests receive only the
+   projected path inventory. `allowlist` controls deterministic content,
+   `proposal_allowlist` controls semantic candidates, and `path_allowlist`
+   controls path candidates. The model must return strict JSON. Running an
+   endpoint provider requires
+   `--allow-provider-endpoint`, including the loopback kou-router preset. A
+   missing remote API key fails before any request.
+2. Identifier `original_text` must equal its owned symbol name and occur in the
+   current source chunk. File-path `original_text` must instead be an exact,
+   case-sensitive substring of the selected path candidate; extensions are
+   never candidates. Local validation rejects invented/stale IDs, allowlisted
+   or already-mapped terms, public/external identifiers, unsafe aliases, and
+   path aliases that would make any tracked file or directory projection
+   collide. Low confidence is flagged for review, never auto-applied.
+3. `code-sanity review [--all]` lists the queue. Approving an identifier writes
+   a symbol-scoped semantic alias. A function-local symbol can be proven closed
+   by the lexical resolver; every non-local Rust or C/C++/Objective-C-family
+   symbol first requires a stable compiler/LSP reference set. The accepted
+   closure links declarations and uses across files and refuses a partial
+   result. Source drift marks the group stale and `index` must successfully
+   refresh the same decision through the language server before projecting it
+   again. Header declarations and their implementation definitions are one
+   alias owner even when clangd returns only the opened declaration. `index`
+   deterministically reconverges aliases accepted by older versions onto the
+   header's authoritative spelling and reports the repaired anchor count.
+   Bulk review first refreshes stale source/policy/mirror or resolver state,
+   quarantines unsafe legacy aliases and broken compiler components, then
+   preflights deterministic ownership/collisions before starting compiler work.
+   It retires only invalid, conflicting, obsolete, or incomplete selections,
+   batches reference requests through one language-server session, proves
+   implementation-local `static` closures from the semantic index, atomically
+   admits the surviving closure batch, and writes aliases, mirrors, review
+   files, and the ledger once. Pending mirror edits stop the operation before
+   any review decision is written.
+   Approving `file_path` writes a global
+   path-only entry under `sanitizer.path_alias_registry`, revalidates the
+   complete path map, and migrates the projected mirror path; it does not
+   rewrite source content or rename the real repository file. Rejecting changes
+   no policy. Approval always revalidates stale queue items.
+4. `index` and `verify` use only the deterministic dictionary, registries, and
+   denylist. The model remains outside the write path.
 
-`code-sanity review-sanitize [--path <path>]` prints an audit of every applied replacement (category, original → sanitized, policy source, confidence, line) read from the span maps.
+`code-sanity review-sanitize [--path <path>]` prints the span-map audit for
+applied content replacements (category, original → sanitized, policy source,
+confidence, line). Path-only decisions remain visible in review history and
+`sanitizer.path_alias_registry`; `project-path` shows their current result.
 
 ## Semantic index (embeddings)
 
@@ -283,11 +385,15 @@ code-sanity embed-index                  # incremental; unchanged files cost no 
 code-sanity semantic-search "where is retry logic for the parser" --k 10
 ```
 
-Only sanitized mirror content is ever sent to the embedding endpoint — the same text agents already read — so enabling OpenRouter leaks no real names. The default endpoint is OpenRouter's OpenAI-compatible `/embeddings`; a local [kou-router](https://github.com/gfhfyjbr/kou-router) gateway or any other OpenAI-compatible endpoint works via `base_url`. Mirror files are snapshotted under short-lived shared locks and embedding requests run unlocked, so a slow endpoint never starves writers; each file's chunk rows then commit in one SQLite transaction under a brief exclusive workspace lock that re-verifies the mirror still matches the embedded snapshot (files that changed mid-run are reported as `stale` and reconciled by the next run). Run `embed-index` after `index`/`sync` to pick up re-rendered files (stale vectors are self-healing on the next run). The MCP server exposes the same search as a `semantic_search` tool.
+Only sanitized mirror content is ever sent to the embedding endpoint — the same text agents already read — so enabling OpenRouter leaks no real names. The default endpoint is OpenRouter's OpenAI-compatible `/embeddings`; a local [kou-router](https://github.com/gfhfyjbr/kou-router) gateway or any other OpenAI-compatible endpoint works via `base_url`. Mirror files are snapshotted under short-lived shared locks and embedding requests run unlocked, so a slow endpoint never starves writers; each file's chunk rows then commit in one SQLite transaction under a brief exclusive workspace lock that re-verifies the mirror still matches the embedded snapshot (files that changed mid-run are reported as `stale` and reconciled by the next run). Run `embed-index` after `index`/`sync` to pick up re-rendered files. Search fails closed before making an HTTP request if any tracked mirror fingerprint is stale. The MCP server exposes the same search as a `semantic_search` tool.
 
 ## Patch Bridge
 
-`apply-patch` accepts unified diffs against sanitized paths such as `a/src/lib.rs`, `b/src/lib.rs`, or `.code-sanity/mirror/src/lib.rs`. Modify, create (`--- /dev/null`), and delete (`+++ /dev/null`) patches are all supported.
+`apply-patch` accepts unified diffs against projected sanitized paths such as
+`a/src/neutral_worker.rs`, `b/src/neutral_worker.rs`, or
+`.code-sanity/mirror/src/neutral_worker.rs`. Modify, create (`--- /dev/null`),
+and delete (`+++ /dev/null`) patches are all supported; existing paths are
+reverse-mapped to their real identities before any write.
 
 Before writing real files it:
 
@@ -296,12 +402,15 @@ Before writing real files it:
 - rejects edits whose changed byte range intersects a replacement span;
 - reverses aliases at known replacement spans from the span map;
 - **reverse-maps aliases in newly added lines** (whole words and inside
-  identifiers) using this file's span map plus the global alias registry, so a
+  identifiers) using the file span map, global lexical registry, and accepted
+  workspace semantic aliases, so a
   line calling `neutral_parser()` lands in the real file as
   `dangerous_parser()`. A reversal is kept only if re-sanitizing it reproduces
   the exact text the agent wrote (run-level roundtrip filter), so innocent
   identifiers that merely contain an alias-looking substring are left alone.
-  An alias observed with two different originals is ambiguous and conflicts;
+  An alias observed with two different originals is ambiguous and conflicts.
+  Reusing an existing alias as a new declaration also conflicts, while a
+  reference to that alias is back-projected to the real symbol;
 - applies the translated patch in memory;
 - verifies the invariant in **both directions**: `sanitize(patched real) ==
   patched mirror`, and reverse-projecting the patched mirror through the fresh
@@ -316,7 +425,12 @@ serialize on a blocking `flock` at `.code-sanity/tmp/apply.lock`; the kernel
 releases it automatically if a process dies, so a crash never wedges the
 workspace and parallel `apply-patch`/`sync` runs stay consistent.
 
-For create patches the added lines become the real file directly (the new file must already be neutral: `sanitize(real) == real`). For delete patches the entire mirror file must be removed, and the real file, mirror, map, and db row are all dropped.
+Create patches use the same syntax-aware back-projection as added lines in an
+existing file: references to accepted aliases land as real symbol names, while
+new declarations that reuse an existing alias are rejected as ambiguous. The
+newly indexed mirror must then reproduce the agent's file byte-for-byte or the
+whole journaled apply is rolled back. For delete patches the entire mirror file
+must be removed, and the real file, mirror, map, and db row are all dropped.
 
 Conflicts write `.code-sanity/journal/*.patch.json` and leave the real file unchanged. If a write or reindex step fails after real-file writes start, the changed real files are restored from the before-snapshots and the entry is marked `rolled-back`.
 
@@ -369,6 +483,7 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 - `init`
 - `index`
 - `read <path>`
+- `project-path <path>`
 - `search <query> [--glob <glob>] [--max-results <n>]`
 - `grep <query> [--glob <glob>] [--max-results <n>]`
 - `apply-patch [--patch <file>] [--dry-run] [--agent <name>] [--session-id <id>]` (`--dry-run` plans and validates without writing; conflicts still exit 2)
@@ -401,7 +516,11 @@ Editing inside a replacement span via a normal patch is refused on purpose. `cod
 
 Search results are capped (default 200, hard max 1000) with an explicit truncation notice.
 
-`--glob` uses gitignore-style dispatch: a pattern without `/` matches file **names** at any depth (`*.rs` = every Rust file); a pattern with `/` matches the repo-relative **path**, with `*` stopping at separators and `**` crossing them (`src/*.rs`, `src/**`, `**/*.rs`). Invalid patterns are an error.
+`--glob` uses gitignore-style dispatch over projected paths: a pattern without
+`/` matches file **names** at any depth (`*.rs` = every Rust file); a pattern
+with `/` matches the projected repo-relative **path**, with `*` stopping at
+separators and `**` crossing them (`src/*.rs`, `src/**`, `**/*.rs`). Invalid
+patterns are an error.
 
 ## MCP Server
 
@@ -474,29 +593,45 @@ Hooks are not a complete enforcement boundary. Strict protection requires runnin
 
 ## Verify
 
-`code-sanity verify` checks every tracked file (`sanitize(real) == mirror`,
-hashes, replacement counts) and additionally runs an **independent leak
+`code-sanity verify` checks every tracked file (the combined lexical + semantic
+projection equals the mirror, hashes and replacement counts agree) and
+additionally runs an **independent leak
 backstop**: the mirror and every span-map replacement output are scanned with
 the same matching primitive the sanitizer uses; any dictionary / denylist /
 registry term whose enclosing identifier is not in the repo-wide protected set
-is a failure, as is any file in the mirror that nothing tracks. Failures are
-printed one per line and the process exits with code `3`.
+is a failure. It also rejects stale/incomplete/non-injective semantic aliases,
+unresolved real spellings that collide with an alias, projection parse
+regressions, and files in the mirror that nothing tracks. Failures are printed
+one per line and the process exits with code `3`.
 
 ## Known Limitations
 
-- Legacy v1 mirror commands still use the regex/byte scanner. V2 `read-code` and structured edit tools are AST-aware and import only exact bound identifier replacements.
+- Legacy mirror commands and v2 `read-code` now consume one physical combined
+  projection: lexical policy still covers prose, while reviewed semantic
+  aliases are overlaid only on exact bound occurrences. V2 additionally
+  returns projected AST/symbol metadata and supports structured edits.
+- Repo-relative path components are projected, but behavior-bearing import,
+  include, and module-path text inside source remains governed by the content
+  sanitizer/public-API rules. The final filename extension is deliberately
+  preserved. Internal maps, journals, and SQLite keep real path identities;
+  they are state, not an agent-facing tree.
 - Multi-file apply is journaled (fsync'd) before writes, serialized by `flock`, and recoverable via `recover`, but it is not a substitute for transactional filesystem commits.
-- Patch back-projection is span-aware for known replacement spans and reverse-maps aliases in added lines, but hunk coordinate remapping is line-oriented and edits *inside* an alias still conflict; use `rename` to change a symbol behind an alias.
+- Patch back-projection is span-aware for known replacement spans and reverse-maps aliases in added lines, but hunk coordinate remapping is line-oriented and edits *inside* an alias still conflict; use `rename-symbol` to replace the real compiler identity and its old reviewed alias with the requested new name.
 - Legacy `rename` is single-file scoped. V2 `rename-symbol` uses `rust-analyzer` or `clangd` and rejects edits outside the workspace.
 - Protected-identifier detection (public API, imports) is conservative lexical heuristics, not a language-aware symbol graph; matching is ASCII-oriented (non-ASCII terms are not matched).
-- Rust and C/C++/Objective-C family have Tree-sitter structure plus compiler/LSP references and rename when the server is installed. JS/TS, Python, and Go have Tree-sitter AST edits but no semantic rename; unknown languages are read-only. No text-edit fallback is attempted.
+- Rust and C/C++/Objective-C family have Tree-sitter structure plus compiler/LSP references and rename when the server is installed. Objective-C++ merges C++ and Objective-C trees and reparses Objective-C method bodies through a byte-stable C++ projection, rather than choosing one incomplete grammar for the whole `.mm` file. JS/TS, Python, and Go have Tree-sitter AST edits but no semantic rename; unknown languages are read-only. No text-edit fallback is attempted.
 - Term matching is deliberately aggressive (case- and underscore-insensitive substrings inside word runs), so a term embedded in an unrelated word is also replaced; keep the allowlist current.
 - `.gitignore` support is delegated to the `ignore` crate (full gitignore language, `require_git(false)`); the walker does not follow parent-directory or global gitignores, for determinism.
 - The opencode plugin, MCP server, and Codex/Claude hooks are working guardrail adapters, not hard boundaries; they do not intercept reads via `bash` or other non-file tools.
 - Codex/Claude hooks require `python3` on the host.
-- The model-based sanitizer is proposal-only: an external provider (a `command` confirmed with `--allow-provider-command`, or an OpenAI-compatible endpoint confirmed with `--allow-provider-endpoint`) must be supplied; there is no bundled LLM. The deterministic engine (dictionary + alias registry + denylist) always does the actual sanitization.
-- The `llm`/`openrouter`/`kou-router` proposal providers pre-redact known dictionary/registry terms, then post the remaining real file content (line-aligned chunks for large files) to the configured endpoint; keep it local (kou-router/Ollama) unless you accept that exposure. Embedding requests carry sanitized mirror content only.
-- Semantic search is brute-force cosine over all stored vectors (no ANN index); fine for tens of thousands of chunks, not millions. Vectors go stale between `index` and the next `embed-index` run (self-healing, hash-keyed).
+- The model-based sanitizer is proposal-only: an external provider (a `command` confirmed with `--allow-provider-command`, or an OpenAI-compatible endpoint confirmed with `--allow-provider-endpoint`) must be supplied; there is no bundled LLM. The deterministic engine (dictionary + content/path alias registries + denylist) always does the actual sanitization.
+- The `llm`/`openrouter`/`kou-router` proposal providers pre-redact known
+  content terms, then post the remaining real file content in line-aligned
+  source chunks and the projected path inventory in separate source-free
+  batches; keep the endpoint local (kou-router/Ollama) unless you accept that
+  exposure. Oversized files send no source body but their path metadata remains
+  eligible. Embedding requests carry sanitized mirror content only.
+- Semantic search is brute-force cosine over all stored vectors (no ANN index); fine for tens of thousands of chunks, not millions. Vectors go stale between `index` and the next `embed-index` run; search detects this and refuses results until `embed-index` converges them.
 - Strict mode (`sh`/`strict-run`) is a guardrail, not a hard sandbox; FUSE/overlay isolation is not implemented. Output sanitization covers terms present in the span maps/dictionary/registry/denylist; novel real names in output are not hidden.
 
 ## Development
@@ -509,7 +644,16 @@ cargo clippy --all-targets -- -D warnings
 
 CI (GitHub Actions) runs fmt + clippy + tests on every push and pull request.
 
-The test suite covers indexing (including incremental fingerprints and a parallel apply/sync stress run), sanitized read/search with result caps, path traversal rejection, span map offsets, bidirectional patch roundtrips (plus a property test over random files and patches), alias reverse-mapping in added lines, public API consistency, conflicts inside replacements, rollback on simulated multi-file apply failure, verify's leak backstop and exit codes, hook generation/merging/uninstall, strict-mode streaming and sanitization, the review pipeline, and CLI smoke flows.
+The test suite covers indexing (including incremental fingerprints and a
+parallel apply/sync stress run), reversible filename/directory projection,
+collision refusal, pending-edit migration, projected provider/review/MCP/strict
+surfaces, sanitized read/search with result caps, path traversal rejection,
+span map offsets, bidirectional patch roundtrips (plus a property test over
+random files and patches), alias reverse-mapping in added lines, public API
+consistency, conflicts inside replacements, rollback on simulated multi-file
+apply failure, verify's leak backstop and exit codes, hook
+generation/merging/uninstall, strict-mode streaming and sanitization, the review
+pipeline, and CLI smoke flows.
 
 ## License
 

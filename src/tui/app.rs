@@ -140,6 +140,10 @@ enum WorkerEvent {
         detail: String,
         progress: Option<(usize, usize)>,
     },
+    Log {
+        level: LogLevel,
+        message: String,
+    },
     Finished {
         label: String,
         result: std::result::Result<String, String>,
@@ -331,6 +335,7 @@ impl App {
                         job.progress = progress;
                     }
                 }
+                WorkerEvent::Log { level, message } => self.log(level, message),
                 WorkerEvent::Finished { label, result } => {
                     self.job = None;
                     match result {
@@ -980,10 +985,12 @@ fn run_action(root: &Path, action: Action, tx: &Sender<WorkerEvent>) -> Result<S
         Action::Index => {
             let report = crate::index::index_workspace(root)?;
             Ok(format!(
-                "index complete: {} indexed, {} unchanged, {} skipped, {} errors",
+                "index complete: {} indexed, {} unchanged, {} skipped, {} aliases reconciled, {} unsafe aliases quarantined, {} errors",
                 report.indexed,
                 report.unchanged,
                 report.skipped,
+                report.semantic.reconciled_aliases,
+                report.semantic.quarantined_aliases,
                 report.errors.len()
             ))
         }
@@ -1022,6 +1029,36 @@ fn run_action(root: &Path, action: Action, tx: &Sender<WorkerEvent>) -> Result<S
                     });
                 },
             )?;
+            let _ = tx.send(WorkerEvent::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "semantic eligibility: {} sent / {} eligible / {} owned ({} compiler-resolvable); already decided {}; excluded unresolved {}, API {}, aliased {}; path candidates {}",
+                    report.eligibility.sent_symbol_candidates,
+                    report.eligibility.eligible_symbols,
+                    report.eligibility.owned_symbols,
+                    report.eligibility.compiler_resolvable_symbols,
+                    report.eligibility.pending_symbol_decisions,
+                    report.eligibility.excluded_unresolved,
+                    report.eligibility.excluded_api_boundary,
+                    report.eligibility.excluded_existing_alias,
+                    report.eligibility.unique_path_candidates,
+                ),
+            });
+            for reason in report.rejected.iter().take(3) {
+                let _ = tx.send(WorkerEvent::Log {
+                    level: LogLevel::Warning,
+                    message: format!("proposal rejected: {reason}"),
+                });
+            }
+            if report.rejected.len() > 3 {
+                let _ = tx.send(WorkerEvent::Log {
+                    level: LogLevel::Warning,
+                    message: format!(
+                        "{} additional proposal rejections omitted from the event log",
+                        report.rejected.len() - 3
+                    ),
+                });
+            }
             Ok(format!(
                 "proposal scan complete: {} queued, {} duplicates, {} rejected, {} errors",
                 report.queued,
@@ -1037,31 +1074,37 @@ fn approve_reviews(root: &Path, ids: &[String], tx: &Sender<WorkerEvent>) -> Res
     if ids.is_empty() {
         return Err(anyhow!("no proposals selected"));
     }
-    let mut approved = Vec::new();
-    let mut failed = Vec::new();
-    for (index, id) in ids.iter().enumerate() {
-        match crate::proposal::resolve_review(root, id, true) {
-            Ok(item) => approved.push(item),
-            Err(error) => failed.push(format!("{id}: {error:#}")),
-        }
-        let completed = index + 1;
+    let approved = crate::proposal::approve_reviews_with_progress(root, ids, |progress| {
         let _ = tx.send(WorkerEvent::Progress {
-            detail: format!("processed {completed}/{} proposals", ids.len()),
-            progress: Some((completed, ids.len())),
+            detail: progress.detail,
+            progress: Some((progress.completed, progress.total)),
         });
-    }
-    if !failed.is_empty() {
-        return Err(anyhow!(
-            "approved {}/{} proposals; failed: {}",
-            approved.len(),
-            ids.len(),
-            failed.join("; ")
-        ));
-    }
+    })?;
+    let retired = ids.len().saturating_sub(approved.len());
+    let _ = tx.send(WorkerEvent::Progress {
+        detail: if retired == 0 {
+            format!("approved {} proposals", approved.len())
+        } else {
+            format!(
+                "approved {}; safely retired {retired} proposals",
+                approved.len()
+            )
+        },
+        progress: Some((ids.len(), ids.len())),
+    });
     if let [item] = approved.as_slice() {
         Ok(format!(
             "approved {} -> {} in {}",
             item.proposal.original_text, item.proposal.sanitized_text, item.file
+        ))
+    } else if approved.is_empty() {
+        Ok(format!(
+            "safely retired {retired} proposals; nothing left to approve"
+        ))
+    } else if retired != 0 {
+        Ok(format!(
+            "approved {} proposals; safely retired {retired} proposals",
+            approved.len()
         ))
     } else {
         Ok(format!("approved {} proposals", approved.len()))
@@ -1141,16 +1184,54 @@ fn workspace_info(root: &Path) -> WorkspaceInfo {
 fn proposal_scopes(root: &Path) -> Vec<ProposeScope> {
     let mut directories = BTreeSet::new();
     let layout = Layout::new(root);
-    if let Ok(files) = crate::db::connect(&layout).and_then(|conn| crate::db::tracked_files(&conn))
-    {
-        for file in files {
-            let path = Path::new(&file);
-            for parent in path.parent().into_iter().flat_map(Path::ancestors) {
-                if parent.as_os_str().is_empty() || parent == Path::new(".") {
-                    continue;
-                }
-                directories.insert(parent.to_path_buf());
+    let config = Config::load_or_default_lenient(&layout).ok();
+    let mut files = crate::db::connect(&layout)
+        .and_then(|conn| crate::db::tracked_files(&conn))
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    // A fresh TUI must still expose its directory picker before the user has
+    // manually pressed Index. Discovery is read-only; the proposal action
+    // performs the initial index before any provider request.
+    if files.is_empty() {
+        files = config
+            .as_ref()
+            .and_then(|config| crate::index::discover_indexable_files(root, config).ok())
+            .unwrap_or_default();
+    }
+    let normalized_files = files
+        .iter()
+        .map(|path| crate::config::normalize_rel_path(path))
+        .collect::<Vec<_>>();
+    let projection = config.as_ref().and_then(|config| {
+        crate::path_projection::PathProjection::build(config, normalized_files.iter()).ok()
+    });
+    for file in &files {
+        for parent in file.parent().into_iter().flat_map(Path::ancestors) {
+            if parent.as_os_str().is_empty() || parent == Path::new(".") {
+                continue;
             }
+            // A workspace-wide projection error must not collapse the whole
+            // dropdown to "Entire workspace". The actual proposal run still
+            // performs the strict collision check before sending data.
+            let projected = match &projection {
+                Some(projection) => projection
+                    .projected_for_real(parent)
+                    .ok()
+                    .or_else(|| {
+                        config.as_ref().and_then(|config| {
+                            crate::path_projection::project_rel_path(parent, config).ok()
+                        })
+                    })
+                    .unwrap_or_else(|| parent.to_path_buf()),
+                // This is an operator-local picker. Showing every real scope
+                // is better than silently dropping all of them when the
+                // current policy has a path collision; the proposal action
+                // will surface that collision before any provider call.
+                None => parent.to_path_buf(),
+            };
+            directories.insert(projected);
         }
     }
     let mut scopes = vec![ProposeScope {
@@ -1246,7 +1327,20 @@ pub fn source_context(root: &Path, item: &ReviewItem, max_lines: usize) -> Vec<S
     if max_lines == 0 {
         return Vec::new();
     }
-    let Ok(content) = std::fs::read_to_string(root.join(&item.file)) else {
+    let display_path = Path::new(&item.file);
+    let real_path = (|| -> anyhow::Result<std::path::PathBuf> {
+        let layout = Layout::new(root);
+        let config = Config::load_or_default_lenient(&layout)?;
+        let conn = crate::db::connect(&layout)?;
+        crate::db::check_schema(&conn)?;
+        let projection = crate::path_projection::PathProjection::from_connection(&config, &conn)?;
+        projection.real_for_agent(display_path)
+    })()
+    .or_else(|_| crate::config::normalize_safe_rel_path(display_path, "review source"));
+    let Ok(real_path) = real_path else {
+        return Vec::new();
+    };
+    let Ok(content) = std::fs::read_to_string(root.join(real_path)) else {
         return Vec::new();
     };
     let lines = content.lines().collect::<Vec<_>>();
@@ -1468,6 +1562,35 @@ mod tests {
     }
 
     #[test]
+    fn proposal_scopes_are_discovered_before_the_first_index() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(temp.path().join("docs")).unwrap();
+        std::fs::write(
+            temp.path().join("src/nested/lib.rs"),
+            "fn local_name() {}\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("docs/guide.md"), "guide\n").unwrap();
+        let layout = Layout::new(temp.path());
+        assert!(!layout.state_dir.exists());
+
+        let scopes = proposal_scopes(temp.path());
+        let labels = scopes
+            .iter()
+            .map(|scope| scope.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels[0], "Entire workspace");
+        assert!(labels.contains(&"docs"));
+        assert!(labels.contains(&"src"));
+        assert!(labels.contains(&"src/nested"));
+        assert!(
+            !layout.state_dir.exists(),
+            "opening the picker must remain read-only"
+        );
+    }
+
+    #[test]
     fn proposal_scopes_are_derived_from_tracked_directories() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("src/nested")).unwrap();
@@ -1490,6 +1613,35 @@ mod tests {
         assert!(labels.contains(&"src"));
         assert!(labels.contains(&"src/nested"));
         assert!(!labels.iter().any(|label| label.contains(".code-sanity")));
+    }
+
+    #[test]
+    fn proposal_scopes_do_not_disappear_when_projection_is_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("dangerous")).unwrap();
+        std::fs::create_dir_all(temp.path().join("neutral")).unwrap();
+        std::fs::write(temp.path().join("dangerous/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(temp.path().join("neutral/b.rs"), "fn b() {}\n").unwrap();
+        crate::index::index_workspace(temp.path()).unwrap();
+
+        let layout = Layout::new(temp.path());
+        let mut config = Config::load_or_default(&layout).unwrap();
+        config.sanitizer.dictionary.clear();
+        config.sanitizer.alias_registry.clear();
+        config.sanitizer.path_alias_registry.clear();
+        config.sanitizer.denylist.clear();
+        config
+            .sanitizer
+            .dictionary
+            .insert("dangerous".to_string(), "neutral".to_string());
+        config.save(&layout).unwrap();
+
+        let labels = proposal_scopes(temp.path())
+            .into_iter()
+            .map(|scope| scope.label)
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"dangerous".to_string()));
+        assert!(labels.contains(&"neutral".to_string()));
     }
 
     #[test]

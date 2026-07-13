@@ -66,10 +66,10 @@ fn spawn_slow_embed_server(delay: Duration, requests: Arc<AtomicUsize>) -> Strin
                     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
                         break;
                     }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        content_length = value.trim().parse().unwrap_or(0);
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
                     }
                 }
                 let mut body = vec![0u8; content_length];
@@ -164,13 +164,17 @@ fn embed_index_converges_under_a_sync_and_edit_storm() {
             }
         });
 
-        // Embedder and reader survive the storm: every call must return Ok
-        // (an Err or a hang here is a lock-ordering failure).
+        // Embedder and reader survive the storm. A search may now fail closed
+        // when the mirror changes after embedding; any other error (or hang)
+        // remains a lock-ordering failure.
         for round in 0..5 {
             embed_index(repo.path())
                 .unwrap_or_else(|err| panic!("embed_index round {round} failed: {err:#}"));
-            let hits = semantic_search(repo.path(), "parser grammar", 2)
-                .unwrap_or_else(|err| panic!("semantic_search round {round} failed: {err:#}"));
+            let hits = match semantic_search(repo.path(), "parser grammar", 2) {
+                Ok(hits) => hits,
+                Err(err) if err.to_string().contains("vector index is stale") => continue,
+                Err(err) => panic!("semantic_search round {round} failed: {err:#}"),
+            };
             for hit in hits {
                 assert!(
                     !hit.preview.to_lowercase().contains("dangerous"),

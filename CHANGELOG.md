@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-13
+
+### Added
+
+- Agent-facing directory names and filename stems now use a deterministic,
+  reversible sanitizer projection across the physical mirror, provider
+  payloads, TUI/review output, MCP/semantic reads, strict worktrees, patches,
+  transactions, search, audit, and verification. `project-path` exposes the
+  current spelling to adapters.
+- Proposal providers now receive first-class directory/filename-stem candidates
+  and may return `category: "file_path"` with a stable `path_id`. Approved
+  terms enter a separate path-only registry, migrate the projected mirror, and
+  never rename real files or rewrite their source. A dedicated deduplicated,
+  batched path-only pass covers oversized files without sending their source.
+- Proposal reports expose semantic eligibility/exclusion counts so recall loss
+  is visible independently of model output.
+- The TUI event log now shows semantic eligibility and the first concrete
+  proposal-rejection reasons instead of only aggregate queue totals.
+- Objective-C++ indexing now merges C++ and Objective-C syntax trees with a
+  byte-stable C++ projection for method bodies, preserving both selectors and
+  body-local C++ declarations/references.
+- C-family alias approval persists clangd-backed header/definition/call links
+  and invalidates the projection on participating-source drift.
+- Lexical policy and accepted symbol-scoped aliases now compose into one
+  physical mirror and span map. Semantic reads/searches expose projected names,
+  paths, ranges, and offsets without leaking the real coordinate system.
+- Patch-created files and structured node edits back-project references to
+  accepted aliases while rejecting ambiguous new declarations that reuse an
+  existing alias.
+
+### Changed
+
+- Index validates workspace-wide file/directory and ASCII case-insensitive path
+  collisions before writing. Alias-policy migrations preserve pending edits,
+  hide stale physical paths, and move them only after a force pass has stashed
+  any unprojected content.
+- The TUI proposal-scope dropdown discovers indexable directories before the
+  first index and no longer collapses to only `Entire workspace` when the
+  current path projection cannot be built.
+- Proposal recall is now symbol-ID scoped: same-spelling symbols in different
+  files no longer suppress each other, unresolved names are checked inside the
+  candidate's lexical function scope, compiler-resolvable C++/ObjC++ symbols
+  remain eligible for approval-time closure, rejected alternatives remain retryable, category drift is
+  recovered from typed targets, and generic external-API prefix overlap is a
+  review warning rather than an automatic rejection. Content, semantic, and
+  path allowlists are independent.
+- LLM proposal parsing preserves valid siblings when one object has a malformed
+  target, normalizes typed targets with harmless extra fields, and retries one
+  invalid JSON/schema response before recording a chunk error.
+- The C++ resolver is declarator- and scope-aware: it handles shadowing,
+  qualified/member lookup, receiver and smart-pointer types, overload
+  signatures/arity/literals, constructors, templates, structured bindings,
+  namespace aliases, declaration/definition parameter-name and default-value
+  differences, Objective-C properties/selectors, and explicit external occurrences.
+  Resolver-version reindexing preserves accepted aliases and pending review
+  IDs even when fresh declarations are coalesced, while fresh qualified names
+  and binding decisions replace stale resolver output instead of preserving
+  historical false-positive bindings.
+- Non-local Rust and C-family proposal approvals require a complete persisted
+  language-server reference closure. Drift makes the group stale and an index
+  pass automatically reapplies the reviewed alias only after closure succeeds.
+  Cached language-server clients are restarted when the indexed document
+  fingerprint changes, so newly-created modules cannot be omitted by a stale
+  workspace snapshot.
+- C-family approval no longer treats the syntax occurrence count as a lower
+  bound for `clangd`: a quiescent compiler result may disprove a legacy
+  same-file receiver binding, but only when the current resolver independently
+  assigns the occurrence elsewhere and it is outside preprocessor branches.
+  Implementation-file `static` functions use an exact syntax closure even when
+  their build macro is disabled; header-local symbols and genuinely omitted
+  references continue to fail closed. Approval errors include the review ID.
+- Nested JavaScript/TypeScript, Python, and Rust function declarations now use
+  their enclosing callable as a syntax-proven lexical closure, so helpers
+  inside an IIFE or function can be approved without a language server.
+  Top-level functions and class/member APIs remain non-local and fail closed;
+  stored `java-script`/`type-script` language IDs are also decoded correctly.
+- Review decisions survive queue pruning, stale targets are retired during
+  indexing, and selected bulk approvals preflight all deterministic and LSP
+  requirements before applying the first decision. Header declarations and
+  implementation definitions share one alias owner; legacy split aliases are
+  reconverged onto the header contract during indexing.
+- Bulk approval now batches translation-unit-local detection and language-server
+  reference requests, opens each document once, validates large LSP sets in
+  bounded windows, atomically admits the complete compiler-closure batch, and
+  commits config, semantic aliases, mirror refreshes, review history, and the
+  decision ledger once per selection. Obsolete alternatives, aliases that
+  became invalid, cross-category collisions, and incomplete closures are
+  deterministically retired instead of aborting every selected proposal.
+  Approval first refreshes an old resolver snapshot, quarantines unsafe legacy
+  aliases and broken compiler components, and refuses pending mirror edits.
+  The TUI reports each validation stage and completed reference-closure count.
+- Bulk validation no longer performs a SQLite lookup for every LSP location,
+  reparses protected identifiers for every proposal, or reparses the semantic
+  workspace for a path-only mirror refresh. The fast path still falls back to
+  a full index whenever source hashes, policy logic, maps, mirrors, or resolver
+  versions do not describe one current snapshot.
+- Semantic search refuses stale vector fingerprints before issuing an HTTP
+  request, and verification checks semantic completeness, injectivity,
+  unresolved collisions, projected syntax, and mirror convergence.
+
 ## [0.4.8] - 2026-07-12
 
 ### Added
@@ -479,7 +579,8 @@ Source-only baseline; never released as a binary.
 - Strict mode (`sh` / `strict-run`) with sanitized command output.
 - Proposal review queue with human approval (`propose-sanitize`, `review`).
 
-[Unreleased]: https://github.com/gfhfyjbr/code-sanity/compare/v0.4.8...HEAD
+[Unreleased]: https://github.com/gfhfyjbr/code-sanity/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.5.0
 [0.4.8]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.8
 [0.4.7]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.7
 [0.4.6]: https://github.com/gfhfyjbr/code-sanity/releases/tag/v0.4.6

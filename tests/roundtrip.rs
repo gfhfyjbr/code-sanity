@@ -233,7 +233,7 @@ fn apply_patch_adjacent_to_replacement_keeps_original_alias() {
 }
 
 #[test]
-fn apply_patch_reverse_maps_bare_alias_in_added_line() {
+fn apply_patch_rejects_existing_alias_as_a_new_declaration() {
     let repo = copy_fixture("basic-rust");
     index_workspace(repo.path()).unwrap();
     let alias = alias_of(repo.path(), "dangerous");
@@ -246,17 +246,15 @@ fn apply_patch_reverse_maps_bare_alias_in_added_line() {
          1\n \
          }}\n"
     );
-    apply_patch_text(repo.path(), &patch).unwrap();
-    // In mirror-speak the alias IS "dangerous": one symbol, one decision. The
-    // added alias is reverse-mapped in the real file and re-sanitized back in
-    // the mirror, so both views stay byte-consistent.
+    let error = apply_patch_text(repo.path(), &patch).unwrap_err();
+    assert!(error.to_string().contains("new declaration"));
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("fn dangerous_parser() -> usize"));
-    assert!(real.contains("let dangerous = 10;"));
+    assert!(!real.contains("let dangerous = 10;"));
     assert!(!real.contains(&format!("let {alias} = 10;")));
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
     assert!(mirror.contains(&format!("fn {alias}_parser() -> usize")));
-    assert!(mirror.contains(&format!("let {alias} = 10;")));
+    assert!(!mirror.contains(&format!("let {alias} = 10;")));
     assert!(verify_workspace(repo.path()).is_ok());
 }
 
@@ -1269,7 +1267,7 @@ fn external_model_proposals_validated_queued_and_applied_on_approval() {
     let script = script_dir.path().join("fake_model.py");
     fs::write(
         &script,
-        "import json,sys\njson.load(sys.stdin)\nprint(json.dumps({\"proposals\":[\n {\"category\":\"identifier\",\"original_text\":\"safe_helper\",\"sanitized_text\":\"assist_helper\",\"confidence\":0.95},\n {\"category\":\"identifier\",\"original_text\":\"safe_helper\",\"sanitized_text\":\"9invalid\",\"confidence\":0.95},\n {\"category\":\"identifier\",\"original_text\":\"ghost_term\",\"sanitized_text\":\"foo\",\"confidence\":0.95}\n]}))\n",
+        "import json,sys\npayload=json.load(sys.stdin)\nif payload.get(\"request_mode\") == \"path-only\":\n print(json.dumps({\"proposals\":[]}))\nelse:\n print(json.dumps({\"proposals\":[\n  {\"category\":\"identifier\",\"original_text\":\"safe_helper\",\"sanitized_text\":\"assist_helper\",\"confidence\":0.95},\n  {\"category\":\"identifier\",\"original_text\":\"safe_helper\",\"sanitized_text\":\"9invalid\",\"confidence\":0.95},\n  {\"category\":\"identifier\",\"original_text\":\"ghost_term\",\"sanitized_text\":\"foo\",\"confidence\":0.95}\n ]}))\n",
     )
     .unwrap();
 
@@ -1319,7 +1317,8 @@ fn external_model_proposals_validated_queued_and_applied_on_approval() {
     assert!(projected.content.contains("fn assist_helper()"));
     assert!(!projected.content.contains("fn safe_helper"));
     let mirror_after = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
-    assert!(mirror_after.contains("fn safe_helper()"));
+    assert!(mirror_after.contains("fn assist_helper()"));
+    assert!(!mirror_after.contains("fn safe_helper()"));
     let real = fs::read_to_string(repo.path().join("src/lib.rs")).unwrap();
     assert!(real.contains("fn safe_helper")); // real symbol untouched
     assert!(verify_workspace(repo.path()).is_ok());

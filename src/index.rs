@@ -11,6 +11,7 @@ use crate::config::{Config, Layout, normalize_rel_path, rel_path};
 use crate::db::{self, IndexState};
 use crate::lock::WorkspaceLock;
 use crate::map::{SpanMap, load_span_map, sha256_hex};
+use crate::path_projection::{PATH_PROJECTION_VERSION, PathProjection, project_rel_path};
 use crate::sanitize::{
     SANITIZER_BEHAVIOR_VERSION, collect_external_identifiers, collect_protected_identifiers,
     sanitize_content,
@@ -141,6 +142,7 @@ fn index_workspace_locked_inner(
 
     struct Candidate {
         rel: PathBuf,
+        projected: PathBuf,
         rel_string: String,
         mtime_ns: i64,
         size: i64,
@@ -184,13 +186,15 @@ fn index_workspace_locked_inner(
             continue;
         }
         let rel = rel_path(root, entry.path())?;
+        let projected = project_rel_path(&rel, &config)?;
         let rel_string = normalize_rel_path(&rel);
+        let projected_string = normalize_rel_path(&projected);
         let metadata = match fs::metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(err) => {
                 report
                     .errors
-                    .push((rel_string.clone(), format!("metadata: {err}")));
+                    .push((projected_string.clone(), format!("metadata: {err}")));
                 seen.insert(rel_string);
                 continue;
             }
@@ -204,7 +208,7 @@ fn index_workspace_locked_inner(
             Err(err) => {
                 report
                     .errors
-                    .push((rel_string.clone(), format!("probe: {err:#}")));
+                    .push((projected_string.clone(), format!("probe: {err:#}")));
                 seen.insert(rel_string);
                 continue;
             }
@@ -216,6 +220,7 @@ fn index_workspace_locked_inner(
             if fast_path_matches(state, mtime, size) {
                 candidates.push(Candidate {
                     rel,
+                    projected,
                     rel_string,
                     mtime_ns: mtime,
                     size,
@@ -236,7 +241,7 @@ fn index_workspace_locked_inner(
             Err(err) => {
                 report
                     .errors
-                    .push((rel_string.clone(), format!("read: {err}")));
+                    .push((projected_string, format!("read: {err}")));
                 seen.insert(rel_string);
                 continue;
             }
@@ -246,6 +251,7 @@ fn index_workspace_locked_inner(
         let external = collect_external_identifiers(&rel, &content);
         candidates.push(Candidate {
             rel,
+            projected,
             rel_string,
             mtime_ns: mtime,
             size,
@@ -261,12 +267,31 @@ fn index_workspace_locked_inner(
         .iter()
         .flat_map(|candidate| candidate.protected.iter().cloned())
         .collect();
+    // Validate reversibility for the complete workspace before writing even
+    // one projected mirror path. This catches both file collisions and two
+    // real directory prefixes collapsing into one agent-facing directory.
+    let path_projection = PathProjection::build(
+        &config,
+        candidates
+            .iter()
+            .map(|candidate| candidate.rel_string.as_str())
+            // A transiently unreadable file keeps its old db/map/mirror
+            // state. Include it in the injectivity proof so a new file can
+            // never take over the same projected path while it is retained.
+            .chain(seen.iter().map(String::as_str)),
+    )?;
+    for candidate in &candidates {
+        debug_assert_eq!(
+            path_projection.projected_for_real(&candidate.rel)?,
+            candidate.projected
+        );
+    }
     let mut declared_in: BTreeMap<String, String> = BTreeMap::new();
     for candidate in &candidates {
         for name in &candidate.protected {
             declared_in
                 .entry(name.clone())
-                .or_insert_with(|| candidate.rel_string.clone());
+                .or_insert_with(|| normalize_rel_path(&candidate.projected));
         }
     }
     refuse_denylist_protected_conflicts(&config, &union, &declared_in)?;
@@ -280,7 +305,7 @@ fn index_workspace_locked_inner(
             !force_mirror
                 && candidate.fast
                 && state.logic_fingerprint == logic
-                && layout.mirror_dir.join(&candidate.rel).exists()
+                && layout.mirror_dir.join(&candidate.projected).exists()
                 && layout.map_path(&candidate.rel).exists()
         });
         if fast_unchanged {
@@ -295,9 +320,10 @@ fn index_workspace_locked_inner(
                 // Became unreadable between pass 1 and here: same skip-and-
                 // report semantics; the rel is already in `seen`.
                 Err(err) => {
-                    report
-                        .errors
-                        .push((candidate.rel_string.clone(), format!("read: {err}")));
+                    report.errors.push((
+                        normalize_rel_path(&candidate.projected),
+                        format!("read: {err}"),
+                    ));
                     continue;
                 }
             },
@@ -323,7 +349,7 @@ fn index_workspace_locked_inner(
             !force_mirror
                 && state.input_sha256 == sha
                 && state.logic_fingerprint == logic
-                && layout.mirror_dir.join(&candidate.rel).exists()
+                && layout.mirror_dir.join(&candidate.projected).exists()
                 && layout.map_path(&candidate.rel).exists()
         });
         if hash_unchanged {
@@ -352,6 +378,7 @@ fn index_workspace_locked_inner(
             &config,
             &mut conn,
             &candidate.rel,
+            &candidate.projected,
             &content,
             state_row,
             &union,
@@ -377,7 +404,14 @@ fn index_workspace_locked_inner(
             // row without `mirror_dir.join("..")` deleting outside the mirror.
             match crate::config::normalize_safe_rel_path(Path::new(&tracked), "mirror") {
                 Ok(rel) => {
-                    remove_if_exists(layout.mirror_dir.join(&rel))?;
+                    let old_projected = load_span_map(&layout.map_path(&rel))
+                        .ok()
+                        .and_then(|map| {
+                            (!map.projected_path.is_empty()).then_some(map.projected_path)
+                        })
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| rel.clone());
+                    remove_if_exists(layout.mirror_dir.join(old_projected))?;
                     remove_if_exists(layout.map_path(&rel))?;
                 }
                 Err(err) => {
@@ -400,20 +434,41 @@ fn index_workspace_locked_inner(
 /// writes sanitized copies outside the mirror, and poisons the stale sweep
 /// into deleting outside `.code-sanity/`.
 fn resolve_repo_rel(root: &Path, layout: &Layout, path: &Path) -> Result<PathBuf> {
-    let candidate = if path.is_absolute() {
-        path.strip_prefix(&layout.mirror_dir)
-            .or_else(|_| path.strip_prefix(root))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "path escapes repo: {} is not under {}",
-                    path.display(),
-                    root.display()
-                )
-            })?
+    enum Spelling {
+        Mirror,
+        RealAbsolute,
+        Relative,
+    }
+    let (candidate, spelling) = if path.is_absolute() {
+        if let Ok(stripped) = path.strip_prefix(&layout.mirror_dir) {
+            (stripped, Spelling::Mirror)
+        } else if let Ok(stripped) = path.strip_prefix(root) {
+            (stripped, Spelling::RealAbsolute)
+        } else {
+            return Err(anyhow::anyhow!(
+                "path escapes repo: {} is not under {}",
+                path.display(),
+                root.display()
+            ));
+        }
     } else {
-        path
+        (path, Spelling::Relative)
     };
-    crate::config::normalize_safe_rel_path(candidate, "repo")
+    let candidate = crate::config::normalize_safe_rel_path(candidate, "repo")?;
+    if matches!(spelling, Spelling::RealAbsolute) && root.join(&candidate).exists() {
+        return Ok(candidate);
+    }
+    let config = Config::load_or_default(layout)?;
+    let conn = db::connect(layout)?;
+    db::check_schema(&conn)?;
+    let projection = PathProjection::from_connection(&config, &conn)?;
+    match projection.real_for_agent(&candidate) {
+        Ok(real) => Ok(real),
+        Err(_) if matches!(spelling, Spelling::Relative) && root.join(&candidate).exists() => {
+            Ok(candidate)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Index one file with the workspace lock held by this call. Force-writes the
@@ -449,8 +504,13 @@ pub fn sync_single_file(root: &Path, rel: &Path) -> Result<IndexReport> {
         // The real file is gone: drop its targets.
         let conn = db::connect(&layout)?;
         let rel_string = normalize_rel_path(&rel);
+        let projected = load_span_map(&layout.map_path(&rel))
+            .ok()
+            .and_then(|map| (!map.projected_path.is_empty()).then_some(map.projected_path))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| rel.clone());
         db::remove_file(&conn, &rel_string)?;
-        remove_if_exists(layout.mirror_dir.join(&rel))?;
+        remove_if_exists(layout.mirror_dir.join(projected))?;
         remove_if_exists(layout.map_path(&rel))?;
         report.removed += 1;
         report.semantic = crate::semantic_store::index_workspace_locked(root, &layout)?;
@@ -517,18 +577,28 @@ pub(crate) fn index_single_file_locked(
     let mut declared_in: BTreeMap<String, String> = BTreeMap::new();
     for state in states.iter().filter(|state| state.rel_path != rel_string) {
         for name in state.protected() {
-            declared_in
-                .entry(name)
-                .or_insert_with(|| state.rel_path.clone());
+            declared_in.entry(name).or_insert_with(|| {
+                project_rel_path(Path::new(&state.rel_path), &config)
+                    .map(|path| normalize_rel_path(&path))
+                    .unwrap_or_else(|_| state.rel_path.clone())
+            });
         }
     }
     for name in &fresh_protected {
-        declared_in
-            .entry(name.clone())
-            .or_insert_with(|| rel_string.clone());
+        declared_in.entry(name.clone()).or_insert_with(|| {
+            project_rel_path(rel, &config)
+                .map(|path| normalize_rel_path(&path))
+                .unwrap_or_else(|_| rel_string.clone())
+        });
     }
     refuse_denylist_protected_conflicts(&config, &union, &declared_in)?;
     let logic = logic_fingerprint(&config, &union);
+    let mut tracked_paths = db::tracked_files(&conn)?;
+    if !tracked_paths.iter().any(|path| path == &rel_string) {
+        tracked_paths.push(rel_string.clone());
+    }
+    let path_projection = PathProjection::build(&config, tracked_paths.iter())?;
+    let projected = path_projection.projected_for_real(rel)?;
 
     let state_row = IndexState {
         rel_path: rel_string,
@@ -545,6 +615,7 @@ pub(crate) fn index_single_file_locked(
         &config,
         &mut conn,
         rel,
+        &projected,
         &content,
         state_row,
         &union,
@@ -584,6 +655,317 @@ fn read_with_stat(path: &Path) -> Result<(String, fs::Metadata)> {
 /// reconvergence later.
 pub(crate) fn reconverge_workspace(root: &Path, layout: &Layout) -> Result<IndexReport> {
     index_workspace_locked(root, layout)
+}
+
+pub(crate) fn pending_mirror_edit_count(layout: &Layout) -> Result<usize> {
+    let conn = db::connect(layout)?;
+    db::check_schema(&conn)?;
+    let mut pending = 0usize;
+    for state in db::all_index_states(&conn)? {
+        let rel = crate::config::normalize_safe_rel_path(
+            Path::new(&state.rel_path),
+            "approval mirror preflight",
+        )?;
+        let map = match load_span_map(&layout.map_path(&rel)) {
+            Ok(map) => map,
+            Err(_) => continue,
+        };
+        let projected = if map.projected_path.is_empty() {
+            rel.clone()
+        } else {
+            crate::config::normalize_safe_rel_path(
+                Path::new(&map.projected_path),
+                "approval projected mirror",
+            )?
+        };
+        let mirror = match fs::read(layout.mirror_dir.join(projected)) {
+            Ok(mirror) => mirror,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                pending += 1;
+                continue;
+            }
+        };
+        let persisted_hash = db::file_hashes(&conn, &state.rel_path)?
+            .map(|(_, sanitized)| sanitized)
+            .unwrap_or(map.sanitized_hash);
+        pending += usize::from(sha256_hex(&mirror) != persisted_hash);
+    }
+    Ok(pending)
+}
+
+/// Cheap approval preflight over persisted state. Unlike a normal incremental
+/// index this does no parsing: it only proves that source bytes, policy logic,
+/// semantic resolver data, maps, and mirrors all describe the same snapshot.
+/// Any mismatch sends the caller through one ordinary index pass before it
+/// resolves proposal targets.
+pub(crate) fn persisted_workspace_is_current(root: &Path, layout: &Layout) -> Result<bool> {
+    let config = Config::load_or_default(layout)?;
+    let conn = db::connect(layout)?;
+    db::check_schema(&conn)?;
+    let states = db::all_index_states(&conn)?;
+    let tracked = db::tracked_files(&conn)?;
+    let state_paths = states
+        .iter()
+        .map(|state| state.rel_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let tracked_paths = tracked.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if state_paths != tracked_paths || !crate::semantic_store::semantic_index_is_current(&conn)? {
+        return Ok(false);
+    }
+
+    let protected_union = states
+        .iter()
+        .flat_map(IndexState::protected)
+        .collect::<BTreeSet<_>>();
+    let logic = logic_fingerprint(&config, &protected_union);
+    let projection = PathProjection::build(&config, tracked.iter())?;
+    for state in &states {
+        if state.logic_fingerprint != logic {
+            return Ok(false);
+        }
+        let rel = crate::config::normalize_safe_rel_path(
+            Path::new(&state.rel_path),
+            "approval index preflight",
+        )?;
+        let content = match fs::read_to_string(root.join(&rel)) {
+            Ok(content) => content,
+            Err(_) => return Ok(false),
+        };
+        if sha256_hex(content.as_bytes()) != state.input_sha256 {
+            return Ok(false);
+        }
+        let map = match load_span_map(&layout.map_path(&rel)) {
+            Ok(map) => map,
+            Err(_) => return Ok(false),
+        };
+        let projected = projection.projected_string_for_real(&state.rel_path)?;
+        if map.original_hash != state.input_sha256 || map.projected_path != projected {
+            return Ok(false);
+        }
+        let mirror = match fs::read(layout.mirror_dir.join(&projected)) {
+            Ok(mirror) => mirror,
+            Err(_) => return Ok(false),
+        };
+        if sha256_hex(&mirror) != map.sanitized_hash {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Re-render and move every tracked mirror after a path-only policy change
+/// without reparsing the semantic workspace. Path aliases cannot change real
+/// content, protected identifiers, or symbol ownership, so the persisted
+/// index state is a safe render input as long as every source hash still
+/// matches. If anything drifted, fall back to the ordinary full index before
+/// writing a single mirror.
+pub(crate) fn reproject_tracked_mirrors_locked(
+    root: &Path,
+    layout: &Layout,
+) -> Result<IndexReport> {
+    let config = Config::load_or_default(layout)?;
+    let mut conn = db::connect(layout)?;
+    db::check_schema(&conn)?;
+    let states = db::all_index_states(&conn)?;
+    let tracked = db::tracked_files(&conn)?;
+    let state_paths = states
+        .iter()
+        .map(|state| state.rel_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let tracked_paths = tracked.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    if state_paths != tracked_paths || !crate::semantic_store::semantic_index_is_current(&conn)? {
+        drop(conn);
+        return index_workspace_locked(root, layout);
+    }
+
+    struct Snapshot {
+        rel: PathBuf,
+        projected: PathBuf,
+        content: String,
+        metadata: fs::Metadata,
+        state: IndexState,
+    }
+
+    let projection = PathProjection::build(&config, tracked.iter())?;
+    let protected_union = states
+        .iter()
+        .flat_map(IndexState::protected)
+        .collect::<BTreeSet<_>>();
+    let mut declared_in = BTreeMap::<String, String>::new();
+    for state in &states {
+        let projected = projection.projected_string_for_real(&state.rel_path)?;
+        for name in state.protected() {
+            declared_in.entry(name).or_insert_with(|| projected.clone());
+        }
+    }
+    refuse_denylist_protected_conflicts(&config, &protected_union, &declared_in)?;
+    let logic = logic_fingerprint(&config, &protected_union);
+
+    let mut snapshots = Vec::with_capacity(states.len());
+    for mut state in states {
+        let rel = crate::config::normalize_safe_rel_path(
+            Path::new(&state.rel_path),
+            "path-only mirror refresh",
+        )?;
+        let (content, metadata) = read_with_stat(&root.join(&rel))?;
+        if sha256_hex(content.as_bytes()) != state.input_sha256 {
+            drop(conn);
+            return index_workspace_locked(root, layout);
+        }
+        state.logic_fingerprint = logic.clone();
+        state.mtime_ns = mtime_ns(&metadata);
+        state.size = metadata.len() as i64;
+        snapshots.push(Snapshot {
+            projected: projection.projected_for_real(&rel)?,
+            rel,
+            content,
+            metadata,
+            state,
+        });
+    }
+
+    let mut report = IndexReport::default();
+    for snapshot in snapshots {
+        debug_assert_eq!(snapshot.state.size, snapshot.metadata.len() as i64);
+        let (outcome, _, stashed) = render_and_store(
+            root,
+            layout,
+            &config,
+            &mut conn,
+            &snapshot.rel,
+            &snapshot.projected,
+            &snapshot.content,
+            snapshot.state,
+            &protected_union,
+            false,
+        )?;
+        if let Some(stash) = stashed {
+            report.stashed.push(stash.display().to_string());
+        }
+        match outcome {
+            FileOutcome::Updated => report.indexed += 1,
+            FileOutcome::Unchanged => report.unchanged += 1,
+            FileOutcome::PendingSkipped => report.pending += 1,
+        }
+    }
+    Ok(report)
+}
+
+/// Re-render tracked mirrors after the semantic index or accepted alias set
+/// changes. This pass never reparses semantics and preserves pending agent
+/// edits; it only makes the persisted mirror/map use the same combined lexical
+/// + symbol-scoped projection as `read_code`.
+pub(crate) fn refresh_semantic_mirrors_locked(root: &Path, layout: &Layout) -> Result<()> {
+    let conn = db::connect(layout)?;
+    db::check_schema(&conn)?;
+    let mut statement = conn
+        .prepare(
+            r#"
+            select distinct occurrence.rel_path
+            from semantic_occurrences occurrence
+            join semantic_aliases alias on alias.symbol_id = occurrence.symbol_id
+            where alias.status = 'accepted'
+            union
+            select distinct file.rel_path
+            from files file
+            join replacements replacement on replacement.file_id = file.id
+            where replacement.policy_source = 'semantic-alias'
+            order by 1
+            "#,
+        )
+        .context("prepare semantic mirror dirty set")?;
+    let candidates = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("query semantic mirror dirty set")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect semantic mirror dirty set")?;
+    drop(statement);
+    refresh_semantic_mirror_paths_locked(root, layout, conn, candidates)
+}
+
+/// Refresh only semantic components changed by one bulk approval. Existing
+/// unrelated aliases already match their maps and must not make an approval
+/// scan the whole historical alias set.
+pub(crate) fn refresh_semantic_mirrors_for_symbols_locked(
+    root: &Path,
+    layout: &Layout,
+    symbol_ids: &BTreeSet<String>,
+) -> Result<()> {
+    if symbol_ids.is_empty() {
+        return Ok(());
+    }
+    let conn = db::connect(layout)?;
+    db::check_schema(&conn)?;
+    let selected = serde_json::to_string(symbol_ids).context("serialize mirror symbol set")?;
+    let mut statement = conn
+        .prepare(
+            r#"
+            with recursive edges(left_id, right_id) as (
+                select canonical_symbol_id, linked_symbol_id from semantic_compiler_links
+                union all
+                select linked_symbol_id, canonical_symbol_id from semantic_compiler_links
+            ), component(symbol_id) as (
+                select value from json_each(?1)
+                union
+                select edge.right_id
+                from edges edge join component on component.symbol_id = edge.left_id
+            )
+            select distinct occurrence.rel_path
+            from semantic_occurrences occurrence
+            join component on component.symbol_id = occurrence.symbol_id
+            join semantic_aliases alias on alias.symbol_id = occurrence.symbol_id
+            where alias.status = 'accepted'
+            union
+            select distinct file.rel_path
+            from files file
+            join replacements replacement on replacement.file_id = file.id
+            join component
+              on replacement.stable_key like 'semantic:' || component.symbol_id || ':%'
+            where replacement.policy_source = 'semantic-alias'
+            order by 1
+            "#,
+        )
+        .context("prepare targeted semantic mirror dirty set")?;
+    let candidates = statement
+        .query_map([selected], |row| row.get::<_, String>(0))
+        .context("query targeted semantic mirror dirty set")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect targeted semantic mirror dirty set")?;
+    drop(statement);
+    refresh_semantic_mirror_paths_locked(root, layout, conn, candidates)
+}
+
+fn refresh_semantic_mirror_paths_locked(
+    root: &Path,
+    layout: &Layout,
+    conn: rusqlite::Connection,
+    candidates: Vec<String>,
+) -> Result<()> {
+    let mut tracked = Vec::new();
+    for rel in candidates {
+        let rel_path = crate::config::normalize_safe_rel_path(Path::new(&rel), "semantic mirror")?;
+        let matches = load_span_map(&layout.map_path(&rel_path))
+            .ok()
+            .is_some_and(|map| {
+                crate::semantic_store::semantic_projection_matches_map(&conn, &rel, &map)
+                    .unwrap_or(false)
+            });
+        if !matches {
+            tracked.push(rel);
+        }
+    }
+    drop(conn);
+    for rel in tracked {
+        let rel = crate::config::normalize_safe_rel_path(Path::new(&rel), "semantic mirror")?;
+        if fs::read_to_string(root.join(&rel)).is_err() {
+            // The main index pass already reported the unreadable file and
+            // deliberately preserved its previous mirror/map.
+            continue;
+        }
+        let _ = index_single_file_locked(root, layout, &rel, false)?;
+    }
+    Ok(())
 }
 
 /// The repo-wide protected identifier union as last indexed.
@@ -645,9 +1027,11 @@ pub(crate) fn logic_fingerprint(config: &Config, protected_union: &BTreeSet<Stri
     denylist.sort();
     let payload = serde_json::json!({
         "behavior": SANITIZER_BEHAVIOR_VERSION,
+        "path_behavior": PATH_PROJECTION_VERSION,
         "salt": config.salt,
         "dictionary": config.sanitizer.dictionary,
         "alias_registry": config.sanitizer.alias_registry,
+        "path_alias_registry": config.sanitizer.path_alias_registry,
         "allowlist": allowlist,
         "denylist": denylist,
         "protected": protected_union,
@@ -662,6 +1046,7 @@ fn render_and_store(
     config: &Config,
     conn: &mut rusqlite::Connection,
     rel: &Path,
+    projected_rel: &Path,
     content: &str,
     state: IndexState,
     protected_union: &BTreeSet<String>,
@@ -681,7 +1066,7 @@ fn render_and_store(
              at byte {}; the sanitized mirror would be ambiguous. Choose a different alias \
              for {:?} in .code-sanity/config.toml (or rename the conflicting word), then \
              run `code-sanity sync`",
-            state.rel_path,
+            normalize_rel_path(projected_rel),
             collision.alias,
             collision.term,
             collision.policy_source,
@@ -690,12 +1075,31 @@ fn render_and_store(
             collision.term,
         );
     }
-    let mut rendered = sanitize_content(rel, content, config, protected_union)
+    let lexical = sanitize_content(rel, content, config, protected_union)
         .with_context(|| format!("sanitize {}", rel.display()))?;
+    let mut rendered =
+        crate::semantic_store::merge_semantic_aliases(conn, &state.rel_path, content, lexical)
+            .with_context(|| format!("apply semantic aliases to {}", rel.display()))?;
+    rendered.span_map.projected_path = normalize_rel_path(projected_rel);
 
-    let mirror_path = layout.mirror_dir.join(rel);
     let map_path = layout.map_path(rel);
-    let old_mirror = fs::read_to_string(&mirror_path).ok();
+    let old_map_raw = fs::read_to_string(&map_path).ok();
+    let old_map = old_map_raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<SpanMap>(raw).ok());
+    let old_projected = old_map
+        .as_ref()
+        .and_then(|map| (!map.projected_path.is_empty()).then_some(&map.projected_path))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| rel.to_path_buf());
+    let mirror_path = layout.mirror_dir.join(projected_rel);
+    let old_mirror_path = layout.mirror_dir.join(&old_projected);
+    let active_mirror_path = if old_mirror_path.exists() {
+        &old_mirror_path
+    } else {
+        &mirror_path
+    };
+    let old_mirror = fs::read_to_string(active_mirror_path).ok();
     let db_sanitized_hash = db::file_hashes(conn, &state.rel_path)?.map(|(_, hash)| hash);
 
     // Pending-edit protection: the agent edited this mirror file and the edit
@@ -738,12 +1142,13 @@ fn render_and_store(
                     .journal_dir
                     .join("discarded")
                     .join(crate::journal::new_journal_id())
-                    .join(rel);
-                crate::fsutil::atomic_write_sync(&stash_path, old)
-                    .with_context(|| format!("stash pending mirror edit for {}", rel.display()))?;
+                    .join(projected_rel);
+                crate::fsutil::atomic_write_sync(&stash_path, old).with_context(|| {
+                    format!("stash pending mirror edit for {}", projected_rel.display())
+                })?;
                 log::info!(
                     "resetting a pending mirror edit for {}; copy kept at {}",
-                    rel.display(),
+                    projected_rel.display(),
                     stash_path.display()
                 );
                 stashed = Some(stash_path);
@@ -758,11 +1163,7 @@ fn render_and_store(
         }
     }
 
-    let old_map_raw = fs::read_to_string(&map_path).ok();
-    if let Some(old_map) = old_map_raw
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<SpanMap>(raw).ok())
-    {
+    if let Some(old_map) = old_map {
         if old_map.original_hash == rendered.span_map.original_hash
             && old_map.sanitized_hash == rendered.span_map.sanitized_hash
             && old_map.replacements == rendered.span_map.replacements
@@ -780,6 +1181,10 @@ fn render_and_store(
     crate::fsutil::atomic_write_if_changed(&map_path, &next_map)
         .with_context(|| format!("write map {}", map_path.display()))?;
     db::upsert_indexed_file(conn, &rendered.span_map, &state)?;
+    if old_mirror_path != mirror_path && old_mirror_path.exists() {
+        remove_if_exists(&old_mirror_path)?;
+        remove_empty_mirror_parents(&old_mirror_path, &layout.mirror_dir)?;
+    }
 
     Ok((
         if unchanged {
@@ -846,6 +1251,42 @@ fn walk_repo(
     Ok(walker)
 }
 
+/// Lightweight source discovery for UI scope selection before the first
+/// index. It follows the exact workspace ignore/binary/size policy but does
+/// not create mirror or database state.
+pub(crate) fn discover_indexable_files(root: &Path, config: &Config) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut first_entry = true;
+    for entry in walk_repo(root, config)? {
+        let is_root_probe = std::mem::take(&mut first_entry);
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) if is_root_probe => {
+                return Err(err).with_context(|| format!("walk repo root {}", root.display()));
+            }
+            Err(_) => continue,
+        };
+        let file_type = entry.file_type();
+        if file_type.is_some_and(|file_type| file_type.is_symlink())
+            || !file_type.is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let rel = rel_path(root, entry.path())?;
+        let Ok(metadata) = fs::metadata(entry.path()) else {
+            continue;
+        };
+        if !matches!(
+            should_skip_file(&rel, entry.path(), &metadata, config),
+            Ok(false)
+        ) {
+            continue;
+        }
+        files.push(rel);
+    }
+    Ok(files)
+}
+
 fn should_skip_file(
     rel: &Path,
     path: &Path,
@@ -888,12 +1329,37 @@ fn is_binary(path: &Path) -> Result<bool> {
     }
 }
 
-fn remove_if_exists(path: PathBuf) -> Result<()> {
-    match fs::remove_file(&path) {
+fn remove_if_exists(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
     }
+}
+
+fn remove_empty_mirror_parents(path: &Path, mirror_root: &Path) -> Result<()> {
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        if directory == mirror_root || !directory.starts_with(mirror_root) {
+            break;
+        }
+        match fs::remove_dir(directory) {
+            Ok(()) => parent = directory.parent(),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("remove empty {}", directory.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_gitignore_entry(root: &Path, entry: &str) -> Result<()> {
@@ -959,5 +1425,50 @@ mod tests {
         bytes.push(0xC3);
         fs::write(&path, bytes).unwrap();
         assert!(is_binary(&path).unwrap());
+    }
+
+    #[test]
+    fn approval_preflight_rejects_an_old_semantic_resolver_snapshot() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "fn current_snapshot() -> usize { 1 }\n",
+        )
+        .unwrap();
+        crate::index_workspace(repo.path()).unwrap();
+        let layout = Layout::new(repo.path());
+        assert!(persisted_workspace_is_current(repo.path(), &layout).unwrap());
+        let mirror_path = layout.mirror_dir.join("src/lib.rs");
+        let mirror = fs::read(&mirror_path).unwrap();
+        let mut edited = mirror.clone();
+        edited.extend_from_slice(b"// pending agent edit\n");
+        fs::write(&mirror_path, edited).unwrap();
+        assert_eq!(pending_mirror_edit_count(&layout).unwrap(), 1);
+        assert!(!persisted_workspace_is_current(repo.path(), &layout).unwrap());
+        fs::write(&mirror_path, mirror).unwrap();
+        assert_eq!(pending_mirror_edit_count(&layout).unwrap(), 0);
+
+        let conn = db::connect(&layout).unwrap();
+        let raw = conn
+            .query_row(
+                "select capabilities_json from semantic_documents where rel_path = 'src/lib.rs'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let mut capabilities =
+            serde_json::from_str::<crate::semantic::BackendCapabilities>(&raw).unwrap();
+        capabilities.resolver_version = 0;
+        conn.execute(
+            "update semantic_documents set capabilities_json = ?1 where rel_path = 'src/lib.rs'",
+            [serde_json::to_string(&capabilities).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(!persisted_workspace_is_current(repo.path(), &layout).unwrap());
+        crate::index_workspace(repo.path()).unwrap();
+        assert!(persisted_workspace_is_current(repo.path(), &layout).unwrap());
     }
 }

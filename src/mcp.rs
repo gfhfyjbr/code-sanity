@@ -569,21 +569,36 @@ fn call_tool(root: &Path, name: &str, args: &Value) -> Result<ToolOutput> {
             let query = required_str(args, "query")?;
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
             with_semantic_read(root, |conn| {
-                let symbols = crate::semantic_store::find_symbols(conn, &query, limit)?;
+                let symbols = crate::semantic_store::find_symbols(conn, root, &query, limit)?;
+                let layout = crate::config::Layout::new(root);
+                let config = crate::config::Config::load_or_default(&layout)?;
+                let projection =
+                    crate::path_projection::PathProjection::from_connection(&config, conn)?;
                 ToolOutput::structured(json!({
                     "revision": crate::semantic_store::current_revision(conn)?,
-                    "symbols": symbols.into_iter().map(|(path, symbol)| json!({
-                        "path": path,
-                        "symbol": symbol,
-                    })).collect::<Vec<_>>()
+                    "symbols": symbols.into_iter().map(|(path, symbol)| {
+                        Ok(json!({
+                            "path": projection.projected_string_for_real(&path)?,
+                            "symbol": symbol,
+                        }))
+                    }).collect::<Result<Vec<_>>>()?
                 }))
             })
         }
         "read_code" => {
             let path = required_str(args, "path")?;
             with_semantic_read(root, |conn| {
-                let projected = crate::semantic_store::project_document(conn, root, &path)?;
-                ToolOutput::structured(serde_json::to_value(projected)?)
+                let path =
+                    crate::config::normalize_safe_rel_path(Path::new(&path), "read_code path")?;
+                let layout = crate::config::Layout::new(root);
+                let config = crate::config::Config::load_or_default(&layout)?;
+                let projection =
+                    crate::path_projection::PathProjection::from_connection(&config, conn)?;
+                let real = projection.real_for_agent(&path)?;
+                let rel = crate::config::normalize_rel_path(&real);
+                let mut document = crate::semantic_store::project_document(conn, root, &rel)?;
+                document.rel_path = projection.projected_string_for_real(&rel)?;
+                ToolOutput::structured(serde_json::to_value(document)?)
             })
         }
         "references" => {
@@ -697,7 +712,7 @@ fn semantic_references(root: &Path, symbol_id: &str) -> Result<ToolOutput> {
         )
     };
     let rel = crate::config::normalize_safe_rel_path(Path::new(&rel_path), "symbol path")?;
-    let locations = crate::lsp::references(
+    let mut locations = crate::lsp::references(
         root,
         &rel,
         &source,
@@ -711,6 +726,33 @@ fn semantic_references(root: &Path, symbol_id: &str) -> Result<ToolOutput> {
         let current = crate::semantic_store::current_revision(&conn)?;
         if current != revision {
             bail!("stale semantic revision: expected {revision}, current {current}");
+        }
+        let config = crate::config::Config::load_or_default(&layout)?;
+        let projection = crate::path_projection::PathProjection::from_connection(&config, &conn)?;
+        for location in &mut locations {
+            let real_path = location.rel_path.clone();
+            let real = crate::config::normalize_safe_rel_path(
+                Path::new(&real_path),
+                "compiler reference path",
+            )?;
+            let map = crate::map::load_span_map(&layout.map_path(&real))
+                .with_context(|| format!("load projected compiler reference map {real_path}"))?;
+            let projected_path = projection.projected_for_real(&real)?;
+            let projected_content = std::fs::read_to_string(
+                layout.mirror_dir.join(&projected_path),
+            )
+            .with_context(|| {
+                format!(
+                    "read projected compiler reference {}",
+                    projected_path.display()
+                )
+            })?;
+            location.range = crate::semantic_store::project_text_range(
+                &map,
+                &projected_content,
+                &location.range,
+            )?;
+            location.rel_path = crate::config::normalize_rel_path(&projected_path);
         }
     }
     ToolOutput::structured(json!({

@@ -18,12 +18,12 @@ semantics from a reviewer or scanner is an explicit non-goal.
 The real repository is always the source of truth. The mirror is a derived,
 regenerable view.
 
-There are now two explicit projection contracts. Legacy v1 mirror tools apply
-the lexical privacy policy described below, including prose. Semantic v2
-`read_code` changes only identifier occurrences bound to an accepted
-`symbol_id`; it deliberately leaves comments and string literals unchanged so
-an edit agent never mistakes prose replacement for a code symbol. Do not use
-v2 alone when raw comment/string privacy is the primary requirement.
+There is one materialized agent projection. The lexical privacy policy applies
+first, including prose; accepted semantic aliases then overlay only identifier
+occurrences bound to an accepted `symbol_id`. Legacy mirror readers and
+semantic v2 `read_code` consume the same bytes. V2 adds projected AST metadata
+and structured mutation, but never promotes comments or strings into symbol
+references.
 
 ## Assets
 
@@ -38,11 +38,15 @@ Protected (kept out of the agent-facing mirror where policy allows):
   also catches `ACME_CLIENT` and `acmeClientFactory`);
 - denylisted terms (replaced immediately with deterministic salted aliases,
   even before a human approves a nicer name);
-- provocative/toxic lexicon normalized to neutral wording.
+- provocative/toxic lexicon normalized to neutral wording;
+- configured terms in agent-facing directory names and filename stems; the
+  complete tracked path map must remain reversible.
 
 Deliberately **not** hidden (behavior must remain legible):
 
-- control flow, imports/exports, module paths, filenames;
+- control flow, imports/exports, and behavior-bearing include/module-path text
+  inside source;
+- filename extensions, which remain stable for language and tool dispatch;
 - public API names — the repo-wide protected identifier set (public
   declarations, import-position names, code dunders; collected from code
   positions only, never from prose/comments/strings) keeps one decision per
@@ -137,10 +141,17 @@ The process dies after real files start changing.
 ### 7. Model proposal error
 A model proposes an unsafe or wrong alias.
 - **Mitigation:** the model never writes the mirror. Proposals are schema- and
-  policy-validated (allowlist, denylist-in-output, identifier validity, public-API
-  guard, confidence threshold) and queued for human review; approval re-validates
-  and records a deterministic alias. `index`/`verify` use only the deterministic
-  engine. Executing a repo-supplied provider command requires an explicit
+  policy-validated (typed semantic/path target IDs, surface-specific allowlist,
+  denylist-in-output, identifier validity, public-API guard, path-map
+  reversibility, confidence threshold) and queued for human review. Approval
+  re-validates and records either a symbol-scoped alias or a path-only alias;
+  neither lets the model write. A non-local Rust or C-family identifier
+  additionally requires a stable `rust-analyzer`/`clangd` reference result and
+  persists exact compiler bindings across declarations and uses. Drift marks
+  the whole alias group stale; `index` projects it again only after a complete
+  fresh closure. Syntax ambiguity and incomplete compiler results fail closed.
+  `index`/`verify` use only the deterministic engine.
+  Executing a repo-supplied provider command requires an explicit
   `--allow-provider-command`, runs with concurrent pipe I/O, and is killed on
   timeout.
 - **Residual risk:** a human can approve a bad alias; the audit (`review-sanitize`)
@@ -149,10 +160,14 @@ A model proposes an unsafe or wrong alias.
 
 ### 7a. Repo-local config exfiltrates real content via the LLM provider
 The `llm`/`openrouter`/`kou-router` proposal providers pre-redact terms already
-covered by the deterministic dictionary/registry, then POST the **remaining
-real file content** to the endpoint named in repo-local `config.toml`. Large
-files are sent in line-aligned chunks: the owned analysis region and overlap
-context are separate payload fields, but both contain real source. A malicious
+covered by deterministic content policy, then POST the **remaining real file
+content** and a separate projected path inventory to the endpoint named in
+repo-local `config.toml`. Large files are sent in line-aligned chunks: the owned
+analysis region and overlap context are separate payload fields, but both
+contain real source. Path-only requests contain no source and batch unique
+directory/filename-stem candidates from the selected scope. Files above
+`propose_max_file_bytes` send no source body or semantic candidates, but their
+paths remain in that inventory. A malicious
 or tampered config could point that at an attacker's server.
 - **Mitigation:** running any endpoint provider requires the explicit
   `--allow-provider-endpoint` confirmation naming the URL (for every kind,
@@ -201,13 +216,37 @@ If a configured alias also occurs naturally in the real repo, the mirror
 becomes non-injective: the natural word is indistinguishable from the alias,
 reads mislead, and an agent-typed word reverse-maps into the real term
 (silent corruption of agent intent).
-- **Mitigation:** alias collisions are hard errors at index, verify, patch
+- **Mitigation:** lexical and semantic alias collisions are hard errors at index, verify, patch
   (conflict, exit 2), rename, and proposal-approval time; config load/save
   rejects non-injective or self-sanitizable alias sets and unmatchable
   multi-token terms; default dictionary aliases carry a per-workspace salted
   suffix so natural collisions are practically impossible.
 - **Residual risk:** a legacy workspace keeps its human-chosen aliases until
   the first post-upgrade sync surfaces any collision as an actionable error.
+
+### 8d. A real filename biases the model or two paths collapse after sanitization
+A private or provocative filename can cause false semantic framing even when
+the file content is benign. Independently, two different real paths could map
+to the same sanitized spelling and make edits ambiguous.
+- **Mitigation:** every directory component and filename stem in the physical
+  mirror and all agent-facing path fields is deterministically projected with
+  the configured term table. The proposal provider receives that projected
+  `rel` plus independently typed `path_candidates`; a `file_path` result must
+  copy a current `path_id` and survive local policy and collision validation.
+  Approval writes only `sanitizer.path_alias_registry`, never source content or
+  the real filesystem name. The provider cannot apply its own answer.
+  Before any mirror write, index proves a bidirectional mapping for every
+  tracked file and directory prefix and rejects file/directory or ASCII
+  case-insensitive collisions. Reads, searches, strict worktrees, reviews,
+  semantic results, and patch reports require membership in the current map;
+  stale or planted physical files are not exposed.
+- **Residual risk:** before the first mapping is approved, an unknown raw term
+  remains visible in the projected path and in its path-proposal candidate. The
+  extension and behavior-bearing include/module strings inside source are
+  preserved; raw filenames also remain in the real repo and internal state
+  identities. A policy change can leave a pending edit at its old physical
+  mirror path until `sync --force` stashes and migrates it, but that stale path
+  is withheld from agent-facing reads in the meantime.
 
 ### 9. Sanitization breaks the code
 A replacement produces invalid code or renames a public symbol.
@@ -242,26 +281,28 @@ term visible.
 ## Guarantees vs non-guarantees
 
 **Guarantees**
-- `sanitize(real)` is deterministic and equals the mirror after `index`/`sync`
-  (checked by `verify`).
+- The deterministic combined lexical + accepted-semantic projection of real
+  source equals the mirror after `index`/`sync` (checked by `verify`).
 - The patch bridge preserves the invariant in both directions for edits outside
   replacement spans: `sanitize(apply_original(patch)) == apply_sanitized(patch)`
   and reverse-projecting the patched mirror reproduces the patched real file
   byte-for-byte — or it conflicts (exit code 2) and leaves the real file
   untouched. Aliases in newly added lines are reverse-mapped to their real
   originals; an ambiguous alias is a conflict.
-- V2 aliases are scoped to one `symbol_id`; same-spelling symbols can have
-  independent decisions, and comments/strings never become references.
-- V1 keeps its legacy global term decision for mirror compatibility.
+- Semantic aliases are scoped to one compiler-linked symbol closure;
+  same-spelling independent symbols can have independent decisions,
+  comments/strings never become references, and all agent readers see the
+  resulting unified mirror.
 - No dictionary/denylist/registry term survives into the mirror outside a
   protected identifier — enforced independently by the `verify` leak backstop.
   Protected identifiers come only from code positions, so no amount of prose,
   comments, or string literals can create one; a **denylisted** term can never
   be a sanctioned residue at all (it is a hard error instead).
 - The model never writes the mirror; only the deterministic engine does.
-- V2 proposal output must reference existing owned symbol/occurrence IDs;
-  invented, ambiguous, external, generated, dependency, and API-boundary
-  targets are rejected locally.
+- V2 proposal output must reference either existing owned symbol/occurrence IDs
+  or a current directory/filename-stem `path_id`; invented, ambiguous, stale,
+  external, generated, dependency, API-boundary, and colliding path targets are
+  rejected locally.
 - Apply intent is journaled (fsync'd) before any real write, and every writer
   holds the workspace flock. A back-projected write preserves the real file's
   permission bits.

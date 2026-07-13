@@ -52,10 +52,10 @@ fn spawn_mock_server_with_status(handler: Arc<StatusHandler>) -> String {
                     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
                         break;
                     }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        content_length = value.trim().parse().unwrap_or(0);
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
                     }
                 }
                 let mut body = vec![0u8; content_length];
@@ -118,6 +118,9 @@ fn targeted_chat_response(request: &Value, proposals: &[(&str, &str, f64)]) -> V
     let user: Value =
         serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
     let candidates = user["context"]["semantic_candidates"].as_array().unwrap();
+    if candidates.is_empty() {
+        return chat_response("{\"proposals\":[]}");
+    }
     let proposals = proposals
         .iter()
         .map(|(original, replacement, confidence)| {
@@ -146,7 +149,7 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
     std::fs::create_dir_all(repo.path().join("src")).unwrap();
     std::fs::write(
         repo.path().join("src/lib.rs"),
-        "// dangerous COMMENT_ONLY_TRIGGER implementation detail\nfn megacorp_client() -> usize {\n    1\n}\n",
+        "// dangerous COMMENT_ONLY_TRIGGER implementation detail\nfn client_count() -> usize {\n    let megacorp_client = 1;\n    megacorp_client\n}\n",
     )
     .unwrap();
     index_workspace(repo.path()).unwrap();
@@ -158,14 +161,38 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
             path.ends_with("/chat/completions"),
             "unexpected path {path}"
         );
-        // The provider must send the real file content to the model.
         let user = request["messages"][1]["content"].as_str().unwrap();
+        let task: Value = serde_json::from_str(user).unwrap();
+        counter.fetch_add(1, Ordering::SeqCst);
+        if task["request_mode"] == "path-only" {
+            assert_eq!(task["file"]["content"], "");
+            assert!(
+                task["context"]["semantic_candidates"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                !task["context"]["path_candidates"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            return chat_response("{\"proposals\":[]}");
+        }
+
+        // Source requests carry real file content but no path inventory.
         assert!(user.contains("megacorp_client"));
         assert!(
             !user.contains("dangerous"),
             "known deterministic terms must be redacted before the provider boundary"
         );
-        let task: Value = serde_json::from_str(user).unwrap();
+        assert!(
+            task["context"]["path_candidates"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             task["file"]["content"]
                 .as_str()
@@ -193,6 +220,12 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
                 .iter()
                 .any(|rule| rule.as_str().unwrap().contains("byte-for-byte"))
         );
+        assert!(task["policy"].get("content_allowlist").is_none());
+        assert!(task["rules"].as_array().unwrap().iter().any(|rule| {
+            rule.as_str()
+                .unwrap()
+                .contains("content allowlist is not a proposal exclusion")
+        }));
         assert!(
             task["required_output_preflight"]
                 .as_array()
@@ -200,7 +233,6 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
                 .iter()
                 .any(|rule| rule.as_str().unwrap().contains("case-sensitive substring"))
         );
-        counter.fetch_add(1, Ordering::SeqCst);
         let candidate = task["context"]["semantic_candidates"]
             .as_array()
             .unwrap()
@@ -268,7 +300,7 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
         },
     )
     .unwrap();
-    assert_eq!(chat_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(chat_requests.load(Ordering::SeqCst), 2);
     assert_eq!(report.proposed, 3);
     assert_eq!(report.queued, 1);
     assert_eq!(report.rejected.len(), 2);
@@ -289,10 +321,119 @@ fn llm_provider_requires_endpoint_confirmation_and_queues_proposals() {
     assert!(!projected.content.contains("megacorp_client"));
     let mirror = read_sanitized_file(repo.path(), Path::new("src/lib.rs")).unwrap();
     assert!(
-        mirror.contains("megacorp_client"),
-        "v1 mirror remains compatible"
+        mirror.contains("examplefirm_client"),
+        "the shared mirror must include the accepted semantic projection"
     );
+    assert!(!mirror.contains("megacorp_client"));
     assert!(code_sanity::verify_workspace(repo.path()).is_ok());
+}
+
+#[test]
+fn llm_can_independently_propose_a_filename_term() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(
+        repo.path().join("src/weaponized_loader.rs"),
+        "fn ordinary_loader() -> usize { 1 }\n",
+    )
+    .unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let base_url = spawn_mock_server(Arc::new(|path: &str, request: &Value| {
+        assert!(path.ends_with("/chat/completions"));
+        let user: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        if user["request_mode"] == "source" {
+            assert_eq!(user["file"]["rel"], "src/weaponized_loader.rs");
+            assert!(
+                user["context"]["path_candidates"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            return chat_response("{\"proposals\":[]}");
+        }
+
+        assert_eq!(user["request_mode"], "path-only");
+        assert_eq!(user["file"]["rel"], "path-inventory");
+        assert_eq!(user["file"]["content"], "");
+        let candidate = user["context"]["path_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["value"] == "weaponized_loader")
+            .expect("filename stem candidate");
+        assert_eq!(candidate["kind"], "filename_stem");
+        assert_eq!(candidate["path"], "src/weaponized_loader.rs");
+        assert!(
+            user["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule.as_str().unwrap().contains("file_path proposal"))
+        );
+        assert!(
+            user["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|rule| { rule.contains("original_text") && rule.contains("file.content") })
+                .all(|rule| rule.contains("identifier")),
+            "source-membership rules must not suppress path-only proposals"
+        );
+        chat_response(
+            &json!({
+                "proposals": [
+                    {
+                        "target": { "path_id": candidate["path_id"] },
+                        "category": "file_path",
+                        "original_text": "weaponized",
+                        "sanitized_text": "1bad-name",
+                        "confidence": 0.99,
+                        "rationale": "invalid first alternative"
+                    },
+                    {
+                        "target": { "path_id": candidate["path_id"] },
+                        "category": "filename",
+                        "original_text": "weaponized",
+                        "sanitized_text": "neutral",
+                        "confidence": 0.96,
+                        "rationale": "risk-loaded filename term"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: false,
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize(
+        repo.path(),
+        Some(Path::new("src/weaponized_loader.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.queued, 1, "{report:?}");
+    assert_eq!(report.rejected.len(), 1, "{report:?}");
+    let reviews = code_sanity::proposal::list_review(repo.path(), false).unwrap();
+    assert_eq!(reviews[0].proposal.category, "file_path");
+    assert!(matches!(
+        reviews[0].proposal.target.as_ref(),
+        Some(code_sanity::proposal::ProposalTarget::FilePath(_))
+    ));
 }
 
 #[test]
@@ -332,8 +473,8 @@ fn json_mode_sends_response_format_opt_in() {
     .unwrap();
     assert_eq!(
         saw_response_format.load(Ordering::SeqCst),
-        1,
-        "json_mode = true must send response_format"
+        2,
+        "json_mode = true must cover source and path-only requests"
     );
 }
 
@@ -385,7 +526,7 @@ fn openrouter_preset_routes_through_the_same_gate_and_client() {
         },
     )
     .unwrap();
-    assert_eq!(chat_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(chat_requests.load(Ordering::SeqCst), 2);
     assert_eq!(report.queued, 1);
 }
 
@@ -626,9 +767,12 @@ fn provider_error_on_one_file_does_not_abort_the_run() {
     // The mock rejects the request that carries bad.rs and answers good.rs.
     let base_url = spawn_mock_server_with_status(Arc::new(|_path: &str, request: &Value| {
         let user = request["messages"][1]["content"].as_str().unwrap_or("");
-        if user.contains("bad.rs") {
+        let task: Value = serde_json::from_str(user).unwrap();
+        if task["request_mode"] == "path-only" {
+            (200, chat_response("{\"proposals\":[]}"))
+        } else if task["file"]["rel"] == "src/bad.rs" {
             (400, json!({ "error": "context overflow" }))
-        } else if user.contains("good.rs") {
+        } else if task["file"]["rel"] == "src/good.rs" {
             (
                 200,
                 targeted_chat_response(request, &[("megacorp_b", "examplefirm_b", 0.95)]),
@@ -755,37 +899,28 @@ fn one_large_file_is_chunked_parallel_and_overlap_findings_are_deduplicated() {
     index_workspace(repo.path()).unwrap();
 
     let requests = Arc::new(AtomicUsize::new(0));
+    let source_requests = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
-    let requests_with_seen = Arc::new(AtomicUsize::new(0));
     let requests_for_handler = Arc::clone(&requests);
+    let source_for_handler = Arc::clone(&source_requests);
     let active_for_handler = Arc::clone(&active);
     let max_for_handler = Arc::clone(&max_active);
-    let seen_for_handler = Arc::clone(&requests_with_seen);
     let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
         requests_for_handler.fetch_add(1, Ordering::SeqCst);
-        let now = active_for_handler.fetch_add(1, Ordering::SeqCst) + 1;
-        max_for_handler.fetch_max(now, Ordering::SeqCst);
         let user: Value =
             serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        if user["request_mode"] == "path-only" {
+            return chat_response("{\"proposals\":[]}");
+        }
+        source_for_handler.fetch_add(1, Ordering::SeqCst);
+        let now = active_for_handler.fetch_add(1, Ordering::SeqCst) + 1;
+        max_for_handler.fetch_max(now, Ordering::SeqCst);
         assert!(user["file"]["chunk"]["total"].as_u64().unwrap() > 1);
         assert!(user["file"]["content"].as_str().unwrap().contains("hwid"));
-        let already_seen = user["context"]["already_decided_symbol_ids"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .next()
-            .is_some();
-        if already_seen {
-            seen_for_handler.fetch_add(1, Ordering::SeqCst);
-        }
         std::thread::sleep(std::time::Duration::from_millis(80));
         active_for_handler.fetch_sub(1, Ordering::SeqCst);
-        if already_seen {
-            chat_response("{\"proposals\":[]}")
-        } else {
-            targeted_chat_response(request, &[("hwid", "device_ref", 0.9)])
-        }
+        targeted_chat_response(request, &[("hwid", "device_ref", 0.9)])
     }));
 
     let layout = Layout::new(repo.path());
@@ -813,13 +948,14 @@ fn one_large_file_is_chunked_parallel_and_overlap_findings_are_deduplicated() {
     )
     .unwrap();
     let request_count = requests.load(Ordering::SeqCst);
+    let source_request_count = source_requests.load(Ordering::SeqCst);
     assert!(request_count > 2);
+    assert_eq!(request_count, source_request_count + 1);
     assert!(max_active.load(Ordering::SeqCst) >= 2);
     assert!(max_active.load(Ordering::SeqCst) <= 3);
-    assert!(requests_with_seen.load(Ordering::SeqCst) > 0);
-    assert_eq!(report.proposed, request_count.min(3));
+    assert_eq!(report.proposed, source_request_count);
     assert_eq!(report.queued, 1);
-    assert_eq!(report.duplicates, request_count.min(3) - 1);
+    assert_eq!(report.duplicates, source_request_count - 1);
     assert_eq!(
         code_sanity::proposal::list_review(repo.path(), false)
             .unwrap()
@@ -941,6 +1077,182 @@ fn repeated_provider_scan_deduplicates_pending_review_items() {
 }
 
 #[test]
+fn same_spelling_symbols_are_proposed_independently_by_symbol_id() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(repo.path().join("src/a.rs"), "fn shadowfax() {}\n").unwrap();
+    std::fs::write(repo.path().join("src/b.rs"), "fn shadowfax() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let source_requests = Arc::new(AtomicUsize::new(0));
+    let source_for_handler = Arc::clone(&source_requests);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
+        let task: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        if task["request_mode"] == "path-only" {
+            return chat_response("{\"proposals\":[]}");
+        }
+        source_for_handler.fetch_add(1, Ordering::SeqCst);
+        let candidate = task["context"]["semantic_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["name"] == "shadowfax")
+            .expect("each same-spelling declaration remains independently eligible");
+        assert!(
+            !task["context"]["already_decided_symbol_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&candidate["symbol_id"]),
+            "a decision for another symbol must not suppress this ID"
+        );
+        let alias = if task["file"]["rel"] == "src/a.rs" {
+            "neutral_a"
+        } else {
+            "neutral_b"
+        };
+        chat_response(
+            &json!({
+                "proposals": [{
+                    "target": {
+                        "symbol_id": candidate["symbol_id"],
+                        "occurrence_id": candidate["occurrence_id"]
+                    },
+                    "category": "identifier",
+                    "original_text": "shadowfax",
+                    "sanitized_text": alias,
+                    "confidence": 0.9
+                }]
+            })
+            .to_string(),
+        )
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: true,
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize_with_progress(
+        repo.path(),
+        Some(Path::new("src")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+        Some(1),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(source_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(report.eligibility.owned_symbols, 2);
+    assert_eq!(report.eligibility.sent_symbol_candidates, 2);
+    assert_eq!(report.queued, 2, "{report:?}");
+    let reviews = code_sanity::proposal::list_review(repo.path(), false).unwrap();
+    let ids = reviews
+        .iter()
+        .map(|item| match item.proposal.target.as_ref().unwrap() {
+            code_sanity::proposal::ProposalTarget::Semantic(target) => target.symbol_id.clone(),
+            code_sanity::proposal::ProposalTarget::FilePath(_) => panic!("unexpected path review"),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
+fn rejected_alias_does_not_suppress_a_later_valid_alias() {
+    let repo = tempfile::tempdir().unwrap();
+    let source = format!(
+        "fn shadowfax() {{}}\n{}fn invoke() {{ shadowfax(); }}\n",
+        (0..30)
+            .map(|index| format!("fn filler_{index}() {{}}\n"))
+            .collect::<String>()
+    );
+    std::fs::write(repo.path().join("lib.rs"), source).unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let candidate_requests = Arc::new(AtomicUsize::new(0));
+    let candidate_for_handler = Arc::clone(&candidate_requests);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
+        let task: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        if task["request_mode"] == "path-only" {
+            return chat_response("{\"proposals\":[]}");
+        }
+        let Some(candidate) = task["context"]["semantic_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["name"] == "shadowfax")
+        else {
+            return chat_response("{\"proposals\":[]}");
+        };
+        let attempt = candidate_for_handler.fetch_add(1, Ordering::SeqCst);
+        let alias = if attempt == 0 {
+            "1invalid"
+        } else {
+            "neutral_helper"
+        };
+        chat_response(
+            &json!({
+                "proposals": [{
+                    "target": {
+                        "symbol_id": candidate["symbol_id"],
+                        "occurrence_id": candidate["occurrence_id"]
+                    },
+                    "category": "identifier",
+                    "original_text": "shadowfax",
+                    "sanitized_text": alias,
+                    "confidence": 0.9
+                }]
+            })
+            .to_string(),
+        )
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.propose_chunk_bytes = 96;
+    config.sanitizer.propose_chunk_overlap_lines = 1;
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: true,
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize_with_progress(
+        repo.path(),
+        Some(Path::new("lib.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+        Some(1),
+        |_| {},
+    )
+    .unwrap();
+    assert!(candidate_requests.load(Ordering::SeqCst) >= 2);
+    assert_eq!(report.queued, 1, "{report:?}");
+    assert!(
+        report
+            .rejected
+            .iter()
+            .any(|reason| reason.contains("valid identifier")),
+        "{report:?}"
+    );
+    let reviews = code_sanity::proposal::list_review(repo.path(), false).unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].proposal.sanitized_text, "neutral_helper");
+}
+
+#[test]
 fn security_adjacent_terms_can_be_proposed_for_review() {
     let repo = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -952,6 +1264,10 @@ fn security_adjacent_terms_can_be_proposed_for_review() {
 
     let base_url = spawn_mock_server(Arc::new(|_path: &str, request: &Value| {
         let user = request["messages"][1]["content"].as_str().unwrap();
+        let task: Value = serde_json::from_str(user).unwrap();
+        if task["request_mode"] == "path-only" {
+            return chat_response("{\"proposals\":[]}");
+        }
         assert!(user.contains("collect_hwid"));
         assert!(user.contains("launcher"));
         assert!(user.contains("public third-party companies"));
@@ -990,7 +1306,7 @@ fn security_adjacent_terms_can_be_proposed_for_review() {
 }
 
 #[test]
-fn oversized_files_are_skipped_with_a_note() {
+fn oversized_files_still_get_path_only_requests() {
     let repo = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(repo.path().join("src")).unwrap();
     std::fs::write(repo.path().join("src/small.rs"), "fn megacorp_small() {}\n").unwrap();
@@ -1006,7 +1322,37 @@ fn oversized_files_are_skipped_with_a_note() {
 
     let chat_requests = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&chat_requests);
-    let base_url = spawn_mock_server(Arc::new(move |_path: &str, _request: &Value| {
+    let saw_large_path = Arc::new(AtomicUsize::new(0));
+    let saw_large_for_handler = Arc::clone(&saw_large_path);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
+        let user: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        if user["request_mode"] == "path-only" {
+            assert_eq!(user["file"]["content"], "");
+            assert_eq!(
+                user["context"]["semantic_candidates"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
+            let candidates = user["context"]["path_candidates"].as_array().unwrap();
+            assert!(!candidates.is_empty());
+            if candidates
+                .iter()
+                .any(|candidate| candidate["path"] == "src/large.rs")
+            {
+                saw_large_for_handler.fetch_add(1, Ordering::SeqCst);
+            }
+        } else {
+            assert_ne!(user["file"]["rel"], "src/large.rs");
+            assert!(
+                user["context"]["path_candidates"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         counter.fetch_add(1, Ordering::SeqCst);
         chat_response("{\"proposals\":[]}")
     }));
@@ -1042,9 +1388,57 @@ fn oversized_files_are_skipped_with_a_note() {
         "{:?}",
         report.skipped
     );
-    // Only the files under the cap were sent (small.rs + the generated
-    // .gitignore tracked by init).
-    assert_eq!(chat_requests.load(Ordering::SeqCst), 2);
+    // Files under the cap send source; a separate deduplicated path-only batch
+    // still covers the oversized file without leaking its content
+    // (small.rs + .gitignore source requests + one path inventory request).
+    assert_eq!(chat_requests.load(Ordering::SeqCst), 3);
+    assert_eq!(saw_large_path.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn malformed_llm_json_is_retried_once_without_losing_the_chunk() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(repo.path().join("main.rs"), "fn shadowfax() {}\n").unwrap();
+    index_workspace(repo.path()).unwrap();
+
+    let source_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_handler = Arc::clone(&source_attempts);
+    let base_url = spawn_mock_server(Arc::new(move |_path: &str, request: &Value| {
+        let task: Value =
+            serde_json::from_str(request["messages"][1]["content"].as_str().unwrap()).unwrap();
+        if task["request_mode"] == "path-only" {
+            return chat_response("{\"proposals\":[]}");
+        }
+        let attempt = attempts_for_handler.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            return chat_response("{\"proposals\":[");
+        }
+        assert!(task.get("retry_instruction").is_some());
+        targeted_chat_response(request, &[("shadowfax", "neutral_helper", 0.9)])
+    }));
+    let layout = Layout::new(repo.path());
+    let mut config = Config::load_or_default(&layout).unwrap();
+    config.sanitizer.provider = ProviderConfig::Llm {
+        base_url,
+        model: "test-model".to_string(),
+        api_key_env: "CODE_SANITY_TEST_KEY_UNSET".to_string(),
+        timeout_secs: Some(5),
+        json_mode: true,
+    };
+    config.save(&layout).unwrap();
+
+    let report = propose_sanitize(
+        repo.path(),
+        Some(Path::new("main.rs")),
+        ProviderAllow {
+            command: false,
+            endpoint: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(source_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.queued, 1);
 }
 
 #[test]

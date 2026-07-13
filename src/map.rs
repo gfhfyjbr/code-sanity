@@ -3,7 +3,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpanMap {
+    /// Real repository-relative path (internal source-of-truth identity).
     pub rel_path: String,
+    /// Agent-facing mirror path. Older maps deserialize with an empty value
+    /// and are migrated on the next index pass.
+    #[serde(default)]
+    pub projected_path: String,
     pub original_hash: String,
     pub sanitized_hash: String,
     pub original_size: usize,
@@ -162,6 +167,7 @@ pub fn render_with_map(
 
     let span_map = SpanMap {
         rel_path: rel_path.to_string(),
+        projected_path: rel_path.to_string(),
         original_hash: sha256_hex(original.as_bytes()),
         sanitized_hash: sha256_hex(sanitized.as_bytes()),
         original_size: original.len(),

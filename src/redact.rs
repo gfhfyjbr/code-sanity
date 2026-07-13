@@ -13,13 +13,17 @@
 use crate::config::{Config, Layout};
 use crate::db;
 use crate::map::load_span_map;
-use crate::sanitize::{Term, normalize_term, sanitize_run_text, term_table, word_runs};
+use crate::sanitize::{
+    Term, normalize_term, path_term_table, sanitize_run_text, sanitize_unprotected_text,
+    term_table, word_runs,
+};
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::Path;
 
 pub struct Redactor {
     terms: Vec<Term>,
+    path_only_terms: Vec<Term>,
     protected: BTreeSet<String>,
 }
 
@@ -30,7 +34,47 @@ impl Redactor {
     pub fn terms_only(config: &Config) -> Self {
         Self {
             terms: term_table(config),
+            path_only_terms: Vec::new(),
             protected: BTreeSet::new(),
+        }
+    }
+
+    /// Extend a redactor with accepted symbol-scoped aliases. This is used at
+    /// every outbound boundary that starts from real source rather than the
+    /// already-rendered unified mirror.
+    pub fn with_semantic_aliases(mut self, conn: &rusqlite::Connection) -> Result<Self> {
+        let pairs = crate::semantic_store::accepted_alias_pairs(conn)?
+            .into_iter()
+            .map(|pair| (pair.original, pair.alias));
+        self.add_alias_pairs(pairs);
+        Ok(self)
+    }
+
+    pub fn with_alias_pairs(mut self, pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.add_alias_pairs(pairs);
+        self
+    }
+
+    fn add_alias_pairs(&mut self, pairs: impl IntoIterator<Item = (String, String)>) {
+        let mut seen = self
+            .terms
+            .iter()
+            .map(|term| term.normalized.clone())
+            .collect::<BTreeSet<_>>();
+        for (original, alias) in pairs {
+            let normalized = normalize_term(&original);
+            if normalized.len() < 2
+                || normalized == normalize_term(&alias)
+                || !seen.insert(normalized.clone())
+            {
+                continue;
+            }
+            self.terms.push(Term {
+                raw: original,
+                normalized,
+                replacement: alias,
+                policy_source: "semantic-alias",
+            });
         }
     }
 
@@ -51,6 +95,10 @@ impl Redactor {
         db::check_schema(&conn)?;
 
         let mut terms = term_table(&config);
+        let path_only_terms = path_term_table(&config)
+            .into_iter()
+            .filter(|term| term.policy_source == "path-alias-registry")
+            .collect();
         let mut seen: BTreeSet<String> = terms.iter().map(|term| term.normalized.clone()).collect();
         for file in db::tracked_files(&conn)? {
             let map_path = layout.map_path(Path::new(&file));
@@ -78,31 +126,37 @@ impl Redactor {
             }
         }
         let protected = crate::index::stored_protected_union(&conn)?;
-        Ok(Self { terms, protected })
+        Self {
+            terms,
+            path_only_terms,
+            protected,
+        }
+        .with_semantic_aliases(&conn)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.terms.is_empty()
+        self.terms.is_empty() && self.path_only_terms.is_empty()
     }
 
     /// Redact every term occurrence in `text`, leaving protected identifiers
     /// and keywords verbatim — the same residue rule as the mirror.
     pub fn redact(&self, text: &str) -> String {
-        if self.terms.is_empty() {
+        if self.terms.is_empty() && self.path_only_terms.is_empty() {
             return text.to_string();
         }
-        let mut out = String::with_capacity(text.len());
+        let path_redacted = sanitize_unprotected_text(text, &self.path_only_terms);
+        let mut out = String::with_capacity(path_redacted.len());
         let mut cursor = 0usize;
-        for (run_start, run_end) in word_runs(text) {
-            out.push_str(&text[cursor..run_start]);
+        for (run_start, run_end) in word_runs(&path_redacted) {
+            out.push_str(&path_redacted[cursor..run_start]);
             out.push_str(&sanitize_run_text(
-                &text[run_start..run_end],
+                &path_redacted[run_start..run_end],
                 &self.terms,
                 &self.protected,
             ));
             cursor = run_end;
         }
-        out.push_str(&text[cursor..]);
+        out.push_str(&path_redacted[cursor..]);
         out
     }
 }

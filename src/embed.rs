@@ -22,6 +22,7 @@ use crate::db;
 use crate::llm::OpenAiClient;
 use crate::lock::WorkspaceLock;
 use crate::map::sha256_hex;
+use crate::path_projection::PathProjection;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -136,13 +137,21 @@ pub fn embed_index(root: &Path) -> Result<EmbedReport> {
         }
         tracked
     };
+    let path_projection = PathProjection::build(&config, tracked.iter())?;
 
     for rel in &tracked {
+        let projected = path_projection.projected_for_real(Path::new(rel))?;
         // Short-lived shared lock: read a consistent (mirror content, prior
         // state) pair, then embed without blocking writers.
         let (content, prior) = {
             let _lock = WorkspaceLock::acquire_shared(&layout)?;
-            let content = match std::fs::read_to_string(layout.mirror_dir.join(rel)) {
+            let mirror_path = layout.mirror_dir.join(&projected);
+            crate::search::ensure_existing_path_inside(
+                &mirror_path,
+                &layout.mirror_dir,
+                &projected,
+            )?;
+            let content = match std::fs::read_to_string(&mirror_path) {
                 Ok(content) => content,
                 // Deleted mid-run: the deleter swept its rows under its own
                 // exclusive lock. Anything else is a real error.
@@ -190,7 +199,15 @@ pub fn embed_index(root: &Path) -> Result<EmbedReport> {
                 )
             })
             .collect();
-        if commit_file_embeddings(&layout, &mut conn, rel, &file_sha, &fingerprint, &rows)? {
+        if commit_file_embeddings(
+            &layout,
+            &mut conn,
+            rel,
+            &projected,
+            &file_sha,
+            &fingerprint,
+            &rows,
+        )? {
             report.embedded += 1;
             report.chunks += rows.len();
         } else {
@@ -209,12 +226,15 @@ fn commit_file_embeddings(
     layout: &Layout,
     conn: &mut rusqlite::Connection,
     rel: &str,
+    projected_rel: &Path,
     file_sha: &str,
     fingerprint: &str,
     rows: &[(usize, usize, &str, Vec<u8>)],
 ) -> Result<bool> {
     let _lock = WorkspaceLock::acquire(layout)?;
-    match std::fs::read_to_string(layout.mirror_dir.join(rel)) {
+    let mirror_path = layout.mirror_dir.join(projected_rel);
+    crate::search::ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, projected_rel)?;
+    match std::fs::read_to_string(&mirror_path) {
         Ok(current) if sha256_hex(current.as_bytes()) == file_sha => {
             db::replace_embeddings(conn, rel, file_sha, fingerprint, rows)?;
             Ok(true)
@@ -264,6 +284,22 @@ pub fn semantic_search(root: &Path, query: &str, k: usize) -> Result<Vec<Semanti
                  `code-sanity embed-index` to re-embed before searching"
             );
         }
+        let projection = PathProjection::from_connection(&config, &conn)?;
+        for rel in db::tracked_files(&conn)? {
+            let projected = projection.projected_for_real(Path::new(&rel))?;
+            let mirror = std::fs::read(layout.mirror_dir.join(&projected))
+                .with_context(|| format!("read semantic-search mirror {}", projected.display()))?;
+            let current_hash = sha256_hex(&mirror);
+            let state = db::embedding_state(&conn, &rel)?;
+            if !state.is_some_and(|(hash, stored_fingerprint)| {
+                hash == current_hash && stored_fingerprint == fingerprint
+            }) {
+                bail!(
+                    "vector index is stale for {}; run `code-sanity embed-index` before searching",
+                    crate::config::normalize_rel_path(&projected)
+                );
+            }
+        }
     }
 
     let client = client_for(&config)?;
@@ -275,6 +311,7 @@ pub fn semantic_search(root: &Path, query: &str, k: usize) -> Result<Vec<Semanti
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
     let conn = db::connect(&layout)?;
     db::check_schema(&conn)?;
+    let path_projection = PathProjection::from_connection(&config, &conn)?;
 
     // Top-k selection over a streamed scan: every vector is scored, but only
     // k (score, rowid) pairs are ever held; chunk texts are fetched afterwards
@@ -301,8 +338,7 @@ pub fn semantic_search(root: &Path, query: &str, k: usize) -> Result<Vec<Semanti
 
     let rowids: Vec<i64> = top.iter().map(|(_, rowid)| *rowid).collect();
     let details = db::embedding_chunks_by_rowid(&conn, &rowids)?;
-    Ok(top
-        .iter()
+    top.iter()
         .zip(details)
         .map(|((score, _), (rel_path, start_line, end_line, text))| {
             let preview = text
@@ -313,15 +349,15 @@ pub fn semantic_search(root: &Path, query: &str, k: usize) -> Result<Vec<Semanti
                 .chars()
                 .take(160)
                 .collect();
-            SemanticMatch {
-                rel_path,
+            Ok(SemanticMatch {
+                rel_path: path_projection.projected_string_for_real(&rel_path)?,
                 start_line,
                 end_line,
                 score: *score,
                 preview,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 pub fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
@@ -408,13 +444,31 @@ mod tests {
         // The mirror moved on after the vectors were computed: refuse.
         std::fs::write(layout.mirror_dir.join("a.txt"), "newer content").unwrap();
         assert!(
-            !commit_file_embeddings(&layout, &mut conn, "a.txt", &file_sha, "fp", &rows).unwrap()
+            !commit_file_embeddings(
+                &layout,
+                &mut conn,
+                "a.txt",
+                Path::new("a.txt"),
+                &file_sha,
+                "fp",
+                &rows,
+            )
+            .unwrap()
         );
         assert!(db::embedding_state(&conn, "a.txt").unwrap().is_none());
         // Mirror matches the snapshot: commit lands.
         std::fs::write(layout.mirror_dir.join("a.txt"), snapshot).unwrap();
         assert!(
-            commit_file_embeddings(&layout, &mut conn, "a.txt", &file_sha, "fp", &rows).unwrap()
+            commit_file_embeddings(
+                &layout,
+                &mut conn,
+                "a.txt",
+                Path::new("a.txt"),
+                &file_sha,
+                "fp",
+                &rows,
+            )
+            .unwrap()
         );
         assert_eq!(
             db::embedding_state(&conn, "a.txt").unwrap(),

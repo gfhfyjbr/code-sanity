@@ -8,6 +8,7 @@ use crate::journal::{
     JournalEntry, JournalStatus, PendingFile, list_journal_entries, new_journal_id, write_journal,
 };
 use crate::map::{SpanMap, common_changed_range, load_span_map, sha256_hex};
+use crate::path_projection::PathProjection;
 use crate::sanitize::{
     Term, adapt_replacement, collect_protected_identifiers, hits_in_run, normalize_term,
     sanitize_content, sanitize_run_text, term_table, word_runs,
@@ -71,6 +72,7 @@ pub(crate) fn commit_real_file_updates_locked(
     root: &Path,
     layout: &Layout,
     updates: &[RealFileUpdate],
+    expected_mirrors: &BTreeMap<String, (PathBuf, String)>,
     agent: Option<String>,
     session_id: Option<String>,
 ) -> Result<PathBuf> {
@@ -88,6 +90,7 @@ pub(crate) fn commit_real_file_updates_locked(
     let planned = updates
         .iter()
         .map(|update| {
+            let rel_string = normalize_rel_path(&update.rel);
             original_patch.push_str(&whole_file_patch(
                 &update.rel,
                 &update.before,
@@ -97,6 +100,7 @@ pub(crate) fn commit_real_file_updates_locked(
                 rel: update.rel.clone(),
                 before: Some(update.before.clone()),
                 op: PlannedOp::Write(update.after.clone()),
+                expected_mirror: expected_mirrors.get(&rel_string).cloned(),
             }
         })
         .collect::<Vec<_>>();
@@ -309,7 +313,7 @@ fn plan_modify(
     original_patch: &mut String,
     files: &mut Vec<String>,
 ) -> Result<()> {
-    let rel = normalize_patch_file_path(&file_patch.new_path, root, layout)
+    let agent_rel = normalize_patch_file_path(&file_patch.new_path, root, layout)
         .or_else(|_| normalize_patch_file_path(&file_patch.old_path, root, layout))
         .with_context(|| {
             format!(
@@ -317,15 +321,19 @@ fn plan_modify(
                 file_patch.old_path, file_patch.new_path
             )
         })?;
+    let projection = PathProjection::from_connection(config, conn)?;
+    let rel = projection.real_for_agent(&agent_rel)?;
+    let projected_rel = projection.projected_for_real(&rel)?;
     let rel_string = normalize_rel_path(&rel);
+    let display_string = normalize_rel_path(&projected_rel);
     let real_path = root.join(&rel);
-    let mirror_path = layout.mirror_dir.join(&rel);
+    let mirror_path = layout.mirror_dir.join(&projected_rel);
     let map_path = layout.map_path(&rel);
 
     let span_map = load_span_map(&map_path)
         .with_context(|| format!("load span map {}; run index first", map_path.display()))?;
     let (db_original_hash, db_sanitized_hash) = db::file_hashes(conn, &rel_string)?
-        .ok_or_else(|| anyhow!("{rel_string}: file is not tracked; run index first"))?;
+        .ok_or_else(|| anyhow!("{display_string}: file is not tracked; run index first"))?;
     let real_content = fs::read_to_string(&real_path)
         .with_context(|| format!("read real file {}", real_path.display()))?;
     let mirror_content = fs::read_to_string(&mirror_path)
@@ -341,7 +349,7 @@ fn plan_modify(
             patch_text,
             original_patch,
             files,
-            format!("{rel_string}: real file drifted since last index; run `code-sanity sync`"),
+            format!("{display_string}: real file drifted since last index; run `code-sanity sync`"),
         );
     }
     if mirror_hash != db_sanitized_hash || mirror_hash != span_map.sanitized_hash {
@@ -353,7 +361,7 @@ fn plan_modify(
             original_patch,
             files,
             format!(
-                "{rel_string}: sanitized mirror drifted since last index; run `code-sanity sync`"
+                "{display_string}: sanitized mirror drifted since last index; run `code-sanity sync`"
             ),
         );
     }
@@ -368,21 +376,23 @@ fn plan_modify(
                 original_patch,
                 files,
                 format!(
-                    "{rel_string}: patch edits sanitized replacement span at bytes {start}..{end}; automatic apply refused"
+                    "{display_string}: patch edits sanitized replacement span at bytes {start}..{end}; automatic apply refused"
                 ),
             );
         }
     }
 
     let patched_sanitized = apply_file_patch_to_content(&mirror_content, file_patch)
-        .with_context(|| format!("apply sanitized patch to {rel_string}"))?;
+        .with_context(|| format!("apply sanitized patch to {display_string}"))?;
     let stored_union = crate::index::stored_protected_union(conn)?;
+    let semantic_aliases = crate::semantic_store::accepted_alias_pairs(conn)?;
     let original_file_patch = match translate_file_patch(
         file_patch,
         &span_map,
         &mirror_content,
         &patched_sanitized,
         config,
+        &semantic_aliases,
         &stored_union,
     ) {
         Ok(translated) => translated,
@@ -394,12 +404,12 @@ fn plan_modify(
                 patch_text,
                 original_patch,
                 files,
-                format!("{rel_string}: {err:#}"),
+                format!("{display_string}: {err:#}"),
             );
         }
     };
     let patched_original = apply_file_patch_to_content(&real_content, &original_file_patch)
-        .with_context(|| format!("apply translated patch to {rel_string}"))?;
+        .with_context(|| format!("apply translated patch to {display_string}"))?;
     // The patch must not introduce an alias word into REAL content (typically
     // via prose/comment runs that reverse mapping deliberately leaves
     // verbatim): the post-apply mirror would be ambiguous and the reindex of
@@ -416,7 +426,7 @@ fn plan_modify(
             &render_file_patch(&original_file_patch),
             files,
             format!(
-                "{rel_string}: patch would introduce alias word {:?} (alias of {:?}) into the \
+                "{display_string}: patch would introduce alias word {:?} (alias of {:?}) into the \
                  real file; the sanitized view would be ambiguous — use a different word or \
                  change the alias in .code-sanity/config.toml",
                 collision.word, collision.term
@@ -428,8 +438,12 @@ fn plan_modify(
     let fresh_protected = collect_protected_identifiers(&rel, &patched_original);
     let union_after = stored_protected_union_with_override(conn, &rel_string, &fresh_protected)?;
     let rendered_after = sanitize_content(&rel, &patched_original, config, &union_after)
-        .with_context(|| format!("resanitize patched {rel_string}"))?;
-    if rendered_after.sanitized != patched_sanitized {
+        .with_context(|| format!("resanitize patched {display_string}"))?;
+    let semantic_projection = span_map
+        .replacements
+        .iter()
+        .any(|replacement| replacement.policy_source == "semantic-alias");
+    if !semantic_projection && rendered_after.sanitized != patched_sanitized {
         return write_conflict_and_bail(
             layout,
             conn,
@@ -438,7 +452,7 @@ fn plan_modify(
             &render_file_patch(&original_file_patch),
             files,
             format!(
-                "{rel_string}: translated patch does not preserve sanitize(real) == patched mirror invariant"
+                "{display_string}: translated patch does not preserve sanitize(real) == patched mirror invariant"
             ),
         );
     }
@@ -459,11 +473,11 @@ fn plan_modify(
                 patch_text,
                 &render_file_patch(&original_file_patch),
                 files,
-                format!("{rel_string}: corrupt span map during reverse projection: {err:#}"),
+                format!("{display_string}: corrupt span map during reverse projection: {err:#}"),
             );
         }
     };
-    if reverse_projected != patched_original {
+    if !semantic_projection && reverse_projected != patched_original {
         return write_conflict_and_bail(
             layout,
             conn,
@@ -472,17 +486,18 @@ fn plan_modify(
             &render_file_patch(&original_file_patch),
             files,
             format!(
-                "{rel_string}: reverse projection of patched mirror does not reproduce patched real file"
+                "{display_string}: reverse projection of patched mirror does not reproduce patched real file"
             ),
         );
     }
 
     original_patch.push_str(&render_file_patch(&original_file_patch));
-    files.push(rel_string);
+    files.push(normalize_rel_path(&projected_rel));
     planned.push(PlannedFileApply {
         rel,
         before: Some(real_content),
         op: PlannedOp::Write(patched_original),
+        expected_mirror: Some((projected_rel, patched_sanitized)),
     });
     Ok(())
 }
@@ -500,9 +515,14 @@ fn plan_create(
     original_patch: &mut String,
     files: &mut Vec<String>,
 ) -> Result<()> {
-    let rel = normalize_patch_file_path(&file_patch.new_path, root, layout)
+    let agent_rel = normalize_patch_file_path(&file_patch.new_path, root, layout)
         .with_context(|| format!("create target is not inside repo: {}", file_patch.new_path))?;
+    let projection = PathProjection::from_connection(config, conn)?;
+    let (_, containment_candidate) = projection.real_candidate_for_new_agent_path(&agent_rel)?;
+    crate::fsutil::ensure_real_path_containment(root, &containment_candidate)?;
+    let rel = projection.real_for_new_agent_path(&agent_rel, config)?;
     let rel_string = normalize_rel_path(&rel);
+    let display_string = normalize_rel_path(&agent_rel);
     let real_path = root.join(&rel);
 
     if real_path.exists() {
@@ -513,12 +533,12 @@ fn plan_create(
             patch_text,
             original_patch,
             files,
-            format!("{rel_string}: create target already exists; send a modify patch instead"),
+            format!("{display_string}: create target already exists; send a modify patch instead"),
         );
     }
 
     let created = created_content_from_patch(file_patch)
-        .with_context(|| format!("build created content for {rel_string}"))?;
+        .with_context(|| format!("build created content for {display_string}"))?;
     // Same ambiguity guard as plan_modify: a created file containing an alias
     // word would make its own mirror ambiguous.
     let terms_after = crate::sanitize::term_table(config);
@@ -531,21 +551,44 @@ fn plan_create(
             original_patch,
             files,
             format!(
-                "{rel_string}: created file contains alias word {:?} (alias of {:?}); the \
+                "{display_string}: created file contains alias word {:?} (alias of {:?}); the \
                  sanitized view would be ambiguous — use a different word or change the alias",
                 collision.word, collision.term
             ),
         );
     }
-    // A created file's patch is written against the mirror, so the added lines
-    // become the real file directly. The real repo stays the source of truth,
-    // so the new file must already be neutral: sanitize(real) must equal the
-    // content the agent sent, otherwise what they see after create would drift.
-    let fresh_protected = collect_protected_identifiers(&rel, &created);
+    // Resolve accepted symbol aliases in the new agent-authored file before it
+    // becomes real source. Declarations may never reuse an existing alias;
+    // references are mapped through the workspace-wide injective alias table.
+    let semantic_aliases = crate::semantic_store::accepted_alias_pairs(conn)?;
+    let neutral_render = sanitize_content(&rel, &created, config, &BTreeSet::new())
+        .with_context(|| format!("analyze created {display_string}"))?;
+    let reverse = reverse_alias_table(&neutral_render.span_map, config, &semantic_aliases);
+    let mut forward_terms = crate::sanitize::term_table(config);
+    forward_terms.extend(semantic_aliases.iter().map(|pair| Term {
+        raw: pair.original.clone(),
+        normalized: normalize_term(&pair.original),
+        replacement: pair.alias.clone(),
+        policy_source: "semantic-alias",
+    }));
+    let zones = ProseZones::new(&rel, &created);
+    let real_created = reverse_map_new_text(
+        &created,
+        &reverse,
+        &forward_terms,
+        &BTreeSet::new(),
+        &|offset| zones.in_prose(offset),
+        &|offset| zones.in_declaration(offset),
+    )
+    .with_context(|| format!("back-project created {display_string}"))?;
+
+    // The lexical part must already round-trip. Semantic-only differences are
+    // resolved by the semantic reindex/compiler binding refresh after commit.
+    let fresh_protected = collect_protected_identifiers(&rel, &real_created);
     let union_after = stored_protected_union_with_override(conn, &rel_string, &fresh_protected)?;
-    let rendered = sanitize_content(&rel, &created, config, &union_after)
-        .with_context(|| format!("sanitize created {rel_string}"))?;
-    if rendered.sanitized != created {
+    let rendered = sanitize_content(&rel, &real_created, config, &union_after)
+        .with_context(|| format!("sanitize created {display_string}"))?;
+    if semantic_aliases.is_empty() && rendered.sanitized != created {
         return write_conflict_and_bail(
             layout,
             conn,
@@ -554,17 +597,18 @@ fn plan_create(
             original_patch,
             files,
             format!(
-                "{rel_string}: created file contains sanitizable text; create already-neutral content or rename after create"
+                "{display_string}: created file contains sanitizable text; create already-neutral content or rename after create"
             ),
         );
     }
 
     original_patch.push_str(&render_file_patch(file_patch));
-    files.push(rel_string);
+    files.push(normalize_rel_path(&agent_rel));
     planned.push(PlannedFileApply {
         rel,
         before: None,
-        op: PlannedOp::Write(created),
+        op: PlannedOp::Write(real_created),
+        expected_mirror: Some((agent_rel, created)),
     });
     Ok(())
 }
@@ -581,17 +625,22 @@ fn plan_delete(
     original_patch: &mut String,
     files: &mut Vec<String>,
 ) -> Result<()> {
-    let rel = normalize_patch_file_path(&file_patch.old_path, root, layout)
+    let agent_rel = normalize_patch_file_path(&file_patch.old_path, root, layout)
         .with_context(|| format!("delete target is not inside repo: {}", file_patch.old_path))?;
+    let config = Config::load_or_default(layout)?;
+    let projection = PathProjection::from_connection(&config, conn)?;
+    let rel = projection.real_for_agent(&agent_rel)?;
+    let projected_rel = projection.projected_for_real(&rel)?;
     let rel_string = normalize_rel_path(&rel);
+    let display_string = normalize_rel_path(&projected_rel);
     let real_path = root.join(&rel);
-    let mirror_path = layout.mirror_dir.join(&rel);
+    let mirror_path = layout.mirror_dir.join(&projected_rel);
     let map_path = layout.map_path(&rel);
 
     let span_map = load_span_map(&map_path)
         .with_context(|| format!("load span map {}; run index first", map_path.display()))?;
     let (db_original_hash, db_sanitized_hash) = db::file_hashes(conn, &rel_string)?
-        .ok_or_else(|| anyhow!("{rel_string}: file is not tracked; run index first"))?;
+        .ok_or_else(|| anyhow!("{display_string}: file is not tracked; run index first"))?;
     let real_content = fs::read_to_string(&real_path)
         .with_context(|| format!("read real file {}", real_path.display()))?;
     let mirror_content = fs::read_to_string(&mirror_path)
@@ -605,7 +654,7 @@ fn plan_delete(
             patch_text,
             original_patch,
             files,
-            format!("{rel_string}: real file drifted since last index; run `code-sanity sync`"),
+            format!("{display_string}: real file drifted since last index; run `code-sanity sync`"),
         );
     }
     let mirror_hash = sha256_hex(mirror_content.as_bytes());
@@ -618,13 +667,13 @@ fn plan_delete(
             original_patch,
             files,
             format!(
-                "{rel_string}: sanitized mirror drifted since last index; run `code-sanity sync`"
+                "{display_string}: sanitized mirror drifted since last index; run `code-sanity sync`"
             ),
         );
     }
 
     let patched_mirror = apply_file_patch_to_content(&mirror_content, file_patch)
-        .with_context(|| format!("apply delete patch to {rel_string}"))?;
+        .with_context(|| format!("apply delete patch to {display_string}"))?;
     if !patched_mirror.is_empty() {
         return write_conflict_and_bail(
             layout,
@@ -633,16 +682,17 @@ fn plan_delete(
             patch_text,
             original_patch,
             files,
-            format!("{rel_string}: delete patch must remove the entire file"),
+            format!("{display_string}: delete patch must remove the entire file"),
         );
     }
 
     original_patch.push_str(&whole_file_delete_patch(&rel_string, &real_content));
-    files.push(rel_string);
+    files.push(normalize_rel_path(&projected_rel));
     planned.push(PlannedFileApply {
         rel,
         before: Some(real_content),
         op: PlannedOp::Delete,
+        expected_mirror: None,
     });
     Ok(())
 }
@@ -652,16 +702,22 @@ pub fn write_sanitized_content(
     rel_path: &Path,
     sanitized_content: &str,
 ) -> Result<ApplyReport> {
-    let rel_path = normalize_sanitized_rel_path(rel_path)?;
+    let agent_rel = normalize_sanitized_rel_path(rel_path)?;
     // One exclusive lock across read-diff-apply: reading the mirror unlocked
     // would let a concurrent sync change it between the diff and the apply.
     let (layout, _lock) = init_workspace_locked(root)?;
-    let mirror_path = layout.mirror_dir.join(&rel_path);
-    ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, &rel_path)?;
+    let config = Config::load_or_default(&layout)?;
+    let conn = db::connect(&layout)?;
+    db::ensure_schema(&conn)?;
+    let projection = PathProjection::from_connection(&config, &conn)?;
+    let real_rel = projection.real_for_agent(&agent_rel)?;
+    let projected_rel = projection.projected_for_real(&real_rel)?;
+    let mirror_path = layout.mirror_dir.join(&projected_rel);
+    ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, &projected_rel)?;
     let current = fs::read_to_string(&mirror_path).with_context(|| {
         format!(
             "read current sanitized file {}; run `code-sanity index` first",
-            rel_path.display()
+            projected_rel.display()
         )
     })?;
     if current == sanitized_content {
@@ -670,7 +726,7 @@ pub fn write_sanitized_content(
             status: JournalStatus::Success,
             session_id: None,
             agent: None,
-            files: vec![normalize_rel_path(&rel_path)],
+            files: vec![normalize_rel_path(&projected_rel)],
             sanitized_patch: String::new(),
             original_patch: String::new(),
             error: None,
@@ -683,7 +739,7 @@ pub fn write_sanitized_content(
             journal_path: Some(journal_path),
         });
     }
-    let patch = whole_file_patch(&rel_path, &current, sanitized_content);
+    let patch = whole_file_patch(&projected_rel, &current, sanitized_content);
     apply_patch_text_locked(root, &layout, &patch, ApplyOptions::default(), None)
 }
 
@@ -699,17 +755,29 @@ pub fn project_mirror_edit(
     rel_path: &Path,
     options: ApplyOptions,
 ) -> Result<ApplyReport> {
-    let rel = normalize_sanitized_rel_path(rel_path)?;
+    let agent_rel = normalize_sanitized_rel_path(rel_path)?;
     // One exclusive lock across the whole read-refresh-diff-apply sequence: a
     // concurrent sync or edit can neither clobber the captured mirror edit nor
     // interleave with the baseline refresh.
     let (layout, _lock) = init_workspace_locked(root)?;
     crate::journal::ensure_no_interrupted_apply(&layout)?;
-
-    let mirror_path = layout.mirror_dir.join(&rel);
-    ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, &rel)?;
+    let config = Config::load_or_default(&layout)?;
+    let conn = db::connect(&layout)?;
+    db::ensure_schema(&conn)?;
+    let projection = PathProjection::from_connection(&config, &conn)?;
+    let existing_real = projection.real_for_agent(&agent_rel).ok();
+    let projected_rel = match existing_real.as_ref() {
+        Some(real) => projection.projected_for_real(real)?,
+        None => agent_rel.clone(),
+    };
+    let mirror_path = layout.mirror_dir.join(&projected_rel);
+    ensure_existing_path_inside(&mirror_path, &layout.mirror_dir, &projected_rel)?;
     let new_mirror = fs::read_to_string(&mirror_path)
-        .with_context(|| format!("read edited mirror {}", rel.display()))?;
+        .with_context(|| format!("read edited mirror {}", projected_rel.display()))?;
+    let rel = match existing_real {
+        Some(real) => real,
+        None => projection.real_for_new_agent_path(&agent_rel, &config)?,
+    };
     let rel_string = normalize_rel_path(&rel);
 
     let real_path = root.join(&rel);
@@ -717,7 +785,9 @@ pub fn project_mirror_edit(
         // The agent created a new mirror file; route through a create patch so
         // the standard "must already be neutral" create checks apply.
         let line_count = new_mirror.lines().count().max(1);
-        let mut patch = format!("--- /dev/null\n+++ b/{rel_string}\n@@ -0,0 +1,{line_count} @@\n");
+        let projected_string = normalize_rel_path(&projected_rel);
+        let mut patch =
+            format!("--- /dev/null\n+++ b/{projected_string}\n@@ -0,0 +1,{line_count} @@\n");
         for line in new_mirror.lines() {
             patch.push_str(&format!("+{line}\n"));
         }
@@ -729,8 +799,6 @@ pub fn project_mirror_edit(
     // view: blindly diffing against a refreshed baseline would silently revert
     // the external change. Record the edit in a conflict journal entry (the
     // durable copy), reset the mirror to sanitize(real), and refuse.
-    let conn = db::connect(&layout)?;
-    db::ensure_schema(&conn)?;
     let real_content = fs::read_to_string(&real_path)
         .with_context(|| format!("read real file {}", real_path.display()))?;
     let drifted = match db::file_hashes(&conn, &rel_string)? {
@@ -740,19 +808,20 @@ pub fn project_mirror_edit(
     if drifted {
         index_single_file_locked(root, &layout, &rel, true)?;
         let baseline = fs::read_to_string(&mirror_path)
-            .with_context(|| format!("read refreshed mirror {}", rel.display()))?;
-        let recorded_edit = whole_file_patch(&rel, &baseline, &new_mirror);
+            .with_context(|| format!("read refreshed mirror {}", projected_rel.display()))?;
+        let recorded_edit = whole_file_patch(&projected_rel, &baseline, &new_mirror);
         return write_conflict_and_bail(
             &layout,
             &conn,
             &options,
             &recorded_edit,
             "",
-            std::slice::from_ref(&rel_string),
+            std::slice::from_ref(&normalize_rel_path(&projected_rel)),
             format!(
-                "{rel_string}: real file drifted since the mirror edit was made; the edit \
+                "{}: real file drifted since the mirror edit was made; the edit \
                  is recorded in the conflict journal and the mirror was reset to \
-                 sanitize(real) — re-apply it against the fresh mirror"
+                 sanitize(real) — re-apply it against the fresh mirror",
+                normalize_rel_path(&projected_rel)
             ),
         );
     }
@@ -762,7 +831,7 @@ pub fn project_mirror_edit(
     // force reset keeps a durable stash copy of it under journal/discarded/.
     let refreshed = index_single_file_locked(root, &layout, &rel, true)?;
     let baseline = fs::read_to_string(&mirror_path)
-        .with_context(|| format!("read refreshed mirror {}", rel.display()))?;
+        .with_context(|| format!("read refreshed mirror {}", projected_rel.display()))?;
     if baseline == new_mirror {
         // No-op edit: record a Success journal entry for the audit trail.
         let entry = JournalEntry {
@@ -770,7 +839,7 @@ pub fn project_mirror_edit(
             status: JournalStatus::Success,
             session_id: options.session_id.clone(),
             agent: options.agent.clone(),
-            files: vec![rel_string],
+            files: vec![normalize_rel_path(&projected_rel)],
             sanitized_patch: String::new(),
             original_patch: String::new(),
             error: None,
@@ -783,7 +852,7 @@ pub fn project_mirror_edit(
             journal_path: Some(journal_path),
         });
     }
-    let patch = whole_file_patch(&rel, &baseline, &new_mirror);
+    let patch = whole_file_patch(&projected_rel, &baseline, &new_mirror);
     apply_patch_text_locked(root, &layout, &patch, options, None).map_err(|err| {
         match refreshed.stashed.as_ref() {
             Some(stash) => err.context(format!(
@@ -843,16 +912,20 @@ pub fn rename_alias(
         );
     }
 
-    let rel = normalize_sanitized_rel_path(rel_path)?;
+    let agent_rel = normalize_sanitized_rel_path(rel_path)?;
+    let projection = PathProjection::from_connection(&config_for_rename, &conn)?;
+    let rel = projection.real_for_agent(&agent_rel)?;
+    let projected_rel = projection.projected_for_real(&rel)?;
     let rel_string = normalize_rel_path(&rel);
+    let display_string = normalize_rel_path(&projected_rel);
     let real_path = root.join(&rel);
-    let mirror_path = layout.mirror_dir.join(&rel);
+    let mirror_path = layout.mirror_dir.join(&projected_rel);
     let map_path = layout.map_path(&rel);
 
     let span_map = load_span_map(&map_path)
         .with_context(|| format!("load span map {}; run index first", map_path.display()))?;
     let (db_original_hash, db_sanitized_hash) = db::file_hashes(&conn, &rel_string)?
-        .ok_or_else(|| anyhow!("{rel_string}: file is not tracked; run index first"))?;
+        .ok_or_else(|| anyhow!("{display_string}: file is not tracked; run index first"))?;
     let real_content = fs::read_to_string(&real_path)
         .with_context(|| format!("read real file {}", real_path.display()))?;
     let mirror_content = fs::read_to_string(&mirror_path)
@@ -860,7 +933,7 @@ pub fn rename_alias(
     if sha256_hex(real_content.as_bytes()) != db_original_hash
         || sha256_hex(mirror_content.as_bytes()) != db_sanitized_hash
     {
-        bail!("{rel_string}: real or mirror drifted since last index; run `code-sanity sync`");
+        bail!("{display_string}: real or mirror drifted since last index; run `code-sanity sync`");
     }
 
     // Resolve `from` through the span map first: replacement spans record
@@ -877,31 +950,33 @@ pub fn rename_alias(
             // Not an alias in this file: rename a plain (unsanitized) word.
             let (from_start, from_end) =
                 find_whole_word(&mirror_content, from).ok_or_else(|| {
-                    anyhow!("alias {from:?} not found as a whole word in {rel_string}")
+                    anyhow!("alias {from:?} not found as a whole word in {display_string}")
                 })?;
             reverse_sanitized_region(&span_map, &mirror_content, from_start, from_end)
-                .with_context(|| format!("reverse-map {from:?} in {rel_string}"))?
+                .with_context(|| format!("reverse-map {from:?} in {display_string}"))?
         }
         1 => {
             let original = alias_originals.iter().next().expect("one original");
             if find_whole_word(&mirror_content, from).is_none() && !mirror_content.contains(from) {
-                bail!("alias {from:?} not found in {rel_string}");
+                bail!("alias {from:?} not found in {display_string}");
             }
             (*original).to_string()
         }
         _ => bail!(
-            "{rel_string}: alias {from:?} is ambiguous (stands for {} different real \
+            "{display_string}: alias {from:?} is ambiguous (stands for {} different real \
              identifiers); rename is refused",
             alias_originals.len()
         ),
     };
     if real_from == to {
-        bail!("{rel_string}: alias {from:?} already maps to real identifier {to:?}");
+        bail!("{display_string}: alias {from:?} already maps to real identifier {to:?}");
     }
 
     let (next_real, occurrences) = replace_whole_word(&real_content, &real_from, to);
     if occurrences == 0 {
-        bail!("{rel_string}: could not locate real identifier {real_from:?} for alias {from:?}");
+        bail!(
+            "{display_string}: could not locate real identifier {real_from:?} for alias {from:?}"
+        );
     }
 
     let original_patch = whole_file_patch(&rel, &real_content, &next_real);
@@ -910,6 +985,7 @@ pub fn rename_alias(
         rel: rel.clone(),
         before: Some(real_content),
         op: PlannedOp::Write(next_real),
+        expected_mirror: None,
     }];
     let journal_path = commit_planned_apply(
         root,
@@ -918,7 +994,7 @@ pub fn rename_alias(
         &options,
         &note,
         &original_patch,
-        std::slice::from_ref(&rel_string),
+        std::slice::from_ref(&normalize_rel_path(&projected_rel)),
         &planned,
         config_for_rename.journal.max_entries,
         None,
@@ -931,7 +1007,7 @@ pub fn rename_alias(
 
     Ok(RenameReport {
         apply: ApplyReport {
-            files: vec![rel_string],
+            files: vec![normalize_rel_path(&projected_rel)],
             journal_path: Some(journal_path),
         },
         real_from,
@@ -1179,6 +1255,10 @@ struct PlannedFileApply {
     /// Content before this apply, or `None` if the file is being created.
     before: Option<String>,
     op: PlannedOp,
+    /// Exact agent-facing content expected after semantic reindex. Legacy
+    /// renames/structured transactions may leave this unset and rely on their
+    /// own preview invariants.
+    expected_mirror: Option<(PathBuf, String)>,
 }
 
 enum PlannedOp {
@@ -1270,8 +1350,28 @@ fn commit_planned_apply(
                 bail!("simulated apply failure after {} write(s)", idx + 1);
             }
         }
-        crate::semantic_store::index_workspace_locked(root, layout)
+        let semantic = crate::semantic_store::index_workspace_locked(root, layout)
             .context("refresh semantic index after file writes")?;
+        if !semantic.errors.is_empty() {
+            bail!(
+                "semantic projection refresh failed: {}",
+                semantic.errors.join("; ")
+            );
+        }
+        for planned_file in planned {
+            if let Some((projected_rel, expected)) = &planned_file.expected_mirror {
+                let actual = fs::read_to_string(layout.mirror_dir.join(projected_rel))
+                    .with_context(|| {
+                        format!("read projected result {}", projected_rel.display())
+                    })?;
+                if &actual != expected {
+                    bail!(
+                        "{}: committed real source does not reproduce the agent-facing edit after semantic reindex",
+                        projected_rel.display()
+                    );
+                }
+            }
+        }
         Ok(())
     })();
 
@@ -1397,11 +1497,16 @@ fn set_file_state(
         }
         None => {
             let rel_string = normalize_rel_path(rel);
+            let projected_rel = load_span_map(&layout.map_path(rel))
+                .ok()
+                .and_then(|map| (!map.projected_path.is_empty()).then_some(map.projected_path))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| rel.to_path_buf());
             let had_protected = db::all_index_states(conn)?
                 .iter()
                 .any(|state| state.rel_path == rel_string && !state.protected().is_empty());
             remove_file_if_exists(&real_path)?;
-            remove_file_if_exists(&layout.mirror_dir.join(rel))?;
+            remove_file_if_exists(&layout.mirror_dir.join(projected_rel))?;
             remove_file_if_exists(&layout.map_path(rel))?;
             db::remove_file(conn, &rel_string)?;
             Ok(had_protected)
@@ -1816,7 +1921,51 @@ struct ReverseAliases {
     originals: Vec<BTreeSet<String>>,
 }
 
-fn reverse_alias_table(span_map: &SpanMap, config: &Config) -> ReverseAliases {
+/// Back-project one agent-authored fragment using the full projected document
+/// as syntax context. Structured edits use this before planning real-source
+/// byte edits, so aliases in references resolve while strings/comments stay
+/// verbatim and declarations cannot capture an existing projected name.
+pub(crate) fn back_project_agent_fragment(
+    conn: &rusqlite::Connection,
+    config: &Config,
+    rel_path: &Path,
+    projected_document: &str,
+    fragment_start: usize,
+    fragment_end: usize,
+) -> Result<String> {
+    if fragment_start > fragment_end
+        || fragment_end > projected_document.len()
+        || !projected_document.is_char_boundary(fragment_start)
+        || !projected_document.is_char_boundary(fragment_end)
+    {
+        bail!("agent replacement has an invalid projected UTF-8 range");
+    }
+    let lexical = sanitize_content(rel_path, projected_document, config, &BTreeSet::new())?;
+    let semantic_aliases = crate::semantic_store::accepted_alias_pairs(conn)?;
+    let reverse = reverse_alias_table(&lexical.span_map, config, &semantic_aliases);
+    let mut terms = term_table(config);
+    terms.extend(semantic_aliases.iter().map(|pair| Term {
+        raw: pair.original.clone(),
+        normalized: normalize_term(&pair.original),
+        replacement: pair.alias.clone(),
+        policy_source: "semantic-alias",
+    }));
+    let zones = ProseZones::new(rel_path, projected_document);
+    reverse_map_new_text(
+        &projected_document[fragment_start..fragment_end],
+        &reverse,
+        &terms,
+        &BTreeSet::new(),
+        &|offset| zones.in_prose(fragment_start + offset),
+        &|offset| zones.in_declaration(fragment_start + offset),
+    )
+}
+
+fn reverse_alias_table(
+    span_map: &SpanMap,
+    config: &Config,
+    semantic_aliases: &[crate::semantic_store::SemanticAliasPair],
+) -> ReverseAliases {
     let mut by_alias: BTreeMap<String, (String, String, BTreeSet<String>)> = BTreeMap::new();
     let mut add = |alias: &str, original: &str| {
         let key = normalize_term(alias);
@@ -1833,6 +1982,9 @@ fn reverse_alias_table(span_map: &SpanMap, config: &Config) -> ReverseAliases {
     }
     for (term, alias) in &config.sanitizer.alias_registry {
         add(alias, term);
+    }
+    for pair in semantic_aliases {
+        add(&pair.alias, &pair.original);
     }
 
     let mut terms = Vec::with_capacity(by_alias.len());
@@ -1864,6 +2016,7 @@ fn reverse_map_new_text(
     terms: &[Term],
     protected: &BTreeSet<String>,
     in_prose: &dyn Fn(usize) -> bool,
+    in_declaration: &dyn Fn(usize) -> bool,
 ) -> Result<String> {
     if reverse.terms.is_empty() {
         return Ok(text.to_string());
@@ -1875,7 +2028,7 @@ fn reverse_map_new_text(
         out.push_str(&text[cursor..run_start]);
         cursor = run_end;
         let run = &text[run_start..run_end];
-        if protected.contains(run) || in_prose(run_start) {
+        if in_prose(run_start) {
             out.push_str(run);
             continue;
         }
@@ -1886,6 +2039,16 @@ fn reverse_map_new_text(
                 .cmp(&b.start)
                 .then_with(|| (b.end - b.start).cmp(&(a.end - a.start)))
         });
+        if !hits.is_empty() && in_declaration(run_start) {
+            bail!(
+                "alias {:?} is used as a new declaration; choose a fresh neutral name instead of reusing an existing projected symbol",
+                reverse.terms[hits[0].term_index].raw
+            );
+        }
+        if protected.contains(run) {
+            out.push_str(run);
+            continue;
+        }
         let mut reversed = String::with_capacity(run.len());
         let mut run_cursor = 0usize;
         for hit in &hits {
@@ -1923,6 +2086,7 @@ fn reverse_map_new_text(
 struct ProseZones {
     strings: Vec<crate::sanitize::ByteRange>,
     comments: Vec<crate::sanitize::ByteRange>,
+    declarations: Vec<crate::sanitize::ByteRange>,
     line_starts: Vec<usize>,
     len: usize,
 }
@@ -1932,9 +2096,25 @@ impl ProseZones {
         let language = crate::sanitize::detect_language(rel_path, patched_sanitized);
         let strings = crate::sanitize::string_ranges(&language, patched_sanitized);
         let comments = crate::sanitize::comment_ranges(&language, patched_sanitized, &strings);
+        let declarations = crate::semantic::parse_document(rel_path, patched_sanitized)
+            .map(|document| {
+                document
+                    .occurrences
+                    .into_iter()
+                    .filter(|occurrence| {
+                        occurrence.role == crate::semantic::OccurrenceRole::Declaration
+                    })
+                    .map(|occurrence| crate::sanitize::ByteRange {
+                        start: occurrence.range.start_byte,
+                        end: occurrence.range.end_byte,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             strings,
             comments,
+            declarations,
             line_starts: line_starts(patched_sanitized),
             len: patched_sanitized.len(),
         }
@@ -1943,6 +2123,10 @@ impl ProseZones {
     fn in_prose(&self, offset: usize) -> bool {
         crate::sanitize::range_contains(&self.strings, offset)
             || crate::sanitize::range_contains(&self.comments, offset)
+    }
+
+    fn in_declaration(&self, offset: usize) -> bool {
+        crate::sanitize::range_contains(&self.declarations, offset)
     }
 
     fn line_offset(&self, one_based_line: usize) -> usize {
@@ -1956,11 +2140,18 @@ fn translate_file_patch(
     sanitized_content: &str,
     patched_sanitized: &str,
     config: &Config,
+    semantic_aliases: &[crate::semantic_store::SemanticAliasPair],
     protected: &BTreeSet<String>,
 ) -> Result<FilePatch> {
     let starts = line_starts(sanitized_content);
-    let reverse = reverse_alias_table(span_map, config);
-    let terms = term_table(config);
+    let reverse = reverse_alias_table(span_map, config, semantic_aliases);
+    let mut terms = term_table(config);
+    terms.extend(semantic_aliases.iter().map(|pair| Term {
+        raw: pair.original.clone(),
+        normalized: normalize_term(&pair.original),
+        replacement: pair.alias.clone(),
+        policy_source: "semantic-alias",
+    }));
     let prose = ProseZones::new(Path::new(&span_map.rel_path), patched_sanitized);
     let hunks = file_patch
         .hunks
@@ -2057,10 +2248,14 @@ fn translate_hunk(
                 // (whole words or inside identifiers); map them back to the
                 // real names so the real file stays semantically coherent.
                 let line_abs = prose.line_offset(new_line + 1);
-                let translated =
-                    reverse_map_new_text(&translated, reverse, terms, protected, &|offset| {
-                        prose.in_prose(line_abs + body_offset_for(&splices, offset))
-                    })?;
+                let translated = reverse_map_new_text(
+                    &translated,
+                    reverse,
+                    terms,
+                    protected,
+                    &|offset| prose.in_prose(line_abs + body_offset_for(&splices, offset)),
+                    &|offset| prose.in_declaration(line_abs + body_offset_for(&splices, offset)),
+                )?;
                 lines.push(HunkLine::Add(translated));
                 new_line += 1;
             }
@@ -2730,6 +2925,7 @@ mod tests {
         use crate::map::{Replacement, SpanMap};
         let base = SpanMap {
             rel_path: "f.rs".into(),
+            projected_path: "f.rs".into(),
             original_hash: String::new(),
             sanitized_hash: String::new(),
             original_size: 0,

@@ -33,7 +33,10 @@ pub fn connect(layout: &Layout) -> Result<Connection> {
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let version = read_user_version(conn)?;
     if version == SCHEMA_VERSION {
-        return Ok(());
+        // Resolver/compiler overlay tables were added additively so existing
+        // v7 workspaces keep accepted aliases and pending proposal rows. This
+        // path is called only while the exclusive workspace lock is held.
+        return create_compiler_overlay_tables(conn);
     }
     refuse_newer_schema(version)?;
     // Read-check-drop-create-stamp must be atomic: a crash or error mid-way
@@ -57,6 +60,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
             drop table if exists semantic_transactions;
             drop table if exists semantic_documents;
             drop table if exists semantic_workspace;
+            drop table if exists semantic_migrations;
             drop table if exists spans;
             drop table if exists replacements;
             drop table if exists files;
@@ -97,7 +101,15 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 pub fn check_schema(conn: &Connection) -> Result<()> {
     let version = read_user_version(conn)?;
     if version == SCHEMA_VERSION {
-        return Ok(());
+        if table_exists(conn, "semantic_compiler_bindings")?
+            && table_exists(conn, "semantic_compiler_links")?
+            && table_exists(conn, "semantic_compiler_resolutions")?
+        {
+            return Ok(());
+        }
+        bail!(
+            "db.sqlite predates compiler-backed semantic tables; run `code-sanity index` to upgrade"
+        );
     }
     refuse_newer_schema(version)?;
     bail!(
@@ -105,6 +117,51 @@ pub fn check_schema(conn: &Connection) -> Result<()> {
          {SCHEMA_VERSION}; run `code-sanity index` to migrate (the database \
          is derived state)"
     );
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    conn.query_row(
+        "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .with_context(|| format!("inspect table {table}"))
+}
+
+fn create_compiler_overlay_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        create table if not exists semantic_compiler_bindings(
+          canonical_symbol_id text not null,
+          rel_path text not null,
+          start_byte integer not null,
+          end_byte integer not null,
+          name text not null,
+          content_hash text not null,
+          primary key(canonical_symbol_id, rel_path, start_byte, end_byte)
+        );
+        create index if not exists semantic_compiler_bindings_rel
+          on semantic_compiler_bindings(rel_path, start_byte, end_byte);
+        create table if not exists semantic_compiler_links(
+          canonical_symbol_id text not null,
+          linked_symbol_id text not null,
+          primary key(canonical_symbol_id, linked_symbol_id)
+        );
+        create table if not exists semantic_compiler_resolutions(
+          canonical_symbol_id text primary key,
+          provider text not null,
+          locations_fingerprint text not null,
+          resolved_revision integer not null
+        );
+        create table if not exists semantic_migrations(
+          migration_key text primary key,
+          applied_at text not null,
+          affected_rows integer not null
+        );
+        "#,
+    )
+    .context("create compiler-backed semantic tables")
 }
 
 fn read_user_version(conn: &Connection) -> Result<i64> {
@@ -313,6 +370,37 @@ fn create_tables(conn: &Connection) -> Result<()> {
         );
         create index if not exists semantic_proposals_symbol
           on semantic_proposals(symbol_id, status);
+
+        create table if not exists semantic_compiler_bindings(
+          canonical_symbol_id text not null,
+          rel_path text not null,
+          start_byte integer not null,
+          end_byte integer not null,
+          name text not null,
+          content_hash text not null,
+          primary key(canonical_symbol_id, rel_path, start_byte, end_byte)
+        );
+        create index if not exists semantic_compiler_bindings_rel
+          on semantic_compiler_bindings(rel_path, start_byte, end_byte);
+
+        create table if not exists semantic_compiler_links(
+          canonical_symbol_id text not null,
+          linked_symbol_id text not null,
+          primary key(canonical_symbol_id, linked_symbol_id)
+        );
+
+        create table if not exists semantic_compiler_resolutions(
+          canonical_symbol_id text primary key,
+          provider text not null,
+          locations_fingerprint text not null,
+          resolved_revision integer not null
+        );
+
+        create table if not exists semantic_migrations(
+          migration_key text primary key,
+          applied_at text not null,
+          affected_rows integer not null
+        );
 
         create table if not exists semantic_transactions(
           transaction_id text primary key,

@@ -1,5 +1,6 @@
-use crate::config::{Layout, normalize_rel_path, normalize_safe_rel_path};
+use crate::config::{Config, Layout, normalize_rel_path, normalize_safe_rel_path};
 use crate::lock::WorkspaceLock;
+use crate::path_projection::PathProjection;
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use std::fs;
@@ -19,8 +20,17 @@ pub fn read_sanitized_file(root: &Path, rel_path: &Path) -> Result<String> {
     // Shared lock: never hand a torn mid-write mirror file to an agent.
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
     let rel_path = normalize_safe_rel_path(rel_path, "sanitized mirror")?;
-    let path = layout.mirror_dir.join(&rel_path);
-    ensure_existing_path_inside(&path, &layout.mirror_dir, &rel_path)?;
+    // Require membership in the current projection before touching disk. An
+    // untracked/planted mirror file or a stale pre-policy path must never be
+    // readable merely because it exists physically.
+    let config = Config::load_or_default(&layout)?;
+    let conn = crate::db::connect(&layout)?;
+    crate::db::check_schema(&conn)?;
+    let projection = PathProjection::from_connection(&config, &conn)?;
+    let real = projection.real_for_agent(&rel_path)?;
+    let projected = projection.projected_for_real(&real)?;
+    let path = layout.mirror_dir.join(&projected);
+    ensure_existing_path_inside(&path, &layout.mirror_dir, &projected)?;
     fs::read_to_string(&path).with_context(|| {
         format!(
             "read sanitized file {}; run `code-sanity index` first if missing",
@@ -56,6 +66,14 @@ pub fn search_mirror_limited(
     layout.require_initialized()?;
     let filter = compile_glob(glob)?;
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
+    let config = Config::load_or_default(&layout)?;
+    let conn = crate::db::connect(&layout)?;
+    crate::db::check_schema(&conn)?;
+    let projection = PathProjection::from_connection(&config, &conn)?;
+    let allowed = crate::db::tracked_files(&conn)?
+        .iter()
+        .map(|real| projection.projected_string_for_real(real))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
     let mut matches = Vec::new();
     if !layout.mirror_dir.exists() {
         bail!("sanitized mirror is missing; run `code-sanity index` first");
@@ -74,6 +92,9 @@ pub fn search_mirror_limited(
             continue;
         }
         let rel = entry.path().strip_prefix(&layout.mirror_dir)?.to_path_buf();
+        if !allowed.contains(&normalize_rel_path(&rel)) {
+            continue;
+        }
         if !filter.matches(&rel) {
             continue;
         }
@@ -104,6 +125,14 @@ pub fn list_mirror_files(root: &Path, glob: Option<&str>) -> Result<Vec<String>>
     layout.require_initialized()?;
     let filter = compile_glob(glob)?;
     let _lock = WorkspaceLock::acquire_shared(&layout)?;
+    let config = Config::load_or_default(&layout)?;
+    let conn = crate::db::connect(&layout)?;
+    crate::db::check_schema(&conn)?;
+    let projection = PathProjection::from_connection(&config, &conn)?;
+    let allowed = crate::db::tracked_files(&conn)?
+        .iter()
+        .map(|real| projection.projected_string_for_real(real))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
     if !layout.mirror_dir.exists() {
         bail!("sanitized mirror is missing; run `code-sanity index` first");
     }
@@ -121,6 +150,9 @@ pub fn list_mirror_files(root: &Path, glob: Option<&str>) -> Result<Vec<String>>
             continue;
         }
         let rel = entry.path().strip_prefix(&layout.mirror_dir)?.to_path_buf();
+        if !allowed.contains(&normalize_rel_path(&rel)) {
+            continue;
+        }
         if !filter.matches(&rel) {
             continue;
         }

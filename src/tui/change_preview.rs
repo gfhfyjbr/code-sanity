@@ -70,6 +70,11 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         chunks[1]
     };
 
+    if item.proposal.category == "file_path" {
+        render_path_change(frame, item, code_area);
+        return;
+    }
+
     let source = app.source_context(code_area.height.max(1) as usize);
     render_source(frame, item, &source, code_area);
 }
@@ -103,10 +108,10 @@ fn metadata_paragraph(item: &ReviewItem, width: u16, bordered: bool) -> Paragrap
 fn metadata_lines(item: &ReviewItem, width: u16) -> Vec<Line<'static>> {
     let flagged = item.flag != "clean";
     let status_color = if is_pending(item) { WARNING } else { MUTED };
-    let scope = if item.proposal.target.is_some() {
-        "symbol scope"
-    } else {
-        "global alias"
+    let scope = match item.proposal.target.as_ref() {
+        Some(crate::proposal::ProposalTarget::Semantic(_)) => "symbol scope",
+        Some(crate::proposal::ProposalTarget::FilePath(_)) => "path-only global alias",
+        None => "global alias",
     };
     let mut metadata = vec![
         Line::from(vec![
@@ -159,6 +164,30 @@ fn metadata_lines(item: &ReviewItem, width: u16) -> Vec<Line<'static>> {
         Style::default().fg(MUTED),
     ));
     metadata
+}
+
+fn render_path_change(frame: &mut Frame, item: &ReviewItem, area: Rect) {
+    let lines = match crate::proposal::preview_file_path_change(item) {
+        Ok((before, after)) => vec![
+            Line::from(Span::styled(
+                format!("- {before}"),
+                Style::default().fg(DANGER),
+            )),
+            Line::from(Span::styled(
+                format!("+ {after}"),
+                Style::default().fg(SUCCESS),
+            )),
+            Line::from(Span::styled(
+                "Real repository path is unchanged.",
+                Style::default().fg(MUTED),
+            )),
+        ],
+        Err(err) => vec![Line::from(Span::styled(
+            format!("Path preview unavailable: {err}"),
+            Style::default().fg(WARNING),
+        ))],
+    };
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn labeled_lines(label: &str, value: &str, width: u16, style: Style) -> Vec<Line<'static>> {
@@ -395,7 +424,7 @@ fn syntax_style(kind: SyntaxKind) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proposal::{Proposal, ReviewStatus};
+    use crate::proposal::{FilePathProposalTarget, Proposal, ProposalTarget, ReviewStatus};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -459,6 +488,30 @@ mod tests {
             .join(" ");
         assert!(normalized.contains("careful human review"));
         assert!(normalized.contains("worker implementation"));
+    }
+
+    #[test]
+    fn file_path_metadata_names_the_path_only_scope() {
+        let mut item = review_item();
+        item.file = "src/weaponized_loader.rs".to_string();
+        item.proposal.target = Some(ProposalTarget::FilePath(FilePathProposalTarget {
+            path_id: "path_1".to_string(),
+        }));
+        item.proposal.category = "file_path".to_string();
+        item.proposal.original_text = "weaponized".to_string();
+        item.proposal.sanitized_text = "neutral".to_string();
+        let lines = metadata_lines(&item, 80)
+            .iter()
+            .map(plain_text)
+            .collect::<Vec<_>>();
+        assert!(lines.join(" ").contains("path-only global alias"));
+        assert_eq!(
+            crate::proposal::preview_file_path_change(&item).unwrap(),
+            (
+                "src/weaponized_loader.rs".to_string(),
+                "src/neutral_loader.rs".to_string()
+            )
+        );
     }
 
     #[test]

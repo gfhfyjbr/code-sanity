@@ -4,6 +4,7 @@ use crate::config::{Layout, normalize_safe_rel_path};
 use crate::lock::WorkspaceLock;
 use crate::map::sha256_hex;
 use crate::patch::{RealFileUpdate, commit_real_file_updates_locked};
+use crate::path_projection::PathProjection;
 use crate::semantic::{LanguageId, SourceOrigin};
 use crate::semantic_store::{self, StoredDocument};
 use anyhow::{Context, Result, anyhow, bail};
@@ -32,6 +33,8 @@ pub struct PlannedEdit {
     pub start_byte: usize,
     pub end_byte: usize,
     pub replacement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_replacement: Option<String>,
     pub source: String,
     pub target_id: String,
 }
@@ -41,6 +44,8 @@ pub struct PlannedFile {
     pub rel_path: String,
     pub before_hash: String,
     pub after_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_after_hash: Option<String>,
     pub edits: Vec<PlannedEdit>,
 }
 
@@ -68,6 +73,7 @@ struct IntentSnapshot {
     source: String,
     range: crate::semantic::TextRange,
     minimum_references: usize,
+    real_replacement: Option<String>,
 }
 
 pub fn preview_transaction(
@@ -100,12 +106,19 @@ pub fn preview_transaction(
         match &snapshot.intent {
             EditIntent::EditNode {
                 node_id,
-                replacement,
+                replacement: _,
             } => edits.push(PlannedEdit {
                 rel_path: snapshot.rel_path.clone(),
                 start_byte: snapshot.range.start_byte,
                 end_byte: snapshot.range.end_byte,
-                replacement: replacement.clone(),
+                replacement: snapshot
+                    .real_replacement
+                    .clone()
+                    .ok_or_else(|| anyhow!("edit_node replacement projection disappeared"))?,
+                agent_replacement: match &snapshot.intent {
+                    EditIntent::EditNode { replacement, .. } => Some(replacement.clone()),
+                    EditIntent::RenameSymbol { .. } => None,
+                },
                 source: "edit_node".to_string(),
                 target_id: node_id.clone(),
             }),
@@ -129,6 +142,7 @@ pub fn preview_transaction(
                     start_byte: edit.start_byte,
                     end_byte: edit.end_byte,
                     replacement: edit.new_text,
+                    agent_replacement: Some(new_name.clone()),
                     source: "rename_symbol".to_string(),
                     target_id: symbol_id.clone(),
                 }));
@@ -145,7 +159,7 @@ pub fn preview_transaction(
     };
     let created_at = Utc::now().to_rfc3339();
     let transaction_id = transaction_id(expected_revision, &intents_json(&snapshots)?, &created_at);
-    let preview = TransactionPreview {
+    let mut preview = TransactionPreview {
         transaction_id: transaction_id.clone(),
         base_revision: expected_revision,
         files,
@@ -158,6 +172,12 @@ pub fn preview_transaction(
     crate::db::check_schema(&conn)?;
     require_revision(&conn, expected_revision)?;
     verify_preview_sources(root, &preview)?;
+    let expected = expected_projected_files(&layout, &conn, &preview)?;
+    for file in &mut preview.files {
+        file.projected_after_hash = expected
+            .get(&file.rel_path)
+            .map(|(_, content)| sha256_hex(content.as_bytes()));
+    }
     semantic_store::insert_preview_transaction(
         &conn,
         &transaction_id,
@@ -166,7 +186,7 @@ pub fn preview_transaction(
         &serde_json::to_string(&preview).context("serialize transaction preview")?,
         &created_at,
     )?;
-    Ok(preview)
+    project_preview_for_agent(&layout, &conn, &preview)
 }
 
 pub fn commit_transaction(
@@ -182,6 +202,8 @@ pub fn commit_transaction(
     crate::journal::ensure_no_interrupted_apply(&layout)?;
     let conn = crate::db::connect(&layout)?;
     crate::db::check_schema(&conn)?;
+    let config = crate::config::Config::load_or_default(&layout)?;
+    let path_projection = PathProjection::from_connection(&config, &conn)?;
     let stored = semantic_store::load_transaction(&conn, transaction_id)?
         .ok_or_else(|| anyhow!("unknown semantic transaction {transaction_id}"))?;
     if stored.base_revision != expected_revision {
@@ -201,11 +223,7 @@ pub fn commit_transaction(
             transaction_id: transaction_id.to_string(),
             base_revision: stored.base_revision,
             committed_revision,
-            files: preview
-                .files
-                .iter()
-                .map(|file| file.rel_path.clone())
-                .collect(),
+            files: project_file_names(&path_projection, &preview)?,
             journal: "already-committed".to_string(),
         });
     }
@@ -214,6 +232,7 @@ pub fn commit_transaction(
     }
     if preview_after_sources_match(root, &preview)? {
         let semantic = semantic_store::index_workspace_locked(root, &layout)?;
+        verify_projected_after_hashes(&layout, &conn, &preview)?;
         semantic_store::mark_transaction_committed(
             &conn,
             transaction_id,
@@ -224,16 +243,13 @@ pub fn commit_transaction(
             transaction_id: transaction_id.to_string(),
             base_revision: stored.base_revision,
             committed_revision: semantic.revision,
-            files: preview
-                .files
-                .iter()
-                .map(|file| file.rel_path.clone())
-                .collect(),
+            files: project_file_names(&path_projection, &preview)?,
             journal: "recovered-after-hash".to_string(),
         });
     }
     require_revision(&conn, expected_revision)?;
     verify_preview_sources(root, &preview)?;
+    let expected_mirrors = expected_projected_files(&layout, &conn, &preview)?;
 
     let mut updates = Vec::with_capacity(preview.files.len());
     for file in &preview.files {
@@ -250,7 +266,14 @@ pub fn commit_transaction(
         updates.push(RealFileUpdate { rel, before, after });
     }
 
-    let journal = commit_real_file_updates_locked(root, &layout, &updates, agent, session_id)?;
+    let journal = commit_real_file_updates_locked(
+        root,
+        &layout,
+        &updates,
+        &expected_mirrors,
+        agent,
+        session_id,
+    )?;
     let semantic = semantic_store::index_workspace_locked(root, &layout)?;
     semantic_store::mark_transaction_committed(
         &conn,
@@ -262,17 +285,106 @@ pub fn commit_transaction(
         transaction_id: transaction_id.to_string(),
         base_revision: expected_revision,
         committed_revision: semantic.revision,
-        files: preview
-            .files
-            .iter()
-            .map(|file| file.rel_path.clone())
-            .collect(),
+        files: project_file_names(&path_projection, &preview)?,
         journal: journal
             .strip_prefix(root)
             .unwrap_or(&journal)
             .to_string_lossy()
             .into_owned(),
     })
+}
+
+fn project_preview_for_agent(
+    layout: &Layout,
+    conn: &rusqlite::Connection,
+    preview: &TransactionPreview,
+) -> Result<TransactionPreview> {
+    let config = crate::config::Config::load_or_default(layout)?;
+    let projection = PathProjection::from_connection(&config, conn)?;
+    let mut projected = preview.clone();
+    for file in &mut projected.files {
+        let real_rel = normalize_safe_rel_path(Path::new(&file.rel_path), "preview file")?;
+        let map = crate::map::load_span_map(&layout.map_path(&real_rel))
+            .with_context(|| format!("load preview projection for {}", file.rel_path))?;
+        for edit in &mut file.edits {
+            let (start, end) =
+                semantic_store::project_original_byte_range(&map, edit.start_byte, edit.end_byte)?;
+            edit.start_byte = start;
+            edit.end_byte = end;
+            edit.rel_path = projection.projected_string_for_real(&edit.rel_path)?;
+            if let Some(agent_replacement) = edit.agent_replacement.take() {
+                edit.replacement = agent_replacement;
+            }
+        }
+        file.rel_path = projection.projected_string_for_real(&file.rel_path)?;
+    }
+    Ok(projected)
+}
+
+fn project_file_names(
+    projection: &PathProjection,
+    preview: &TransactionPreview,
+) -> Result<Vec<String>> {
+    preview
+        .files
+        .iter()
+        .map(|file| projection.projected_string_for_real(&file.rel_path))
+        .collect()
+}
+
+fn expected_projected_files(
+    layout: &Layout,
+    conn: &rusqlite::Connection,
+    preview: &TransactionPreview,
+) -> Result<BTreeMap<String, (std::path::PathBuf, String)>> {
+    let agent_preview = project_preview_for_agent(layout, conn, preview)?;
+    let mut expected = BTreeMap::new();
+    for (real_file, projected_file) in preview.files.iter().zip(&agent_preview.files) {
+        let projected_rel = normalize_safe_rel_path(
+            Path::new(&projected_file.rel_path),
+            "projected transaction file",
+        )?;
+        let before =
+            fs::read_to_string(layout.mirror_dir.join(&projected_rel)).with_context(|| {
+                format!(
+                    "read projected transaction file {}",
+                    projected_rel.display()
+                )
+            })?;
+        let after = apply_edits(&before, &projected_file.edits)?;
+        expected.insert(real_file.rel_path.clone(), (projected_rel, after));
+    }
+    Ok(expected)
+}
+
+fn verify_projected_after_hashes(
+    layout: &Layout,
+    conn: &rusqlite::Connection,
+    preview: &TransactionPreview,
+) -> Result<()> {
+    let config = crate::config::Config::load_or_default(layout)?;
+    let projection = PathProjection::from_connection(&config, conn)?;
+    for file in &preview.files {
+        let Some(expected_hash) = file.projected_after_hash.as_ref() else {
+            // Compatibility with previews created before projected hashes were
+            // persisted. Normal (non-recovery) commits still use exact bytes.
+            continue;
+        };
+        let projected_rel = projection.projected_for_real(Path::new(&file.rel_path))?;
+        let actual = fs::read(layout.mirror_dir.join(&projected_rel)).with_context(|| {
+            format!(
+                "read recovered transaction projection {}",
+                projected_rel.display()
+            )
+        })?;
+        if sha256_hex(&actual) != *expected_hash {
+            bail!(
+                "{}: recovered real source does not reproduce the stored structured preview",
+                projected_rel.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn snapshot_intent(
@@ -300,6 +412,34 @@ fn snapshot_intent(
                 .ok_or_else(|| anyhow!("semantic document disappeared for {node_id}"))?;
             require_owned_editable(&document)?;
             let source = read_snapshot_source(root, &document)?;
+            let projected = semantic_store::project_document(conn, root, &node.rel_path)?;
+            let projected_range = projected
+                .nodes
+                .iter()
+                .find(|candidate| candidate.node_id == *node_id)
+                .map(|candidate| candidate.range.clone())
+                .ok_or_else(|| anyhow!("projected node_id {node_id} disappeared"))?;
+            let replacement = match &intent {
+                EditIntent::EditNode { replacement, .. } => replacement,
+                EditIntent::RenameSymbol { .. } => unreachable!(),
+            };
+            let mut projected_after = projected.content;
+            projected_after.replace_range(
+                projected_range.start_byte..projected_range.end_byte,
+                replacement,
+            );
+            let replacement_end = projected_range.start_byte + replacement.len();
+            let layout = Layout::new(root);
+            let config = crate::config::Config::load_or_default(&layout)?;
+            let rel = normalize_safe_rel_path(Path::new(&node.rel_path), "edit_node path")?;
+            let real_replacement = crate::patch::back_project_agent_fragment(
+                conn,
+                &config,
+                &rel,
+                &projected_after,
+                projected_range.start_byte,
+                replacement_end,
+            )?;
             Ok(IntentSnapshot {
                 intent,
                 rel_path: node.rel_path,
@@ -307,6 +447,7 @@ fn snapshot_intent(
                 source,
                 range: node.range,
                 minimum_references: 0,
+                real_replacement: Some(real_replacement),
             })
         }
         EditIntent::RenameSymbol { symbol_id, .. } => {
@@ -327,6 +468,7 @@ fn snapshot_intent(
                 source,
                 range: symbol.range,
                 minimum_references,
+                real_replacement: None,
             })
         }
     }
@@ -412,6 +554,7 @@ fn build_planned_files(
             rel_path,
             before_hash: document.content_hash,
             after_hash: sha256_hex(after.as_bytes()),
+            projected_after_hash: None,
             edits,
         });
     }
@@ -522,6 +665,7 @@ mod tests {
                 start_byte: 0,
                 end_byte: 3,
                 replacement: "long".into(),
+                agent_replacement: None,
                 source: "test".into(),
                 target_id: "a".into(),
             },
@@ -530,6 +674,7 @@ mod tests {
                 start_byte: 4,
                 end_byte: 7,
                 replacement: "x".into(),
+                agent_replacement: None,
                 source: "test".into(),
                 target_id: "b".into(),
             },
@@ -545,6 +690,7 @@ mod tests {
                 start_byte: 0,
                 end_byte: 3,
                 replacement: String::new(),
+                agent_replacement: None,
                 source: "test".into(),
                 target_id: "a".into(),
             },
@@ -553,6 +699,7 @@ mod tests {
                 start_byte: 2,
                 end_byte: 4,
                 replacement: String::new(),
+                agent_replacement: None,
                 source: "test".into(),
                 target_id: "b".into(),
             },

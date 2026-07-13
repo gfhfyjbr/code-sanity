@@ -163,7 +163,16 @@ pub struct SanitizerConfig {
     pub provider: ProviderConfig,
     pub preserve_line_count: bool,
     pub dictionary: BTreeMap<String, String>,
+    /// Content-policy exemptions for the deterministic lexical mirror. This
+    /// no longer suppresses symbol/path proposals: those have separate lists
+    /// so a public content spelling can still be reviewed as private metadata.
     pub allowlist: Vec<String>,
+    /// Owned semantic symbol spellings the proposal provider must ignore.
+    #[serde(default)]
+    pub proposal_allowlist: Vec<String>,
+    /// Directory/filename terms the path-only proposal pass must ignore.
+    #[serde(default)]
+    pub path_allowlist: Vec<String>,
     /// Terms that must never survive into the mirror. A proposal whose output
     /// still contains a denylisted term is rejected.
     #[serde(default)]
@@ -185,6 +194,9 @@ pub struct SanitizerConfig {
     /// Source lines repeated on both sides of adjacent proposal chunks.
     #[serde(default = "default_propose_chunk_overlap_lines")]
     pub propose_chunk_overlap_lines: usize,
+    /// Unique directory/filename candidates per dedicated path-only request.
+    #[serde(default = "default_propose_path_batch_size")]
+    pub propose_path_batch_size: usize,
     /// Maximum number of files sent to the proposal provider concurrently.
     /// `propose-sanitize --jobs` can override this for one run.
     #[serde(default = "default_propose_concurrency")]
@@ -194,6 +206,11 @@ pub struct SanitizerConfig {
     /// engine during index so the model never writes the mirror directly.
     #[serde(default)]
     pub alias_registry: BTreeMap<String, String>,
+    /// Path-only deterministic aliases proposed from directory names and
+    /// filename stems. These never rewrite source content and never rename
+    /// the real repository; they only define the agent-facing path projection.
+    #[serde(default)]
+    pub path_alias_registry: BTreeMap<String, String>,
 }
 
 fn default_confidence_threshold() -> f64 {
@@ -210,6 +227,10 @@ fn default_propose_chunk_bytes() -> usize {
 
 fn default_propose_chunk_overlap_lines() -> usize {
     12
+}
+
+fn default_propose_path_batch_size() -> usize {
+    64
 }
 
 fn default_propose_concurrency() -> usize {
@@ -496,13 +517,17 @@ impl Default for Config {
                     "auth".to_string(),
                     "token".to_string(),
                 ],
+                proposal_allowlist: Vec::new(),
+                path_allowlist: Vec::new(),
                 denylist: Vec::new(),
                 confidence_threshold: default_confidence_threshold(),
                 propose_max_file_bytes: default_propose_max_file_bytes(),
                 propose_chunk_bytes: default_propose_chunk_bytes(),
                 propose_chunk_overlap_lines: default_propose_chunk_overlap_lines(),
+                propose_path_batch_size: default_propose_path_batch_size(),
                 propose_concurrency: default_propose_concurrency(),
                 alias_registry: BTreeMap::new(),
+                path_alias_registry: BTreeMap::new(),
             },
             ignore: IgnoreConfig {
                 extra_dirs: vec![
